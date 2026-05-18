@@ -1,0 +1,1102 @@
+import secrets
+import threading
+import time as _time
+import uuid
+from urllib.parse import quote
+
+from sqlalchemy.exc import IntegrityError
+
+from modules.db import (
+    Cluster, delete_cluster_db, get_config, load_cluster, load_clusters,
+    save_cluster, get_session,
+)
+from modules.openwrt_client import OpenWrtClient, OpenWrtError
+from modules.pve_client import PVEClient, PVEError
+
+
+class K8sError(Exception):
+    pass
+
+
+_task_store = {}
+_task_lock = threading.Lock()
+
+
+def _new_task_id():
+    return uuid.uuid4().hex[:12]
+
+
+def _update_task(task_id, status="running", progress=0, message="", result=None, error=None):
+    with _task_lock:
+        entry = _task_store.get(task_id)
+        if entry is None:
+            entry = {}
+            _task_store[task_id] = entry
+        entry["status"] = status
+        entry["progress"] = progress
+        entry["message"] = message
+        if result is not None:
+            entry["result"] = result
+        if error is not None:
+            entry["error"] = error
+        entry["updated_at"] = _time.time()
+        entry.setdefault("logs", []).append({
+            "time": _time.strftime("%H:%M:%S"),
+            "progress": progress,
+            "message": message,
+        })
+
+
+def _append_log(task_id, message):
+    with _task_lock:
+        entry = _task_store.get(task_id)
+        if entry is None:
+            return
+        entry["updated_at"] = _time.time()
+        entry.setdefault("logs", []).append({
+            "time": _time.strftime("%H:%M:%S"),
+            "progress": entry.get("progress", 0),
+            "message": message,
+        })
+
+
+def get_task_status(task_id):
+    with _task_lock:
+        return _task_store.get(task_id)
+
+
+def _cleanup_old_tasks():
+    now = _time.time()
+    with _task_lock:
+        expired = [tid for tid, t in _task_store.items() if now - t.get("updated_at", 0) > 1800]
+        for tid in expired:
+            del _task_store[tid]
+
+
+def _generate_ssh_key():
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives import serialization
+
+    priv = ed25519.Ed25519PrivateKey.generate()
+    priv_bytes = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_bytes = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH,
+        format=serialization.PublicFormat.OpenSSH,
+    )
+    return priv_bytes.decode(), pub_bytes.decode().strip()
+
+
+def _random_mac():
+    prefix = "52:54:00"
+    suffix = ":".join(f"{secrets.randbits(8):02x}" for _ in range(3))
+    return f"{prefix}:{suffix}"
+
+
+def _guest_exec_wait(pve, node, vmid, pid_info, timeout=60):
+    info = pid_info or {}
+    pid = (info.get("return", {}) or info.get("data", {}) or info).get("pid", 0)
+    if not pid:
+        return
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        _time.sleep(1)
+        try:
+            s = pve.guest_exec_status(node, vmid, pid)
+            ret = (s.get("return", {}) or s.get("data", {}) or s)
+            if ret.get("exited"):
+                exitcode = ret.get("exitcode", 0)
+                if exitcode != 0:
+                    err = (ret.get("err-data") or "").strip()
+                    raise K8sError(f"guest exec failed (exit={exitcode}): {err}")
+                return
+        except K8sError:
+            raise
+        except Exception:
+            pass
+    raise K8sError(f"guest exec timed out after {timeout}s")
+
+
+def _openwrt_client():
+    cfg = get_config("openwrt")
+    if not cfg:
+        raise K8sError(f"OpenWrt 未配置，请先在页面中保存配置")
+    missing = [k for k in ("host", "username", "password") if not cfg.get(k)]
+    if missing:
+        raise K8sError(f"OpenWrt 配置不完整: {', '.join(missing)}")
+    return OpenWrtClient(
+        host=cfg["host"],
+        username=cfg["username"],
+        password=cfg["password"],
+        port=int(cfg.get("port", 22)),
+    )
+
+
+def _pve_client():
+    cfg = get_config("pve")
+    if not cfg:
+        raise K8sError(f"PVE 未配置，请先在页面中保存配置")
+    missing = [k for k in ("host", "user", "token_name", "token_value") if not cfg.get(k)]
+    if missing:
+        raise K8sError(f"PVE 配置不完整: {', '.join(missing)}")
+    return PVEClient(
+        host=cfg["host"],
+        user=cfg["user"],
+        token_name=cfg["token_name"],
+        token_value=cfg["token_value"],
+        verify_ssl=cfg.get("verify_ssl", False),
+        port=int(cfg.get("port", 8006)),
+    )
+
+
+def list_clusters():
+    return load_clusters()
+
+
+def get_cluster(name):
+    return load_cluster(name)
+
+
+def delete_cluster(name, status_callback=None, log_callback=None):
+    def report(p, m):
+        if status_callback: status_callback(p, m)
+    def _log(m):
+        if log_callback: log_callback(m)
+
+    report(5, "正在加载集群信息...")
+    cluster = load_cluster(name)
+    if not cluster:
+        raise K8sError(f"Cluster {name} not found")
+    _num = name.split("_")[1]
+    pve = _pve_client()
+    pve.connect()
+    _vms = list(cluster.get("vms", {}).items())
+    _total = len(_vms)
+    report(10, f"正在释放虚拟机 (共 {_total} 台)...")
+    for i, (vm_name, vm_info) in enumerate(_vms):
+        _log(f"释放虚拟机 {vm_name} (VMID {vm_info['vmid']})...")
+        try:
+            pve.release_vm(vm_info["node"], vm_info["vmid"], purge=True)
+            _log(f"{vm_name} 已释放")
+        except Exception as e:
+            _log(f"{vm_name} 释放失败: {e}")
+        report(10 + int((i + 1) / _total * 30), f"正在释放虚拟机 ({i + 1}/{_total})...")
+    try:
+        pve.api
+    except Exception:
+        pass
+
+    report(40, "正在清理 OpenWrt 配置...")
+    ow = _openwrt_client()
+    ow.connect()
+    try:
+        report(45, "删除路由转发")
+        try:
+            ow.delete_redirect(name)
+            _log("路由转发已删除")
+        except Exception:
+            pass
+        _vnames = list(cluster.get("vms", {}).keys())
+        report(50, f"删除 DHCP 主机绑定 ({len(_vnames)} 个)")
+        for vm_name in _vnames:
+            try:
+                ow.delete_dhcp_host(vm_name, skip_restart=True)
+                _log(f"DHCP 主机绑定 {vm_name} 已删除")
+            except Exception:
+                pass
+        _log("重启 dnsmasq")
+        ow.exec("/etc/init.d/dnsmasq restart", tolerant=True)
+        report(60, "删除 dnsmasq 实例")
+        try:
+            ow.delete_dnsmasq(cluster["dnsmasq"])
+            _log("dnsmasq 实例已删除")
+        except Exception:
+            pass
+        report(65, "删除 DHCP 池")
+        try:
+            ow.delete_dhcp_pool(cluster["interface"])
+        except Exception:
+            pass
+        report(70, "删除接口")
+        try:
+            ow.delete_interface(cluster["interface"])
+        except Exception:
+            pass
+        report(75, "删除 VLAN 设备")
+        try:
+            ow.delete_vlan_device(cluster["vlan_device"])
+        except Exception:
+            pass
+        report(80, "清理 DHCP 动态租约")
+        try:
+            _gw = cluster.get("gateway", "")
+            if _gw:
+                _prefix = ".".join(_gw.split(".")[:3]) + "."
+                ow.exec(f"sed -i '/^{_prefix}/d' /tmp/dhcp.leases", tolerant=True)
+                _log("DHCP 动态租约已清理")
+        except Exception:
+            pass
+        report(85, "重启网络")
+        try:
+            ow.exec("/etc/init.d/network restart", tolerant=True)
+            _log("网络已重启")
+        except Exception:
+            pass
+    finally:
+        ow.close()
+    report(95, "清理数据库")
+    delete_cluster_db(name)
+    _log("数据库记录已删除")
+    report(100, f"集群 {name} 已删除")
+
+
+def delete_cluster_async(name):
+    task_id = _new_task_id()
+    _update_task(task_id, status="running", progress=0, message="正在初始化删除...")
+
+    def _cb(p, m):
+        _update_task(task_id, progress=p, message=m)
+    def _log(m):
+        _append_log(task_id, m)
+
+    def _run():
+        try:
+            delete_cluster(name, status_callback=_cb, log_callback=_log)
+            _update_task(task_id, status="completed", progress=100, message="集群已删除")
+        except Exception as e:
+            _update_task(task_id, status="error", progress=0, message=str(e), error=str(e))
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    _cleanup_old_tasks()
+    return task_id
+
+
+def create_cluster(master_count, node_count, master_cores, master_memory,
+                   node_cores, node_memory, pve_node, template_vmid,
+                   password="k8s.1234", status_callback=None, log_callback=None):
+    def report(progress, message):
+        if status_callback:
+            status_callback(progress, message)
+
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    _log(f"开始创建集群: master={master_count}, node={node_count}, "
+         f"cores=(master={master_cores}, node={node_cores}), "
+         f"memory=(master={master_memory}MB, node={node_memory}MB)")
+    _log(f"PVE 节点: {pve_node}, 模板 VMID: {template_vmid}")
+    session = get_session()
+    try:
+        used_ids = sorted(row[0] for row in session.query(Cluster.id).all())
+        num = 1
+        for used_id in used_ids:
+            if used_id > num:
+                break
+            num = used_id + 1
+        cluster_name = f"k8s_{num}"
+        cluster_row = Cluster(id=num, name=cluster_name, status="allocating")
+        session.add(cluster_row)
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise K8sError("并发冲突导致集群编号分配失败，请重试")
+    except Exception:
+        session.rollback()
+        raise K8sError("无法分配集群编号，请重试")
+    finally:
+        session.close()
+
+    _log(f"集群编号: {num}, 名称: {cluster_name}")
+    vlan_id = 100 + num
+    vlan_device = f"eth1.{vlan_id}"
+    iface_name = cluster_name
+    ip_prefix = f"10.100.{num}"
+    gateway = f"{ip_prefix}.1"
+    netmask = "255.255.255.0"
+    dnsmasq_name = f"k8s{num}"
+    dhcp_start = "100"
+    dhcp_limit = "150"
+
+    report(5, "正在生成 SSH 密钥对...")
+    _log("生成 2048-bit RSA 密钥对")
+    priv_key, pub_key = _generate_ssh_key()
+    _log(f"SSH 公钥: {pub_key[:80]}...")
+    _log(f"SSH 私钥长度: {len(priv_key)} 字节")
+
+    _log("保存集群信息到数据库 (创建中...)")
+    _initial_entry = {
+        "status": "creating",
+        "vlan_id": vlan_id,
+        "vlan_device": vlan_device,
+        "interface": iface_name,
+        "gateway": gateway,
+        "netmask": netmask,
+        "dnsmasq": dnsmasq_name,
+        "ssh_private_key": priv_key,
+        "ssh_public_key": pub_key,
+        "pve_node": pve_node,
+        "template_vmid": template_vmid,
+        "ssh_port": 50000 + num,
+        "vms": {},
+    }
+    save_cluster(cluster_name, _initial_entry)
+
+    vms = {}
+    created_vms = []
+
+    def _cleanup_db():
+        try:
+            delete_cluster_db(cluster_name)
+        except Exception:
+            pass
+
+    def _rollback_openwrt(ow):
+        try: ow.delete_redirect(cluster_name)
+        except Exception: pass
+        for vm_name in list(vms.keys()):
+            try: ow.delete_dhcp_host(vm_name, skip_restart=True)
+            except Exception: pass
+        try: ow.exec("/etc/init.d/dnsmasq restart", tolerant=True)
+        except Exception: pass
+        try: ow.delete_dnsmasq(dnsmasq_name)
+        except Exception: pass
+        try: ow.delete_dhcp_pool(iface_name)
+        except Exception: pass
+        try: ow.delete_interface(iface_name)
+        except Exception: pass
+        try: ow.delete_vlan_device(vlan_device)
+        except Exception: pass
+        try: ow.exec("/etc/init.d/network restart", tolerant=True)
+        except Exception: pass
+
+    ow = _openwrt_client()
+    ow.connect()
+
+    try:
+        report(10, "正在创建 VLAN 设备...")
+        _log(f"VLAN: 创建设备 {vlan_device} (iface=eth1, vid={vlan_id})")
+        _log(f"执行: uci add network device")
+        _log(f"执行: uci set network.@device[-1].type=8021q, ifname=eth1, vid={vlan_id}, name={vlan_device}")
+        ow.create_vlan_device(vlan_device, "eth1", vlan_id)
+        _log(f"VLAN 设备 {vlan_device} 创建完成")
+
+        report(20, "正在配置接口...")
+        _log(f"接口: 创建 {iface_name} (device={vlan_device}, ip={gateway}/{netmask})")
+        ow.create_interface(iface_name, vlan_device, "static", gateway, netmask)
+        _log(f"接口 {iface_name} 创建完成")
+
+        report(28, "正在配置 DHCP...")
+        _log(f"DHCP: 创建池 {iface_name} (interface={iface_name}, start={dhcp_start}, limit={dhcp_limit})")
+        ow.create_dhcp_pool(iface_name, iface_name, dhcp_start, dhcp_limit)
+        _log(f"DHCP 池 {iface_name} 创建完成")
+
+        report(33, "正在配置 dnsmasq...")
+        _log(f"dnsmasq: 创建实例 {dnsmasq_name} (interface={iface_name}, listen={gateway}, domain={dnsmasq_name}.lan)")
+        ow.create_dnsmasq(dnsmasq_name, iface_name, gateway, f"{dnsmasq_name}.lan")
+        _log(f"dnsmasq 实例 {dnsmasq_name} 创建完成，服务已重启")
+
+        report(38, "正在配置防火墙...")
+        _log("防火墙: 查找 LAN 区域")
+        zones = ow.get_firewall_zones()
+        _log(f"防火墙: 找到 {len(zones)} 个区域: {[z.get('name','?') for z in zones.values()]}")
+        matched = False
+        for sec_name, zone in zones.items():
+            if zone.get("name", "").lower() == "lan":
+                _log(f"防火墙: 找到 LAN 区域 (section={sec_name}), 添加接口 {iface_name}")
+                ow.add_interface_to_zone(sec_name, iface_name)
+                _log(f"防火墙: 接口 {iface_name} 已加入 LAN 区域，防火墙已重启")
+                matched = True
+                break
+        if not matched:
+            _log("防火墙: 警告 - 未找到 LAN 区域，跳过接口绑定")
+
+        report(42, "正在重启 OpenWrt 网络...")
+        _log("执行: /etc/init.d/network restart")
+        ow.exec("/etc/init.d/network restart", tolerant=True)
+        _log("OpenWrt 网络已重启")
+    except Exception as e:
+        _rollback_openwrt(ow)
+        ow.close()
+        _cleanup_db()
+        raise K8sError(f"OpenWrt setup failed: {e}") from e
+
+    client_cores = max(2, master_cores)
+    client_memory = max(2048, master_memory)
+
+    pve_cfg = get_config("pve")
+    _log(f"PVE: 正在连接 {pve_cfg.get('host', '?') if pve_cfg else '?'}:{pve_cfg.get('port', 8006) if pve_cfg else '?'}")
+    report(45, "正在连接 PVE...")
+    pve = _pve_client()
+    version = pve.connect()
+    _log(f"PVE: 连接成功, 版本 {version.get('version', '?') if isinstance(version, dict) else version}")
+    try:
+        configs = [
+            ("client", f"client-k8s{num}", client_cores, client_memory),
+        ]
+        for i in range(1, master_count + 1):
+            configs.append(("master", f"master{i}-k8s{num}", master_cores, master_memory))
+        for i in range(1, node_count + 1):
+            configs.append(("node", f"node{i}-k8s{num}", node_cores, node_memory))
+
+        total_vms = len(configs)
+        _log(f"PVE: 共 {total_vms} 个虚拟机，逐个分配 VMID")
+        for idx, item in enumerate(configs):
+            role = item[0]
+            vm_name = item[1]
+            cores = item[2]
+            memory = item[3]
+
+            vm_progress = 50 + int((idx / total_vms) * 38)
+            report(vm_progress, f"正在创建虚拟机 {vm_name} ({idx + 1}/{total_vms})...")
+
+            cfg = {
+                "name": vm_name,
+                "full": 0,
+                "ciuser": "k8s",
+                "cipassword": password,
+                "sshkeys": quote(pub_key.strip(), safe=''),
+                "ipconfig0": "ip=dhcp",
+                "cores": cores,
+                "memory": memory,
+            }
+
+            _log(f"VM {vm_name}: 读取模板 (VMID {template_vmid}) 网络配置")
+            tmpl_config = pve.get_vm_config(pve_node, template_vmid)
+            old_net = tmpl_config.get("net0", "")
+            _log(f"VM {vm_name}: 模板 net0 = \"{old_net}\"")
+            parts = old_net.split(",")
+            model = parts[0].split("=")[0] if "=" in parts[0] else parts[0]
+            parts[0] = model
+            parts = [p for p in parts if not p.startswith("tag=")]
+            parts = [p for p in parts if not p.startswith("macaddr=")]
+            parts.append(f"tag={vlan_id}")
+            mac = _random_mac()
+            parts.append(f"macaddr={mac}")
+            cfg["net0"] = ",".join(parts)
+            _log(f"VM {vm_name}: 生成 MAC = {mac}, VLAN = {vlan_id}")
+            _log(f"VM {vm_name}: net0 = \"{cfg['net0']}\"")
+            _log(f"VM {vm_name}: 配置 cores={cores}, memory={memory}, cipassword=***, full=0")
+
+            newid = pve.create_vm(pve_node, template_vmid, cfg)
+            _log(f"VM {vm_name}: 创建成功, VMID = {newid}")
+            vms[vm_name] = {"node": pve_node, "vmid": newid, "mac": mac, "role": role}
+            created_vms.append((vm_name, pve_node, newid))
+
+        report(92, "正在启动虚拟机...")
+        for vm_name, node, vmid in created_vms:
+            _log(f"VM {vm_name}: 发送启动命令")
+            try:
+                pve.start_vm(node, vmid)
+                _log(f"VM {vm_name}: 启动命令已发送")
+            except Exception as e:
+                _log(f"VM {vm_name}: 启动跳过 ({e})")
+
+        _exec_timeout = 60
+
+        def _wait_pid(node, vmid, pid_info):
+            info = pid_info or {}
+            pid = (info.get("return", {}) or info.get("data", {}) or info).get("pid", 0)
+            if not pid:
+                return
+            for _ in range(_exec_timeout):
+                _time.sleep(1)
+                try:
+                    s = pve.guest_exec_status(node, vmid, pid)
+                    ret = (s.get("return", {}) or s.get("data", {}) or s)
+                    if ret.get("exited"):
+                        exitcode = ret.get("exitcode", 0)
+                        if exitcode != 0:
+                            err = (ret.get("err-data") or "").strip()
+                            raise K8sError(f"guest exec failed (exit={exitcode}): {err}")
+                        return
+                except K8sError:
+                    raise
+                except Exception:
+                    pass
+
+        report(94, "正在等待 client VM 就绪...")
+        client_vm = next((item for item in created_vms if item[0].startswith("client-")), None)
+        if client_vm:
+            _log(f"Client VM {client_vm[0]}: 等待 QEMU Guest Agent 就绪 (120s 超时)")
+            try:
+                pve.wait_for_guest_agent(client_vm[1], client_vm[2], timeout=120)
+                _log(f"Client VM {client_vm[0]}: Guest Agent 已就绪")
+            except Exception as e:
+                _log(f"Client VM {client_vm[0]}: Guest Agent 未响应 ({e})")
+
+            report(95, "正在配置 client 免密登录...")
+            _log(f"Client VM {client_vm[0]}: 通过 Guest Agent 上传 SSH 私钥")
+            try:
+                _log(f"Guest Exec: mkdir -p /home/k8s/.ssh && chmod 700 /home/k8s/.ssh")
+                r = pve.guest_exec(client_vm[1], client_vm[2],
+                    ["sh", "-c", "mkdir -p /home/k8s/.ssh && chmod 700 /home/k8s/.ssh"])
+                _wait_pid(client_vm[1], client_vm[2], r)
+                _log(f"Guest Exec: 目录创建完成")
+
+                _log(f"Guest Exec: tee /home/k8s/.ssh/id_rsa ({len(priv_key)} bytes)")
+                r = pve.guest_exec(client_vm[1], client_vm[2],
+                    ["tee", "/home/k8s/.ssh/id_rsa"], input_data=priv_key)
+                _wait_pid(client_vm[1], client_vm[2], r)
+                _log(f"Guest Exec: 私钥写入完成")
+
+                _log(f"Guest Exec: chmod 600 /home/k8s/.ssh/id_rsa")
+                r = pve.guest_exec(client_vm[1], client_vm[2],
+                    ["chmod", "600", "/home/k8s/.ssh/id_rsa"])
+                _wait_pid(client_vm[1], client_vm[2], r)
+                _log(f"Guest Exec: 权限设置完成")
+
+                _log(f"Guest Exec: chown -R k8s:k8s /home/k8s/.ssh")
+                r = pve.guest_exec(client_vm[1], client_vm[2],
+                    ["chown", "-R", "k8s:k8s", "/home/k8s/.ssh"])
+                _wait_pid(client_vm[1], client_vm[2], r)
+                _log(f"Guest Exec: 所有者设置完成")
+            except Exception as e:
+                _log(f"Client VM {client_vm[0]}: SSH 密钥上传异常 ({e})")
+
+        report(96, "正在重启虚拟机以刷新主机名...")
+        for vm_name, node, vmid in created_vms:
+            _log(f"VM {vm_name}: 发送重启命令")
+            try:
+                pve.reboot_vm(node, vmid)
+                _log(f"VM {vm_name}: 重启完成")
+            except Exception as e:
+                _log(f"VM {vm_name}: 重启跳过 ({e})")
+
+        _ssh_port = 50000 + num
+        report(96, "正在配置 DHCP 主机绑定和端口转发...")
+        try:
+            ow2 = _openwrt_client()
+            ow2.connect()
+            try:
+                for vm_name, vm_info in vms.items():
+                    _log(f"VM {vm_name}: 等待 Guest Agent 获取 IP")
+                    try:
+                        pve.wait_for_guest_agent(vm_info["node"], vm_info["vmid"], timeout=120)
+                    except Exception as e:
+                        _log(f"VM {vm_name}: Guest Agent 未响应 ({e})")
+                        continue
+                    ip = pve.get_vm_ip(vm_info["node"], vm_info["vmid"])
+                    _log(f"VM {vm_name}: IP = {ip}, MAC = {vm_info['mac']}")
+                    if ip and vm_info["mac"]:
+                        ow2.create_dhcp_host(vm_name, ip, vm_info["mac"])
+                        _log(f"VM {vm_name}: DHCP 主机绑定完成")
+                        if vm_info["role"] == "client":
+                            ow2.create_redirect(
+                                cluster_name, _ssh_port,
+                                ip, "22")
+                            _log(f"Client VM: 端口转发配置完成 WAN:{_ssh_port} → {ip}:22")
+                            report(96, f"端口转发已配置: WAN:{_ssh_port} → {ip}:22")
+            finally:
+                ow2.close()
+        except Exception as e:
+            _log(f"DHCP/端口转发配置异常 ({e})")
+
+    except Exception as e:
+        _log(f"错误: {e}")
+        _log("回滚: 释放已创建的虚拟机")
+        for vm_name, node, vmid in created_vms:
+            try:
+                pve.release_vm(node, vmid, purge=True)
+                _log(f"回滚: VM {vm_name} (VMID {vmid}) 已释放")
+            except Exception as re:
+                _log(f"回滚: VM {vm_name} 释放失败 ({re})")
+        _log("回滚: 清理 OpenWrt 配置")
+        _rollback_openwrt(ow)
+        ow.close()
+        _cleanup_db()
+        _log("回滚: 数据库记录已清理")
+        raise K8sError(f"PVE VM creation failed: {e}") from e
+
+    ow.close()
+
+    report(97, "正在保存集群信息...")
+    _log("保存集群信息到数据库")
+    _client_mac = next((vm["mac"] for vm in vms.values() if vm.get("role") == "client"), None)
+    cluster_entry = {
+        "status": "running",
+        "vlan_id": vlan_id,
+        "vlan_device": vlan_device,
+        "interface": iface_name,
+        "gateway": gateway,
+        "netmask": netmask,
+        "dnsmasq": dnsmasq_name,
+        "ssh_private_key": priv_key,
+        "ssh_public_key": pub_key,
+        "password": password,
+        "pve_node": pve_node,
+        "template_vmid": template_vmid,
+        "vms": vms,
+        "ssh_port": _ssh_port,
+        "client_mac": _client_mac,
+    }
+    save_cluster(cluster_name, cluster_entry)
+
+    _log(f"集群 {cluster_name} 已保存: {total_vms} 个 VM, VLAN {vlan_id}")
+    report(100, "集群创建完成")
+
+    return cluster_name, cluster_entry
+
+
+def create_cluster_async(master_count, node_count, master_cores, master_memory,
+                         node_cores, node_memory, pve_node, template_vmid,
+                         password="k8s.1234"):
+    task_id = _new_task_id()
+    _update_task(task_id, status="running", progress=0, message="正在初始化...")
+
+    def _cb(progress, message):
+        _update_task(task_id, progress=progress, message=message)
+
+    def _log(msg):
+        _append_log(task_id, msg)
+
+    def _run():
+        try:
+            name, cluster = create_cluster(
+                master_count, node_count,
+                master_cores, master_memory,
+                node_cores, node_memory,
+                pve_node, template_vmid,
+                password=password,
+                status_callback=_cb,
+                log_callback=_log,
+            )
+            safe = {k: v for k, v in cluster.items() if k != "ssh_private_key"}
+            _update_task(task_id, status="completed", progress=100,
+                         message="集群创建完成", result={"name": name, "cluster": safe})
+        except Exception as e:
+            _update_task(task_id, status="error", progress=0,
+                         message=str(e), error=str(e))
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    _cleanup_old_tasks()
+    return task_id
+
+
+def deploy_k8s(name, status_callback=None, log_callback=None):
+    cluster = load_cluster(name)
+    if not cluster:
+        raise K8sError(f"集群 {name} 不存在")
+    if cluster.get("status") != "running":
+        raise K8sError(f"集群 {name} 状态异常，无法部署 K8s")
+
+    def report(progress, message):
+        if status_callback:
+            status_callback(progress, message)
+    def _log(msg):
+        if log_callback:
+            log_callback(msg)
+
+    _log(f"开始部署 K8s: 集群 {name}")
+
+    pve = _pve_client()
+    pve.connect()
+    _log("PVE 连接成功")
+
+    client_vm = None
+    for vm_name, vm_info in cluster.get("vms", {}).items():
+        if vm_name.startswith("client-"):
+            client_vm = vm_info
+            break
+    if not client_vm:
+        raise K8sError("集群中没有 client VM")
+    node = client_vm["node"]
+    vmid = client_vm["vmid"]
+
+    report(10, "正在等待 client VM Guest Agent...")
+    _log(f"Client VM {vmid}: 等待 Guest Agent 就绪")
+    pve.wait_for_guest_agent(node, vmid, timeout=120)
+    _log("Guest Agent 已就绪")
+
+    def _file_exists(path):
+        try:
+            r = pve.guest_exec(node, vmid, ["test", "-f", path])
+            _guest_exec_wait(pve, node, vmid, r)
+            return True
+        except K8sError:
+            return False
+
+    def _dir_exists(path):
+        try:
+            r = pve.guest_exec(node, vmid, ["test", "-d", path])
+            _guest_exec_wait(pve, node, vmid, r)
+            return True
+        except K8sError:
+            return False
+
+    def _sh(cmd, timeout=60):
+        r = pve.guest_exec(node, vmid, ["sh", "-c", cmd])
+        _guest_exec_wait(pve, node, vmid, r, timeout=timeout)
+
+    def _sh_out(cmd, timeout=30):
+        r = pve.guest_exec(node, vmid, ["sh", "-c", cmd])
+        info = r or {}
+        pid = (info.get("return", {}) or info.get("data", {}) or info).get("pid", 0)
+        if not pid:
+            return ""
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            _time.sleep(1)
+            s = pve.guest_exec_status(node, vmid, pid)
+            ret = (s.get("return", {}) or s.get("data", {}) or s)
+            if ret.get("exited"):
+                exitcode = ret.get("exitcode", 0)
+                if exitcode != 0:
+                    err = (ret.get("err-data") or "").strip()
+                    raise K8sError(f"guest exec failed (exit={exitcode}): {err}")
+                return (ret.get("out-data") or "").strip()
+        raise K8sError(f"guest exec timed out after {timeout}s")
+
+    def _sh_with_output(cmd, timeout=3600):
+        r = pve.guest_exec(node, vmid, ["sh", "-c", cmd])
+        info = r or {}
+        pid = (info.get("return", {}) or info.get("data", {}) or info).get("pid", 0)
+        if not pid:
+            return
+        prev_out = ""
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            _time.sleep(3)
+            try:
+                s = pve.guest_exec_status(node, vmid, pid)
+                ret = (s.get("return", {}) or s.get("data", {}) or s)
+                out = ret.get("out-data") or ""
+                if out != prev_out:
+                    for line in out[len(prev_out):].rstrip("\n").split("\n"):
+                        _log(f"  {line}")
+                    prev_out = out
+                if ret.get("exited"):
+                    exitcode = ret.get("exitcode", 0)
+                    if exitcode != 0:
+                        raise K8sError(f"命令失败 (exit={exitcode})")
+                    return
+            except K8sError:
+                raise
+            except Exception:
+                pass
+        raise K8sError(f"命令超时 ({timeout}s)")
+
+    report(15, "正在复制 SSH 密钥到 /root/.ssh/...")
+    _priv_key = cluster.get("ssh_private_key", "")
+    _existing_key = _sh_out("cat /root/.ssh/id_rsa || true")
+    if _existing_key != _priv_key:
+        _log("复制 SSH 私钥 → /root/.ssh/id_rsa")
+        try:
+            _sh("cp /home/k8s/.ssh/id_rsa /root/.ssh/id_rsa && "
+                "chmod 600 /root/.ssh/id_rsa && "
+                "chown root:root /root/.ssh/id_rsa")
+            _log("SSH 密钥复制完成")
+        except K8sError as e:
+            _log(f"SSH 密钥复制失败: {e}")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+    else:
+        _log("/root/.ssh/id_rsa 内容正确，跳过")
+
+    report(18, "正在上传 SSH 公钥到所有节点...")
+    _log("开始上传 SSH 公钥 → /root/.ssh/authorized_keys")
+    pub_key = cluster.get("ssh_public_key", "")
+    if not pub_key:
+        _log("SSH 公钥缺失")
+        cluster["k8s_status"] = "failed"
+        save_cluster(name, cluster)
+        raise K8sError("集群 SSH 公钥缺失")
+    for vm_name, vm_info in cluster.get("vms", {}).items():
+        _log(f"VM {vm_name}: 等待 Guest Agent 就绪")
+        try:
+            pve.wait_for_guest_agent(vm_info["node"], vm_info["vmid"], timeout=120)
+        except Exception as e:
+            _log(f"VM {vm_name}: Guest Agent 未响应 ({e}), 跳过")
+            continue
+        _log(f"VM {vm_name}: 创建 /root/.ssh/ 目录")
+        try:
+            r = pve.guest_exec(vm_info["node"], vm_info["vmid"],
+                ["sh", "-c", "mkdir -p /root/.ssh && chmod 700 /root/.ssh"])
+            _guest_exec_wait(pve, vm_info["node"], vm_info["vmid"], r)
+        except K8sError as e:
+            _log(f"VM {vm_name}: 目录创建失败 ({e})")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+        _log(f"VM {vm_name}: 写入 authorized_keys")
+        try:
+            r = pve.guest_exec(vm_info["node"], vm_info["vmid"],
+                ["tee", "/root/.ssh/authorized_keys"], input_data=pub_key)
+            _guest_exec_wait(pve, vm_info["node"], vm_info["vmid"], r)
+        except K8sError as e:
+            _log(f"VM {vm_name}: authorized_keys 写入失败 ({e})")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+        _log(f"VM {vm_name}: 设置权限")
+        try:
+            r = pve.guest_exec(vm_info["node"], vm_info["vmid"],
+                ["sh", "-c", "chmod 600 /root/.ssh/authorized_keys && chown root:root /root/.ssh/authorized_keys"])
+            _guest_exec_wait(pve, vm_info["node"], vm_info["vmid"], r)
+            _log(f"VM {vm_name}: SSH 公钥上传完成")
+        except K8sError as e:
+            _log(f"VM {vm_name}: 权限设置失败 ({e})")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+
+    report(25, "正在更新集群 K8s 状态...")
+    cluster["k8s_status"] = "installing"
+    save_cluster(name, cluster)
+    _log("集群 K8s 状态已更新为 installing")
+
+    # ── ezdown ──
+    report(30, "正在下载 ezdown...")
+    if not _file_exists("/home/k8s/ezdown"):
+        _log("下载 ezdown → /home/k8s/ezdown")
+        try:
+            r = pve.guest_exec(node, vmid,
+                ["/usr/bin/python3", "-c",
+                 "import urllib.request; urllib.request.urlretrieve('http://10.11.43.82/download/ezdown', '/tmp/ezdown')"])
+            _guest_exec_wait(pve, node, vmid, r, timeout=120)
+            _sh("mv /tmp/ezdown /home/k8s/ezdown && chmod 755 /home/k8s/ezdown && chown k8s:k8s /home/k8s/ezdown")
+            _log("ezdown 下载完成")
+        except K8sError as e:
+            _log(f"ezdown 下载失败: {e}")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+    else:
+        _log("ezdown 已存在，跳过下载")
+
+    # ── kubeasz_offline.tgz ──
+    report(40, "正在下载 kubeasz 离线包...")
+    if not _file_exists("/home/k8s/kubeasz_offline.tgz"):
+        _log("下载 kubeasz_offline.tgz → /home/k8s/kubeasz_offline.tgz")
+        try:
+            r = pve.guest_exec(node, vmid,
+                ["/usr/bin/python3", "-c",
+                 "import urllib.request; urllib.request.urlretrieve('http://10.11.43.82/download/kubeasz_offline.tgz', '/tmp/kubeasz_offline.tgz')"])
+            _guest_exec_wait(pve, node, vmid, r, timeout=600)
+            _sh("mv /tmp/kubeasz_offline.tgz /home/k8s/kubeasz_offline.tgz && chown k8s:k8s /home/k8s/kubeasz_offline.tgz")
+            _log("kubeasz_offline.tgz 下载完成")
+        except K8sError as e:
+            _log(f"kubeasz_offline.tgz 下载失败: {e}")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+    else:
+        _log("kubeasz_offline.tgz 已存在，跳过下载")
+
+    # ── extract kubeasz_offline.tgz ──
+    report(55, "正在解压 kubeasz 离线包...")
+    if not _dir_exists("/etc/kubeasz/roles"):
+        _log("解压 kubeasz_offline.tgz → /etc")
+        try:
+            _sh("tar xzf /home/k8s/kubeasz_offline.tgz -C /etc", timeout=300)
+            _log("解压完成")
+        except K8sError as e:
+            _log(f"解压失败: {e}")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+    else:
+        _log("kubeasz 已解压，跳过")
+
+    # ── ezdown: download dependencies ──
+    report(65, "正在通过 ezdown 下载离线依赖...")
+    if not _sh_out("which docker || true"):
+        _log("执行: sudo /home/k8s/ezdown -D")
+        try:
+            _sh("sudo /home/k8s/ezdown -D", timeout=600)
+            _log("ezdown -D 下载完成")
+        except K8sError as e:
+            _log(f"ezdown -D 失败: {e}")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+    else:
+        _log("Docker 已安装，跳过")
+
+    # ── ezdown: create kubeasz container ──
+    report(75, "正在创建 kubeasz 容器...")
+    _container_name = _sh_out("docker ps -a --format '{{.Names}}' | grep -w kubeasz || true")
+    if not _container_name:
+        _log("执行: sudo /home/k8s/ezdown -S")
+        try:
+            _sh("sudo /home/k8s/ezdown -S", timeout=120)
+            _log("kubeasz 容器创建完成")
+        except K8sError as e:
+            _log(f"ezdown -S 失败: {e}")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+    else:
+        _log("kubeasz 容器已存在，跳过创建")
+
+    # ── ezctl new + config ──
+    report(80, "正在检查集群配置文件...")
+    cluster_dir = f"/etc/kubeasz/clusters/{name}"
+    if not _dir_exists(cluster_dir):
+        _log(f"执行: docker exec kubeasz ezctl new {name}")
+        try:
+            _sh(f"docker exec kubeasz ezctl new {name}", timeout=60)
+            _log("ezctl new 完成")
+        except K8sError as e:
+            _log(f"ezctl new 失败: {e}")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+    else:
+        _log(f"配置目录 {cluster_dir} 已存在，跳过")
+
+    f_config = f"{cluster_dir}/config.yml"
+
+    masters = sorted([k for k, v in cluster["vms"].items() if v["role"] == "master"])
+    nodes   = sorted([k for k, v in cluster["vms"].items() if v["role"] == "node"])
+    _log(f"master 节点: {masters}")
+    _log(f"node 节点:   {nodes}")
+
+    # Resolve hostnames to IPs via PVE guest agent
+    report(82, "正在获取节点 IP 地址...")
+    _log("通过 Guest Agent 获取所有节点 IP")
+    master_ips = {}
+    node_ips = {}
+    for vm_name in masters + nodes:
+        vm_info = cluster["vms"][vm_name]
+        ip = None
+        try:
+            ip = pve.get_vm_ip(vm_info["node"], vm_info["vmid"])
+        except Exception:
+            pass
+        if ip:
+            _log(f"{vm_name}: {ip}")
+        else:
+            _log(f"{vm_name}: 无法获取 IP，使用主机名")
+        role = vm_info.get("role")
+        if role == "master":
+            master_ips[vm_name] = ip or vm_name
+        else:
+            node_ips[vm_name] = ip or vm_name
+
+    # hosts: 读取已生成的文件，只替换三个占位符
+    _log(f"读取已有 hosts 文件: {cluster_dir}/hosts")
+    _tmpl = _sh_out(f"cat {cluster_dir}/hosts")
+
+    _tmpl = _tmpl.replace("{{etcd_server}}", "\n".join(
+        master_ips[m] for m in masters
+    ))
+    _tmpl = _tmpl.replace("{{master_server}}", "\n".join(
+        f"{master_ips[m]} k8s_nodename='master-{i:02d}'" for i, m in enumerate(masters, 1)
+    ))
+    _tmpl = _tmpl.replace("{{node_server}}", "\n".join(
+        f"{node_ips[n]} k8s_nodename='worker-{i:02d}'" for i, n in enumerate(nodes, 1)
+    ))
+
+    _log("写入 hosts 文件")
+    try:
+        r = pve.guest_exec(node, vmid,
+            ["tee", f"{cluster_dir}/hosts"], input_data=_tmpl)
+        _guest_exec_wait(pve, node, vmid, r)
+        _log("hosts 文件写入完成")
+    except K8sError as e:
+        _log(f"hosts 文件写入失败: {e}")
+        cluster["k8s_status"] = "failed"
+        save_cluster(name, cluster)
+        raise
+
+    # config.yml: INSTALL_SOURCE
+    _log("修改 config.yml: INSTALL_SOURCE=offline")
+    _sh(f"""sed -i 's/^INSTALL_SOURCE: "online"/INSTALL_SOURCE: "offline"/' {f_config}""")
+
+    # MASTER_CERT_HOSTS: 替换示例 IP 为第一个 master 的真实 IP (非致命)
+    if masters:
+        _master0 = masters[0]
+        _master0_ip = master_ips.get(_master0, _master0)
+        _log(f"更新 MASTER_CERT_HOSTS: {_master0} → {_master0_ip}")
+        _prefix = "'s/^  - \"10\\.1\\.1\\.1\"/  - \"'"
+        _suffix = "'\"/'"
+        _sh(f"sed -i {_prefix}{_master0_ip}{_suffix} {f_config} && "
+            f"sed -i '/k8s\\.easzlab\\.io/s/^/#/' {f_config} || true")
+
+    # ── 实际安装 K8s ──
+    report(92, "正在检查 K8s 集群安装状态...")
+    if not _file_exists(f"{cluster_dir}/kubeconfig"):
+        _log("开始安装 Kubernetes 集群（预计 15-30 分钟）...")
+        try:
+            _sh_with_output(f"sudo docker exec kubeasz ezctl setup {name} all")
+            _log("Kubernetes 集群安装完成")
+        except K8sError as e:
+            _log(f"集群安装失败: {e}")
+            cluster["k8s_status"] = "failed"
+            save_cluster(name, cluster)
+            raise
+    else:
+        _log("K8s 集群已安装，跳过安装步骤")
+
+    # ── 下载 kubeconfig ──
+    report(97, "正在下载 kubeconfig...")
+    _kube_dir = "/home/k8s/.kube"
+    _kubeconfig_path = f"{_kube_dir}/config"
+    if not _file_exists(_kubeconfig_path):
+        _log(f"创建目录 {_kube_dir}")
+        _sh(f"mkdir -p {_kube_dir} && chown k8s:k8s {_kube_dir}")
+        _log(f"从第一个 master 节点下载 kubeconfig → {_kubeconfig_path}")
+        try:
+            first_master_ip = master_ips[masters[0]]
+            _sh(f"ssh -o StrictHostKeyChecking=no root@{first_master_ip} "
+                f"'cat /root/.kube/config' > {_kubeconfig_path} && "
+                f"chown k8s:k8s {_kubeconfig_path}")
+            _log("kubeconfig 下载完成")
+        except Exception as e:
+            _log(f"kubeconfig 下载失败（可手动下载）: {e}")
+    else:
+        _log("kubeconfig 已存在，跳过下载")
+
+    # ── 安装 kubectl ──
+    report(98, "正在安装 kubectl...")
+    if not _file_exists("/usr/local/bin/kubectl"):
+        _log("从 /etc/kubeasz/bin/kubectl 安装 kubectl")
+        try:
+            _sh("cp /etc/kubeasz/bin/kubectl /usr/local/bin/kubectl && "
+                "chmod 755 /usr/local/bin/kubectl")
+            _log("kubectl 安装完成")
+        except Exception as e:
+            _log(f"kubectl 安装失败（可手动安装）: {e}")
+    else:
+        _log("kubectl 已存在，跳过安装")
+
+    report(99, "正在保存 K8s 部署状态...")
+    _log("更新集群 K8s 状态为 installed")
+    cluster["k8s_status"] = "installed"
+    save_cluster(name, cluster)
+
+    _log("K8s 部署完成")
+    report(100, "K8s 部署完成")
+
+
+def deploy_k8s_async(name):
+    task_id = _new_task_id()
+    _update_task(task_id, status="running", progress=0, message="正在初始化 K8s 部署...")
+
+    def _cb(progress, message):
+        _update_task(task_id, progress=progress, message=message)
+    def _log(msg):
+        _append_log(task_id, msg)
+
+    def _run():
+        try:
+            deploy_k8s(name, status_callback=_cb, log_callback=_log)
+            _update_task(task_id, status="completed", progress=100,
+             message="K8s 部署完成")
+        except Exception as e:
+            _update_task(task_id, status="error", progress=0,
+                         message=str(e), error=str(e))
+    
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    
+    _cleanup_old_tasks()
+    return task_id
