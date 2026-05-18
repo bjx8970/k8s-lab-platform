@@ -4,22 +4,42 @@
 <div class="stats-grid">
     <div class="stat-card">
         <div class="label">用户总数</div>
-        <div class="value">0</div>
+        <div class="value" id="stat-users">-</div>
     </div>
     <div class="stat-card">
         <div class="label">班级总数</div>
-        <div class="value">0</div>
+        <div class="value" id="stat-classes">-</div>
     </div>
     <div class="stat-card">
         <div class="label">K8s集群数</div>
-        <div class="value">0</div>
+        <div class="value" id="stat-clusters">-</div>
     </div>
     <div class="stat-card">
         <div class="label">PVE连接数</div>
-        <div class="value">0</div>
+        <div class="value" id="stat-pve">-</div>
     </div>
 </div>
 <div class="card">
-    <p>欢迎使用 K8s Lab Platform 管理后台，请通过左侧导航栏进入各功能模块。</p>
+    <p>欢迎使用 K8s Lab Platform 管理后台，{{ g.user.username }}（{{ {'admin':'管理员','teacher':'教师','student':'学生'}.get(g.user.role, g.user.role) }}）。</p>
 </div>
+<script>
+async function loadStats() {
+    try {
+        const [users, classes, pve] = await Promise.all([
+            fetch('/api/users').then(r => r.json()),
+            fetch('/api/classes').then(r => r.json()),
+            fetch('/api/pve/servers').then(r => r.json()),
+        ]);
+        document.getElementById('stat-users').textContent = Array.isArray(users) ? users.length : '0';
+        document.getElementById('stat-classes').textContent = Array.isArray(classes) ? classes.length : '0';
+        document.getElementById('stat-pve').textContent = Array.isArray(pve) ? pve.length : '0';
+    } catch(e) {}
+    try {
+        const r = await fetch('/api/k8s/clusters');
+        const clusters = await r.json();
+        document.getElementById('stat-clusters').textContent = Object.keys(clusters).length;
+    } catch(e) {}
+}
+document.addEventListener('DOMContentLoaded', loadStats);
+</script>
 {% endblock %}

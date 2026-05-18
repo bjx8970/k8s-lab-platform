@@ -1,16 +1,16 @@
 import json
 import os
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 
 from sqlalchemy import (
-    Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
-    create_engine, func, text as sa_text,
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
+    create_engine, func,
 )
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker, selectinload
 
-DB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(DB_DIR, "k8s_lab.db")
-DB_CONFIG_PATH = os.path.join(DB_DIR, ".db_config.json")
+DB_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".db_config.json")
 
 
 def _load_db_config():
@@ -20,7 +20,7 @@ def _load_db_config():
                 return json.load(f)
         except Exception:
             pass
-    return {"type": "sqlite"}
+    return None
 
 
 def _save_db_config(cfg):
@@ -30,15 +30,27 @@ def _save_db_config(cfg):
 
 def _create_engine():
     cfg = _load_db_config()
-    if cfg.get("type") == "postgresql":
-        url = (f"postgresql+pg8000://{cfg['user']}:{cfg['password']}@"
-               f"{cfg['host']}:{cfg.get('port', 5432)}/{cfg['database']}")
-        return create_engine(url, echo=False)
-    return create_engine(f"sqlite:///{DB_PATH}", echo=False)
+    if not cfg or cfg.get("type") != "postgresql":
+        return None
+    missing = [k for k in ("host", "user", "password", "database") if not cfg.get(k)]
+    if missing:
+        return None
+    url = (f"postgresql+pg8000://{cfg['user']}:{cfg['password']}@"
+           f"{cfg['host']}:{cfg.get('port', 5432)}/{cfg['database']}")
+    try:
+        return create_engine(
+            url, echo=False,
+            pool_size=10, max_overflow=20,
+            pool_pre_ping=True, pool_recycle=3600,
+        )
+    except Exception:
+        return None
 
+
+_engine_lock = threading.Lock()
 
 engine = _create_engine()
-SessionLocal = sessionmaker(bind=engine)
+SessionLocal = sessionmaker(bind=engine) if engine else None
 Base = declarative_base()
 
 
@@ -65,16 +77,21 @@ class Cluster(Base):
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=True, index=True)
+    class_id = Column(Integer, ForeignKey("classes.id"), nullable=True, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+
     vms = relationship("Vm", back_populates="cluster", cascade="all, delete-orphan")
+    group_ref = relationship("Group", back_populates="clusters")
 
 
 class Vm(Base):
     __tablename__ = "vms"
     id = Column(Integer, primary_key=True)
-    cluster_id = Column(Integer, ForeignKey("clusters.id"), nullable=False)
+    cluster_id = Column(Integer, ForeignKey("clusters.id"), nullable=False, index=True)
     vm_name = Column(String(64), nullable=False)
     vmid = Column(Integer, unique=True, nullable=False)
-    node = Column(String(32), nullable=False)
+    node = Column(String(32), nullable=False, index=True)
     role = Column(String(16))
     mac = Column(String(24))
     ip = Column(String(16))
@@ -102,47 +119,80 @@ class PVEServer(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    password_hash = Column(String(256), nullable=False)
+    role = Column(String(16), nullable=False, default="student")
+    is_active = Column(Boolean, default=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    created_at = Column(DateTime, default=func.now())
+
+    group_memberships = relationship("GroupMember", back_populates="user", cascade="all, delete-orphan")
+
+
+class SchoolClass(Base):
+    __tablename__ = "classes"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(128), nullable=False)
+    description = Column(Text, default="")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now())
+
+    groups = relationship("Group", back_populates="class_ref", cascade="all, delete-orphan")
+
+
+class Group(Base):
+    __tablename__ = "groups"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(128), nullable=False)
+    class_id = Column(Integer, ForeignKey("classes.id"), nullable=False, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=func.now())
+
+    class_ref = relationship("SchoolClass", back_populates="groups")
+    members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
+    clusters = relationship("Cluster", back_populates="group_ref")
+
+
+class GroupMember(Base):
+    __tablename__ = "group_members"
+    id = Column(Integer, primary_key=True)
+    group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    class_id = Column(Integer, ForeignKey("classes.id"), nullable=False, index=True)
+    __table_args__ = (
+        UniqueConstraint("user_id", "class_id", name="uq_user_class_group"),
+    )
+
+    user = relationship("User", back_populates="group_memberships")
+    group = relationship("Group", back_populates="members")
+
+
 def get_config(key):
-    session = get_session()
-    try:
+    with session_scope() as session:
         row = session.query(Config).filter_by(key=key).first()
         return json.loads(row.value) if row else None
-    finally:
-        session.close()
 
 
 def set_config(key, value):
-    session = get_session()
-    try:
+    with session_scope(commit=True) as session:
         row = session.query(Config).filter_by(key=key).first()
         val = json.dumps(value, ensure_ascii=False)
         if row:
             row.value = val
         else:
             session.add(Config(key=key, value=val))
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
 
 
 def delete_config(key):
-    session = get_session()
-    try:
+    with session_scope(commit=True) as session:
         session.query(Config).filter_by(key=key).delete()
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
 
 
 def migrate_pve_config():
-    session = get_session()
-    try:
+    with session_scope(commit=True) as session:
         existing = session.query(PVEServer).first()
         if existing:
             return
@@ -159,17 +209,11 @@ def migrate_pve_config():
             node=cfg.get("node", ""),
         )
         session.add(server)
-        session.commit()
         delete_config("pve")
-    except Exception:
-        session.rollback()
-    finally:
-        session.close()
 
 
 def list_pve_servers():
-    session = get_session()
-    try:
+    with session_scope() as session:
         servers = session.query(PVEServer).all()
         return [{
             "id": s.id,
@@ -181,13 +225,10 @@ def list_pve_servers():
             "token_value": "****",
             "node": s.node,
         } for s in servers]
-    finally:
-        session.close()
 
 
 def get_pve_server(server_id):
-    session = get_session()
-    try:
+    with session_scope() as session:
         s = session.query(PVEServer).filter_by(id=server_id).first()
         if not s:
             return None
@@ -201,13 +242,10 @@ def get_pve_server(server_id):
             "token_value": s.token_value,
             "node": s.node,
         }
-    finally:
-        session.close()
 
 
 def create_pve_server(data):
-    session = get_session()
-    try:
+    with session_scope(commit=True) as session:
         s = PVEServer(
             name=data["name"],
             host=data["host"],
@@ -218,18 +256,11 @@ def create_pve_server(data):
             node=data.get("node", ""),
         )
         session.add(s)
-        session.commit()
         return s.id
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
 
 
 def update_pve_server(server_id, data):
-    session = get_session()
-    try:
+    with session_scope(commit=True) as session:
         s = session.query(PVEServer).filter_by(id=server_id).first()
         if not s:
             return None
@@ -241,21 +272,31 @@ def update_pve_server(server_id, data):
         if "token_value" in data and data["token_value"] and data["token_value"] != "****":
             s.token_value = data["token_value"]
         if "node" in data: s.node = data["node"]
-        session.commit()
         return s.id
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
 
 
 def delete_pve_server(server_id):
-    session = get_session()
-    try:
+    with session_scope(commit=True) as session:
         s = session.query(PVEServer).filter_by(id=server_id).first()
         if s:
             session.delete(s)
+
+
+def init_db():
+    with _engine_lock:
+        if engine is None:
+            raise RuntimeError("数据库未配置")
+    Base.metadata.create_all(engine)
+    _ensure_db_indexes()
+    migrate_pve_config()
+
+
+@contextmanager
+def session_scope(commit=False):
+    session = get_session()
+    try:
+        yield session
+        if commit:
             session.commit()
     except Exception:
         session.rollback()
@@ -264,33 +305,11 @@ def delete_pve_server(server_id):
         session.close()
 
 
-def init_db():
-    Base.metadata.create_all(engine)
-    cfg = _load_db_config()
-    if cfg.get("type", "sqlite") == "sqlite":
-        try:
-            with engine.connect() as conn:
-                conn.execute(sa_text("ALTER TABLE clusters ADD COLUMN k8s_status VARCHAR(16) DEFAULT 'pending'"))
-                conn.commit()
-        except Exception:
-            pass
-        try:
-            with engine.connect() as conn:
-                conn.execute(sa_text("ALTER TABLE clusters ADD COLUMN password VARCHAR(64) DEFAULT 'k8s.1234'"))
-                conn.commit()
-        except Exception:
-            pass
-        try:
-            with engine.connect() as conn:
-                conn.execute(sa_text("ALTER TABLE clusters ADD COLUMN pve_server_id INTEGER DEFAULT 0"))
-                conn.commit()
-        except Exception:
-            pass
-        migrate_pve_config()
-
-
 def get_session():
-    return SessionLocal()
+    with _engine_lock:
+        if SessionLocal is None:
+            raise RuntimeError("数据库未配置")
+        return SessionLocal()
 
 
 def _cluster_to_dict(cluster):
@@ -311,34 +330,52 @@ def _cluster_to_dict(cluster):
         "pve_server_id": cluster.pve_server_id,
         "ssh_port": cluster.ssh_port,
         "client_mac": cluster.client_mac,
+        "group_id": cluster.group_id,
+        "class_id": cluster.class_id,
+        "created_by": cluster.created_by,
         "vms": {vm.vm_name: {"node": vm.node, "vmid": vm.vmid, "role": vm.role, "mac": vm.mac, "ip": vm.ip}
                 for vm in cluster.vms},
     }
 
 
+def _ensure_db_indexes():
+    if engine is None:
+        return
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS ix_clusters_group_id ON clusters (group_id)",
+        "CREATE INDEX IF NOT EXISTS ix_clusters_created_by ON clusters (created_by)",
+        "CREATE INDEX IF NOT EXISTS ix_clusters_pve_server_id ON clusters (pve_server_id)",
+        "CREATE INDEX IF NOT EXISTS ix_vms_cluster_id ON vms (cluster_id)",
+        "CREATE INDEX IF NOT EXISTS ix_vms_node ON vms (node)",
+        "CREATE INDEX IF NOT EXISTS ix_group_members_user_id ON group_members (user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_group_members_group_id ON group_members (group_id)",
+        "CREATE INDEX IF NOT EXISTS ix_group_members_class_id ON group_members (class_id)",
+    ]
+    with engine.connect() as conn:
+        for stmt in indexes:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass
+        conn.commit()
+
+
 def load_clusters():
-    session = get_session()
-    try:
-        clusters = session.query(Cluster).all()
+    with session_scope() as session:
+        clusters = session.query(Cluster).options(selectinload(Cluster.vms)).all()
         return {c.name: _cluster_to_dict(c) for c in clusters}
-    finally:
-        session.close()
 
 
 def load_cluster(name):
-    session = get_session()
-    try:
+    with session_scope() as session:
         cluster = session.query(Cluster).filter_by(name=name).first()
         if cluster is None:
             return None
         return _cluster_to_dict(cluster)
-    finally:
-        session.close()
 
 
 def save_cluster(name, cluster_data):
-    session = get_session()
-    try:
+    with session_scope(commit=True) as session:
         cluster = session.query(Cluster).filter_by(name=name).first()
         if cluster is None:
             cluster = Cluster(name=name)
@@ -359,6 +396,9 @@ def save_cluster(name, cluster_data):
         cluster.password = cluster_data.get("password", cluster.password or "k8s.1234")
         cluster.client_mac = cluster_data.get("client_mac")
         cluster.k8s_status = cluster_data.get("k8s_status", cluster.k8s_status or "pending")
+        cluster.group_id = cluster_data.get("group_id")
+        cluster.class_id = cluster_data.get("class_id")
+        cluster.created_by = cluster_data.get("created_by")
         cluster.updated_at = func.now()
 
         vms = cluster_data.get("vms", {})
@@ -376,27 +416,25 @@ def save_cluster(name, cluster_data):
             vm.mac = vm_info.get("mac", "")
             vm.ip = vm_info.get("ip", "")
 
-        session.commit()
         return cluster.id
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
 
 
 def delete_cluster_db(name):
-    session = get_session()
-    try:
+    with session_scope(commit=True) as session:
         cluster = session.query(Cluster).filter_by(name=name).first()
         if cluster:
             session.delete(cluster)
-            session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
+
+
+def find_cluster_by_vm(node, vmid):
+    with session_scope() as session:
+        vm = session.query(Vm).filter_by(node=node, vmid=vmid).first()
+        if not vm:
+            return None
+        cluster = session.query(Cluster).filter_by(id=vm.cluster_id).first()
+        if not cluster:
+            return None
+        return _cluster_to_dict(cluster)
 
 
 def migrate_from_json(json_path):
@@ -432,16 +470,26 @@ def set_db_config(cfg):
     _save_db_config(cfg)
 
 
+def reload_db_engine():
+    global engine, SessionLocal
+    with _engine_lock:
+        engine = _create_engine()
+        SessionLocal = sessionmaker(bind=engine) if engine else None
+
+
+def is_db_configured():
+    with _engine_lock:
+        return engine is not None
+
+
 def get_db_status():
     cfg = _load_db_config()
-    result = {"type": cfg.get("type", "sqlite")}
-    if result["type"] == "postgresql":
-        result["host"] = cfg.get("host", "")
-        result["database"] = cfg.get("database", "")
+    if not cfg:
+        return {"type": "none", "connected": False, "cluster_count": 0}
+    result = {"type": "postgresql", "host": cfg.get("host", ""), "database": cfg.get("database", "")}
     try:
-        session = get_session()
-        cluster_count = session.query(Cluster).count()
-        session.close()
+        with session_scope() as session:
+            cluster_count = session.query(Cluster).count()
         result["cluster_count"] = cluster_count
         result["connected"] = True
     except Exception:
@@ -450,58 +498,479 @@ def get_db_status():
     return result
 
 
-def migrate_data_from_sqlite():
-    cfg = _load_db_config()
-    if cfg.get("type") != "postgresql":
-        raise Exception("当前不是 PostgreSQL 模式")
+# ── User CRUD ──
 
-    if not os.path.exists(DB_PATH):
-        raise Exception(f"SQLite 文件不存在: {DB_PATH}")
+def _user_to_dict(u):
+    return {
+        "id": u.id,
+        "username": u.username,
+        "role": u.role,
+        "is_active": u.is_active,
+        "password_hash": u.password_hash,
+        "created_by": u.created_by,
+        "created_at": u.created_at.isoformat() if u.created_at else None,
+    }
 
-    sqlite_engine = create_engine(f"sqlite:///{DB_PATH}")
-    SQLiteSession = sessionmaker(bind=sqlite_engine)
 
-    pg_session = get_session()
-    sq_session = SQLiteSession()
-
+def create_user(data):
+    session = get_session()
     try:
-        for row in sq_session.query(Config).all():
-            existing = pg_session.query(Config).filter_by(key=row.key).first()
-            if not existing:
-                pg_session.add(Config(key=row.key, value=row.value))
-
-        sq_clusters = sq_session.query(Cluster).all()
-        for sc in sq_clusters:
-            existing = pg_session.query(Cluster).filter_by(id=sc.id).first()
-            if not existing:
-                c = Cluster(
-                    id=sc.id, name=sc.name, status=sc.status,
-                    vlan_id=sc.vlan_id, vlan_device=sc.vlan_device,
-                    interface=sc.interface, gateway=sc.gateway,
-                    netmask=sc.netmask, dnsmasq=sc.dnsmasq,
-                    ssh_private_key=sc.ssh_private_key,
-                    ssh_public_key=sc.ssh_public_key,
-                    pve_node=sc.pve_node, template_vmid=sc.template_vmid,
-                    ssh_port=sc.ssh_port, client_mac=sc.client_mac,
-                    k8s_status=sc.k8s_status, password=sc.password,
-                    pve_server_id=sc.pve_server_id,
-                    created_at=sc.created_at, updated_at=sc.updated_at,
-                )
-                pg_session.add(c)
-                pg_session.flush()
-
-                for sv in sc.vms:
-                    pg_session.add(Vm(
-                        cluster_id=c.id, vm_name=sv.vm_name,
-                        vmid=sv.vmid, node=sv.node, role=sv.role,
-                        mac=sv.mac, ip=sv.ip,
-                    ))
-
-        pg_session.commit()
-        return {"message": f"已迁移 {len(sq_clusters)} 条集群记录"}
+        u = User(
+            username=data["username"],
+            password_hash=data["password_hash"],
+            role=data.get("role", "student"),
+            created_by=data.get("created_by"),
+        )
+        session.add(u)
+        session.commit()
+        return u.id
     except Exception:
-        pg_session.rollback()
+        session.rollback()
         raise
     finally:
-        sq_session.close()
-        pg_session.close()
+        session.close()
+
+
+def get_user(user_id):
+    session = get_session()
+    try:
+        u = session.query(User).filter_by(id=user_id).first()
+        if not u:
+            return None
+        return _user_to_dict(u)
+    finally:
+        session.close()
+
+
+def get_user_by_username(username):
+    session = get_session()
+    try:
+        u = session.query(User).filter_by(username=username).first()
+        if not u:
+            return None
+        return _user_to_dict(u)
+    finally:
+        session.close()
+
+
+def list_users(role=None, created_by=None):
+    session = get_session()
+    try:
+        q = session.query(User)
+        if role:
+            q = q.filter_by(role=role)
+        if created_by is not None:
+            q = q.filter_by(created_by=created_by)
+        users = q.order_by(User.created_at.desc()).all()
+        result = []
+        for u in users:
+            d = _user_to_dict(u)
+            d.pop("password_hash", None)
+            result.append(d)
+        return result
+    finally:
+        session.close()
+
+
+def update_user(user_id, data):
+    session = get_session()
+    try:
+        u = session.query(User).filter_by(id=user_id).first()
+        if not u:
+            return None
+        if "username" in data:
+            u.username = data["username"]
+        if "password_hash" in data:
+            u.password_hash = data["password_hash"]
+        if "role" in data:
+            u.role = data["role"]
+        if "is_active" in data:
+            u.is_active = data["is_active"]
+        session.commit()
+        return u.id
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def delete_user(user_id):
+    session = get_session()
+    try:
+        u = session.query(User).filter_by(id=user_id).first()
+        if u:
+            session.delete(u)
+            session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def count_users(role=None):
+    session = get_session()
+    try:
+        q = session.query(func.count(User.id))
+        if role:
+            q = q.filter_by(role=role)
+        return q.scalar() or 0
+    finally:
+        session.close()
+
+
+# ── Class CRUD ──
+
+def create_class(data):
+    session = get_session()
+    try:
+        c = SchoolClass(
+            name=data["name"],
+            description=data.get("description", ""),
+            created_by=data["created_by"],
+        )
+        session.add(c)
+        session.commit()
+        return c.id
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_class(class_id):
+    session = get_session()
+    try:
+        c = session.query(SchoolClass).filter_by(id=class_id).first()
+        if not c:
+            return None
+        return {
+            "id": c.id,
+            "name": c.name,
+            "description": c.description,
+            "created_by": c.created_by,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        }
+    finally:
+        session.close()
+
+
+def list_classes(created_by=None):
+    session = get_session()
+    try:
+        q = session.query(SchoolClass)
+        if created_by is not None:
+            q = q.filter_by(created_by=created_by)
+        classes = q.order_by(SchoolClass.created_at.desc()).all()
+        return [{
+            "id": c.id,
+            "name": c.name,
+            "description": c.description,
+            "created_by": c.created_by,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        } for c in classes]
+    finally:
+        session.close()
+
+
+def update_class(class_id, data):
+    session = get_session()
+    try:
+        c = session.query(SchoolClass).filter_by(id=class_id).first()
+        if not c:
+            return None
+        if "name" in data:
+            c.name = data["name"]
+        if "description" in data:
+            c.description = data["description"]
+        session.commit()
+        return c.id
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def delete_class(class_id):
+    session = get_session()
+    try:
+        c = session.query(SchoolClass).filter_by(id=class_id).first()
+        if c:
+            session.delete(c)
+            session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def count_classes(created_by=None):
+    session = get_session()
+    try:
+        q = session.query(func.count(SchoolClass.id))
+        if created_by is not None:
+            q = q.filter_by(created_by=created_by)
+        return q.scalar() or 0
+    finally:
+        session.close()
+
+
+def get_classes_for_student(user_id):
+    session = get_session()
+    try:
+        memberships = session.query(GroupMember).filter_by(user_id=user_id).all()
+        if not memberships:
+            return []
+        class_ids = list(set(m.class_id for m in memberships))
+        classes = session.query(SchoolClass).filter(SchoolClass.id.in_(class_ids)).all()
+        class_map = {c.id: {"id": c.id, "name": c.name, "description": c.description} for c in classes}
+        group_ids = list(set(m.group_id for m in memberships))
+        groups = session.query(Group).filter(Group.id.in_(group_ids)).all()
+        group_map = {g.id: g for g in groups}
+        for m in memberships:
+            cid = m.class_id
+            if cid in class_map and "groups" not in class_map[cid]:
+                class_map[cid]["groups"] = []
+            g = group_map.get(m.group_id)
+            if g and cid in class_map:
+                class_map[cid]["groups"].append({
+                    "group_id": g.id,
+                    "group_name": g.name,
+                })
+        return list(class_map.values())
+    finally:
+        session.close()
+
+
+# ── Group CRUD ──
+
+def create_group(data):
+    session = get_session()
+    try:
+        g = Group(
+            name=data["name"],
+            class_id=data["class_id"],
+            created_by=data["created_by"],
+        )
+        session.add(g)
+        session.commit()
+        return g.id
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_group(group_id):
+    session = get_session()
+    try:
+        g = session.query(Group).filter_by(id=group_id).first()
+        if not g:
+            return None
+        return {
+            "id": g.id,
+            "name": g.name,
+            "class_id": g.class_id,
+            "created_by": g.created_by,
+            "created_at": g.created_at.isoformat() if g.created_at else None,
+        }
+    finally:
+        session.close()
+
+
+def list_groups(class_id=None, created_by=None):
+    session = get_session()
+    try:
+        q = session.query(Group)
+        if class_id is not None:
+            q = q.filter_by(class_id=class_id)
+        if created_by is not None:
+            q = q.filter_by(created_by=created_by)
+        groups = q.order_by(Group.created_at.desc()).all()
+        return [{
+            "id": g.id,
+            "name": g.name,
+            "class_id": g.class_id,
+            "created_by": g.created_by,
+            "created_at": g.created_at.isoformat() if g.created_at else None,
+        } for g in groups]
+    finally:
+        session.close()
+
+
+def delete_group(group_id):
+    session = get_session()
+    try:
+        g = session.query(Group).filter_by(id=group_id).first()
+        if g:
+            session.delete(g)
+            session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def count_groups(class_id=None):
+    session = get_session()
+    try:
+        q = session.query(func.count(Group.id))
+        if class_id is not None:
+            q = q.filter_by(class_id=class_id)
+        return q.scalar() or 0
+    finally:
+        session.close()
+
+
+# ── GroupMember CRUD ──
+
+def add_group_member(group_id, user_id):
+    session = get_session()
+    try:
+        group = session.query(Group).filter_by(id=group_id).first()
+        if not group:
+            raise ValueError("组不存在")
+        existing = session.query(GroupMember).filter_by(
+            user_id=user_id, class_id=group.class_id
+        ).first()
+        if existing:
+            raise ValueError("该学生已在本班级的其他组中")
+        gm = GroupMember(group_id=group_id, user_id=user_id, class_id=group.class_id)
+        session.add(gm)
+        session.commit()
+        return gm.id
+    except ValueError:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def remove_group_member(group_id, user_id):
+    session = get_session()
+    try:
+        gm = session.query(GroupMember).filter_by(
+            group_id=group_id, user_id=user_id
+        ).first()
+        if gm:
+            session.delete(gm)
+            session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def list_group_members(group_id):
+    session = get_session()
+    try:
+        members = session.query(GroupMember).filter_by(group_id=group_id).all()
+        user_ids = [m.user_id for m in members]
+        if not user_ids:
+            return []
+        users = session.query(User).filter(User.id.in_(user_ids)).all()
+        return [{"id": u.id, "username": u.username, "role": u.role} for u in users]
+    finally:
+        session.close()
+
+
+def list_group_members_batch(group_ids):
+    session = get_session()
+    try:
+        members = session.query(GroupMember).filter(GroupMember.group_id.in_(group_ids)).all()
+        if not members:
+            return {}
+        user_ids = list(set(m.user_id for m in members))
+        users = session.query(User).filter(User.id.in_(user_ids)).all()
+        user_map = {u.id: {"id": u.id, "username": u.username, "role": u.role} for u in users}
+        from collections import defaultdict
+        result = defaultdict(list)
+        for m in members:
+            result[m.group_id].append(user_map[m.user_id])
+        return result
+    finally:
+        session.close()
+
+
+def get_user_groups(user_id):
+    session = get_session()
+    try:
+        memberships = session.query(GroupMember).filter_by(user_id=user_id).all()
+        if not memberships:
+            return []
+        group_ids = [m.group_id for m in memberships]
+        groups = session.query(Group).filter(Group.id.in_(group_ids)).all()
+        class_ids = list(set(g.class_id for g in groups))
+        classes = session.query(SchoolClass).filter(SchoolClass.id.in_(class_ids)).all()
+        class_map = {c.id: c for c in classes}
+        result = []
+        for g in groups:
+            c = class_map.get(g.class_id)
+            result.append({
+                "group_id": g.id,
+                "group_name": g.name,
+                "class_id": g.class_id,
+                "class_name": c.name if c else "未知班级",
+            })
+        return result
+    finally:
+        session.close()
+
+
+def get_user_cluster_ids(user_id):
+    session = get_session()
+    try:
+        memberships = session.query(GroupMember).filter_by(user_id=user_id).all()
+        if not memberships:
+            return []
+        group_ids = [m.group_id for m in memberships]
+        if not group_ids:
+            return []
+        clusters = session.query(Cluster.id).filter(Cluster.group_id.in_(group_ids)).all()
+        return [c[0] for c in clusters]
+    finally:
+        session.close()
+
+
+def check_user_in_class_group(user_id, class_id):
+    session = get_session()
+    try:
+        existing = session.query(GroupMember).filter_by(
+            user_id=user_id, class_id=class_id
+        ).first()
+        return existing is not None
+    finally:
+        session.close()
+
+
+def get_students_created_by(teacher_id):
+    session = get_session()
+    try:
+        users = session.query(User).filter_by(created_by=teacher_id, role="student").all()
+        result = []
+        for u in users:
+            d = _user_to_dict(u)
+            d.pop("password_hash", None)
+            result.append(d)
+        return result
+    finally:
+        session.close()
+
+
+def get_student_group_ids(user_id):
+    session = get_session()
+    try:
+        memberships = session.query(GroupMember).filter_by(user_id=user_id).all()
+        return [m.group_id for m in memberships]
+    finally:
+        session.close()

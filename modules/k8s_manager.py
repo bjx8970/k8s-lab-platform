@@ -4,11 +4,12 @@ import time as _time
 import uuid
 from urllib.parse import quote
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from modules.db import (
     Cluster, delete_cluster_db, get_config, get_pve_server, load_cluster,
-    load_clusters, save_cluster, get_session,
+    load_clusters, save_cluster, session_scope,
 )
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.pve_client import PVEClient, PVEError
@@ -20,6 +21,12 @@ class K8sError(Exception):
 
 _task_store = {}
 _task_lock = threading.Lock()
+
+_openwrt_locks = {}
+_openwrt_locks_lock = threading.Lock()
+
+_MAX_CONCURRENT = 3
+_concurrency_semaphore = threading.BoundedSemaphore(_MAX_CONCURRENT)
 
 
 def _new_task_id():
@@ -71,6 +78,26 @@ def _cleanup_old_tasks():
         expired = [tid for tid, t in _task_store.items() if now - t.get("updated_at", 0) > 1800]
         for tid in expired:
             del _task_store[tid]
+
+
+def _openwrt_lock():
+    cfg = get_config("openwrt")
+    host = cfg.get("host", "_default_") if cfg else "_default_"
+    with _openwrt_locks_lock:
+        if host not in _openwrt_locks:
+            _openwrt_locks[host] = threading.Lock()
+        return _openwrt_locks[host]
+
+
+def _allocate_cluster_id(session):
+    session.execute(text("SELECT pg_advisory_xact_lock(42)"))
+    used_ids = sorted(row[0] for row in session.query(Cluster.id).all())
+    num = 1
+    for used_id in used_ids:
+        if used_id > num:
+            break
+        num = used_id + 1
+    return num
 
 
 def _generate_ssh_key():
@@ -195,63 +222,65 @@ def delete_cluster(name, status_callback=None, log_callback=None):
         pass
 
     report(40, "正在清理 OpenWrt 配置...")
-    ow = _openwrt_client()
-    ow.connect()
-    try:
-        report(45, "删除路由转发")
+    ow_lock = _openwrt_lock()
+    with ow_lock:
+        ow = _openwrt_client()
+        ow.connect()
         try:
-            ow.delete_redirect(name)
-            _log("路由转发已删除")
-        except Exception:
-            pass
-        _vnames = list(cluster.get("vms", {}).keys())
-        report(50, f"删除 DHCP 主机绑定 ({len(_vnames)} 个)")
-        for vm_name in _vnames:
+            report(45, "删除路由转发")
             try:
-                ow.delete_dhcp_host(vm_name, skip_restart=True)
-                _log(f"DHCP 主机绑定 {vm_name} 已删除")
+                ow.delete_redirect(name)
+                _log("路由转发已删除")
             except Exception:
                 pass
-        _log("重启 dnsmasq")
-        ow.exec("/etc/init.d/dnsmasq restart", tolerant=True)
-        report(60, "删除 dnsmasq 实例")
-        try:
-            ow.delete_dnsmasq(cluster["dnsmasq"])
-            _log("dnsmasq 实例已删除")
-        except Exception:
-            pass
-        report(65, "删除 DHCP 池")
-        try:
-            ow.delete_dhcp_pool(cluster["interface"])
-        except Exception:
-            pass
-        report(70, "删除接口")
-        try:
-            ow.delete_interface(cluster["interface"])
-        except Exception:
-            pass
-        report(75, "删除 VLAN 设备")
-        try:
-            ow.delete_vlan_device(cluster["vlan_device"])
-        except Exception:
-            pass
-        report(80, "清理 DHCP 动态租约")
-        try:
-            _gw = cluster.get("gateway", "")
-            if _gw:
-                _prefix = ".".join(_gw.split(".")[:3]) + "."
-                ow.exec(f"sed -i '/^{_prefix}/d' /tmp/dhcp.leases", tolerant=True)
-                _log("DHCP 动态租约已清理")
-        except Exception:
-            pass
-        report(85, "重启网络")
-        try:
-            ow.exec("/etc/init.d/network restart", tolerant=True)
-            _log("网络已重启")
-        except Exception:
-            pass
-    finally:
-        ow.close()
+            _vnames = list(cluster.get("vms", {}).keys())
+            report(50, f"删除 DHCP 主机绑定 ({len(_vnames)} 个)")
+            for vm_name in _vnames:
+                try:
+                    ow.delete_dhcp_host(vm_name, skip_restart=True)
+                    _log(f"DHCP 主机绑定 {vm_name} 已删除")
+                except Exception:
+                    pass
+            _log("重启 dnsmasq")
+            ow.exec("/etc/init.d/dnsmasq restart", tolerant=True)
+            report(60, "删除 dnsmasq 实例")
+            try:
+                ow.delete_dnsmasq(cluster["dnsmasq"])
+                _log("dnsmasq 实例已删除")
+            except Exception:
+                pass
+            report(65, "删除 DHCP 池")
+            try:
+                ow.delete_dhcp_pool(cluster["interface"])
+            except Exception:
+                pass
+            report(70, "删除接口")
+            try:
+                ow.delete_interface(cluster["interface"])
+            except Exception:
+                pass
+            report(75, "删除 VLAN 设备")
+            try:
+                ow.delete_vlan_device(cluster["vlan_device"])
+            except Exception:
+                pass
+            report(80, "清理 DHCP 动态租约")
+            try:
+                _gw = cluster.get("gateway", "")
+                if _gw:
+                    _prefix = ".".join(_gw.split(".")[:3]) + "."
+                    ow.exec(f"sed -i '/^{_prefix}/d' /tmp/dhcp.leases", tolerant=True)
+                    _log("DHCP 动态租约已清理")
+            except Exception:
+                pass
+            report(85, "重启网络")
+            try:
+                ow.exec("/etc/init.d/network restart", tolerant=True)
+                _log("网络已重启")
+            except Exception:
+                pass
+        finally:
+            ow.close()
     report(95, "清理数据库")
     delete_cluster_db(name)
     _log("数据库记录已删除")
@@ -268,11 +297,15 @@ def delete_cluster_async(name):
         _append_log(task_id, m)
 
     def _run():
+        _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
+        _concurrency_semaphore.acquire()
         try:
             delete_cluster(name, status_callback=_cb, log_callback=_log)
             _update_task(task_id, status="completed", progress=100, message="集群已删除")
         except Exception as e:
             _update_task(task_id, status="error", progress=0, message=str(e), error=str(e))
+        finally:
+            _concurrency_semaphore.release()
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -282,7 +315,8 @@ def delete_cluster_async(name):
 
 def create_cluster(master_count, node_count, master_cores, master_memory,
                    node_cores, node_memory, pve_node, template_vmid,
-                   password="k8s.1234", pve_server_id=0,
+                   password="k8s.1234", pve_server_id=0, group_id=None,
+                   class_id=None, created_by=None,
                    status_callback=None, log_callback=None):
     def report(progress, message):
         if status_callback:
@@ -296,26 +330,14 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
          f"cores=(master={master_cores}, node={node_cores}), "
          f"memory=(master={master_memory}MB, node={node_memory}MB)")
     _log(f"PVE 节点: {pve_node}, 模板 VMID: {template_vmid}")
-    session = get_session()
-    try:
-        used_ids = sorted(row[0] for row in session.query(Cluster.id).all())
-        num = 1
-        for used_id in used_ids:
-            if used_id > num:
-                break
-            num = used_id + 1
-        cluster_name = f"k8s_{num}"
-        cluster_row = Cluster(id=num, name=cluster_name, status="allocating")
-        session.add(cluster_row)
-        session.commit()
-    except IntegrityError:
-        session.rollback()
-        raise K8sError("并发冲突导致集群编号分配失败，请重试")
-    except Exception:
-        session.rollback()
-        raise K8sError("无法分配集群编号，请重试")
-    finally:
-        session.close()
+    with session_scope(commit=True) as session:
+        try:
+            num = _allocate_cluster_id(session)
+            cluster_name = f"k8s_{num}"
+            cluster_row = Cluster(id=num, name=cluster_name, status="allocating")
+            session.add(cluster_row)
+        except Exception:
+            raise K8sError("无法分配集群编号，请重试")
 
     _log(f"集群编号: {num}, 名称: {cluster_name}")
     vlan_id = 100 + num
@@ -381,56 +403,58 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         try: ow.exec("/etc/init.d/network restart", tolerant=True)
         except Exception: pass
 
-    ow = _openwrt_client()
-    ow.connect()
+    ow_lock = _openwrt_lock()
+    with ow_lock:
+        ow = _openwrt_client()
+        ow.connect()
 
-    try:
-        report(10, "正在创建 VLAN 设备...")
-        _log(f"VLAN: 创建设备 {vlan_device} (iface=eth1, vid={vlan_id})")
-        _log(f"执行: uci add network device")
-        _log(f"执行: uci set network.@device[-1].type=8021q, ifname=eth1, vid={vlan_id}, name={vlan_device}")
-        ow.create_vlan_device(vlan_device, "eth1", vlan_id)
-        _log(f"VLAN 设备 {vlan_device} 创建完成")
+        try:
+            report(10, "正在创建 VLAN 设备...")
+            _log(f"VLAN: 创建设备 {vlan_device} (iface=eth1, vid={vlan_id})")
+            _log(f"执行: uci add network device")
+            _log(f"执行: uci set network.@device[-1].type=8021q, ifname=eth1, vid={vlan_id}, name={vlan_device}")
+            ow.create_vlan_device(vlan_device, "eth1", vlan_id)
+            _log(f"VLAN 设备 {vlan_device} 创建完成")
 
-        report(20, "正在配置接口...")
-        _log(f"接口: 创建 {iface_name} (device={vlan_device}, ip={gateway}/{netmask})")
-        ow.create_interface(iface_name, vlan_device, "static", gateway, netmask)
-        _log(f"接口 {iface_name} 创建完成")
+            report(20, "正在配置接口...")
+            _log(f"接口: 创建 {iface_name} (device={vlan_device}, ip={gateway}/{netmask})")
+            ow.create_interface(iface_name, vlan_device, "static", gateway, netmask)
+            _log(f"接口 {iface_name} 创建完成")
 
-        report(28, "正在配置 DHCP...")
-        _log(f"DHCP: 创建池 {iface_name} (interface={iface_name}, start={dhcp_start}, limit={dhcp_limit})")
-        ow.create_dhcp_pool(iface_name, iface_name, dhcp_start, dhcp_limit)
-        _log(f"DHCP 池 {iface_name} 创建完成")
+            report(28, "正在配置 DHCP...")
+            _log(f"DHCP: 创建池 {iface_name} (interface={iface_name}, start={dhcp_start}, limit={dhcp_limit})")
+            ow.create_dhcp_pool(iface_name, iface_name, dhcp_start, dhcp_limit)
+            _log(f"DHCP 池 {iface_name} 创建完成")
 
-        report(33, "正在配置 dnsmasq...")
-        _log(f"dnsmasq: 创建实例 {dnsmasq_name} (interface={iface_name}, listen={gateway}, domain={dnsmasq_name}.lan)")
-        ow.create_dnsmasq(dnsmasq_name, iface_name, gateway, f"{dnsmasq_name}.lan")
-        _log(f"dnsmasq 实例 {dnsmasq_name} 创建完成，服务已重启")
+            report(33, "正在配置 dnsmasq...")
+            _log(f"dnsmasq: 创建实例 {dnsmasq_name} (interface={iface_name}, listen={gateway}, domain={dnsmasq_name}.lan)")
+            ow.create_dnsmasq(dnsmasq_name, iface_name, gateway, f"{dnsmasq_name}.lan")
+            _log(f"dnsmasq 实例 {dnsmasq_name} 创建完成，服务已重启")
 
-        report(38, "正在配置防火墙...")
-        _log("防火墙: 查找 LAN 区域")
-        zones = ow.get_firewall_zones()
-        _log(f"防火墙: 找到 {len(zones)} 个区域: {[z.get('name','?') for z in zones.values()]}")
-        matched = False
-        for sec_name, zone in zones.items():
-            if zone.get("name", "").lower() == "lan":
-                _log(f"防火墙: 找到 LAN 区域 (section={sec_name}), 添加接口 {iface_name}")
-                ow.add_interface_to_zone(sec_name, iface_name)
-                _log(f"防火墙: 接口 {iface_name} 已加入 LAN 区域，防火墙已重启")
-                matched = True
-                break
-        if not matched:
-            _log("防火墙: 警告 - 未找到 LAN 区域，跳过接口绑定")
+            report(38, "正在配置防火墙...")
+            _log("防火墙: 查找 LAN 区域")
+            zones = ow.get_firewall_zones()
+            _log(f"防火墙: 找到 {len(zones)} 个区域: {[z.get('name','?') for z in zones.values()]}")
+            matched = False
+            for sec_name, zone in zones.items():
+                if zone.get("name", "").lower() == "lan":
+                    _log(f"防火墙: 找到 LAN 区域 (section={sec_name}), 添加接口 {iface_name}")
+                    ow.add_interface_to_zone(sec_name, iface_name)
+                    _log(f"防火墙: 接口 {iface_name} 已加入 LAN 区域，防火墙已重启")
+                    matched = True
+                    break
+            if not matched:
+                _log("防火墙: 警告 - 未找到 LAN 区域，跳过接口绑定")
 
-        report(42, "正在重启 OpenWrt 网络...")
-        _log("执行: /etc/init.d/network restart")
-        ow.exec("/etc/init.d/network restart", tolerant=True)
-        _log("OpenWrt 网络已重启")
-    except Exception as e:
-        _rollback_openwrt(ow)
-        ow.close()
-        _cleanup_db()
-        raise K8sError(f"OpenWrt setup failed: {e}") from e
+            report(42, "正在重启 OpenWrt 网络...")
+            _log("执行: /etc/init.d/network restart")
+            ow.exec("/etc/init.d/network restart", tolerant=True)
+            _log("OpenWrt 网络已重启")
+        except Exception as e:
+            _rollback_openwrt(ow)
+            ow.close()
+            _cleanup_db()
+            raise K8sError(f"OpenWrt setup failed: {e}") from e
 
     client_cores = max(2, master_cores)
     client_memory = max(2048, master_memory)
@@ -577,29 +601,31 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         _ssh_port = 50000 + num
         report(96, "正在配置 DHCP 主机绑定和端口转发...")
         try:
-            ow2 = _openwrt_client()
-            ow2.connect()
-            try:
-                for vm_name, vm_info in vms.items():
-                    _log(f"VM {vm_name}: 等待 Guest Agent 获取 IP")
-                    try:
-                        pve.wait_for_guest_agent(vm_info["node"], vm_info["vmid"], timeout=120)
-                    except Exception as e:
-                        _log(f"VM {vm_name}: Guest Agent 未响应 ({e})")
-                        continue
-                    ip = pve.get_vm_ip(vm_info["node"], vm_info["vmid"])
-                    _log(f"VM {vm_name}: IP = {ip}, MAC = {vm_info['mac']}")
-                    if ip and vm_info["mac"]:
-                        ow2.create_dhcp_host(vm_name, ip, vm_info["mac"])
-                        _log(f"VM {vm_name}: DHCP 主机绑定完成")
-                        if vm_info["role"] == "client":
-                            ow2.create_redirect(
-                                cluster_name, _ssh_port,
-                                ip, "22")
-                            _log(f"Client VM: 端口转发配置完成 WAN:{_ssh_port} → {ip}:22")
-                            report(96, f"端口转发已配置: WAN:{_ssh_port} → {ip}:22")
-            finally:
-                ow2.close()
+            ow_lock = _openwrt_lock()
+            with ow_lock:
+                ow2 = _openwrt_client()
+                ow2.connect()
+                try:
+                    for vm_name, vm_info in vms.items():
+                        _log(f"VM {vm_name}: 等待 Guest Agent 获取 IP")
+                        try:
+                            pve.wait_for_guest_agent(vm_info["node"], vm_info["vmid"], timeout=120)
+                        except Exception as e:
+                            _log(f"VM {vm_name}: Guest Agent 未响应 ({e})")
+                            continue
+                        ip = pve.get_vm_ip(vm_info["node"], vm_info["vmid"])
+                        _log(f"VM {vm_name}: IP = {ip}, MAC = {vm_info['mac']}")
+                        if ip and vm_info["mac"]:
+                            ow2.create_dhcp_host(vm_name, ip, vm_info["mac"])
+                            _log(f"VM {vm_name}: DHCP 主机绑定完成")
+                            if vm_info["role"] == "client":
+                                ow2.create_redirect(
+                                    cluster_name, _ssh_port,
+                                    ip, "22")
+                                _log(f"Client VM: 端口转发配置完成 WAN:{_ssh_port} → {ip}:22")
+                                report(96, f"端口转发已配置: WAN:{_ssh_port} → {ip}:22")
+                finally:
+                    ow2.close()
         except Exception as e:
             _log(f"DHCP/端口转发配置异常 ({e})")
 
@@ -641,6 +667,9 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         "vms": vms,
         "ssh_port": _ssh_port,
         "client_mac": _client_mac,
+        "group_id": group_id,
+        "class_id": class_id,
+        "created_by": created_by,
     }
     save_cluster(cluster_name, cluster_entry)
 
@@ -652,7 +681,8 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
 def create_cluster_async(master_count, node_count, master_cores, master_memory,
                          node_cores, node_memory, pve_node, template_vmid,
-                         password="k8s.1234", pve_server_id=0):
+                         password="k8s.1234", pve_server_id=0,
+                         group_id=None, class_id=None, created_by=None):
     task_id = _new_task_id()
     _update_task(task_id, status="running", progress=0, message="正在初始化...")
 
@@ -663,6 +693,8 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
         _append_log(task_id, msg)
 
     def _run():
+        _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
+        _concurrency_semaphore.acquire()
         try:
             name, cluster = create_cluster(
                 master_count, node_count,
@@ -671,6 +703,9 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                 pve_node, template_vmid,
                 password=password,
                 pve_server_id=pve_server_id,
+                group_id=group_id,
+                class_id=class_id,
+                created_by=created_by,
                 status_callback=_cb,
                 log_callback=_log,
             )
@@ -680,6 +715,8 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
         except Exception as e:
             _update_task(task_id, status="error", progress=0,
                          message=str(e), error=str(e))
+        finally:
+            _concurrency_semaphore.release()
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -1115,6 +1152,8 @@ def deploy_k8s_async(name):
         _append_log(task_id, msg)
 
     def _run():
+        _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
+        _concurrency_semaphore.acquire()
         try:
             deploy_k8s(name, status_callback=_cb, log_callback=_log)
             _update_task(task_id, status="completed", progress=100,
@@ -1122,6 +1161,8 @@ def deploy_k8s_async(name):
         except Exception as e:
             _update_task(task_id, status="error", progress=0,
                          message=str(e), error=str(e))
+        finally:
+            _concurrency_semaphore.release()
     
     t = threading.Thread(target=_run, daemon=True)
     t.start()

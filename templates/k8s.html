@@ -2,7 +2,8 @@
 {% block page_heading %}K8s集群管理{% endblock %}
 {% block content %}
 
-<div class="card" style="margin-bottom:16px;max-width:640px">
+{% if g.user.role in ('admin', 'teacher') %}
+<div class="card" style="margin-bottom:16px;max-width:720px">
     <h3 style="margin-bottom:16px">新建集群</h3>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div class="form-group"><label>PVE 服务器</label><select id="form-server" class="form-control"><option value="">-- 请选择 --</option></select></div>
@@ -14,12 +15,20 @@
         <div class="form-group"><label>子节点 CPU 核心</label><input id="form-node-cores" class="form-control" type="number" value="4"></div>
         <div class="form-group"><label>子节点内存 (MB)</label><input id="form-node-mem" class="form-control" type="number" value="4096"></div>
         <div class="form-group" style="grid-column:1/-1"><label>client 密码</label><input id="form-password" class="form-control" type="text" value="k8s.1234"></div>
+        {% if g.user.role == 'teacher' %}
+        <div class="form-group"><label>班级</label><select id="form-class" class="form-control"><option value="">-- 请选择 --</option></select></div>
+        <div class="form-group"><label>组（选填，创建演示集群可不选）</label><select id="form-group" class="form-control"><option value="">-- 不绑定组（演示集群） --</option></select></div>
+        {% endif %}
     </div>
-    <div style="margin-top:14px">
+    <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary" id="btn-create" onclick="createCluster()">创建集群</button>
+        {% if g.user.role == 'teacher' %}
+        <button class="btn" id="btn-batch" onclick="batchCreate()">批量创建（为所有选中组）</button>
+        {% endif %}
     </div>
     <div id="create-result" style="margin-top:10px;font-size:14px"></div>
 </div>
+{% endif %}
 
 <div class="card">
     <h3 style="margin-bottom:16px">集群列表</h3>
@@ -33,19 +42,30 @@
                 <span class="k8s-badge k8s-{{ c.get('k8s_status', 'pending') }}">
                     {{ {'pending': '未部署', 'installing': '部署中', 'installed': '已部署', 'failed': '部署失败'}.get(c.k8s_status, '未部署') }}
                 </span>
+                {% if g.user.role in ('admin', 'teacher') %}
                 {% if c.get('k8s_status') != 'installed' %}
                 <button class="btn btn-sm" onclick="deployK8s('{{ name }}')">部署 K8s</button>
                 {% endif %}
                 <button class="btn btn-sm" onclick="uploadSshKey('{{ name }}')">上传 SSH 密钥</button>
                 <button class="btn btn-sm btn-danger" onclick="deleteCluster('{{ name }}')">删除</button>
+                {% endif %}
             </div>
             <div class="cluster-vms">
                 {% for vm_name, vm_info in c.vms.items() %}
-                <span class="vm-tag">{{ vm_name }} (VMID {{ vm_info.vmid }})</span>
+                <span class="vm-tag" id="vm-{{ name }}-{{ vm_info.vmid }}">
+                    {{ vm_name }} (VMID {{ vm_info.vmid }})
+                    {% if g.user.role == 'student' %}
+                    <button class="vm-btn" onclick="vmAction('{{ vm_info.node }}', {{ vm_info.vmid }}, 'start')">▶</button>
+                    <button class="vm-btn" onclick="vmAction('{{ vm_info.node }}', {{ vm_info.vmid }}, 'stop')">⏹</button>
+                    {% endif %}
+                </span>
                 {% endfor %}
             </div>
             <div style="margin-top:8px;font-size:12px;color:#666">
                 SSH: <code>{{ openwrt_host }}:{{ c.ssh_port }}</code> &nbsp;|&nbsp; 用户: <code>k8s</code> &nbsp;|&nbsp; 密码: <code>{{ c.get('password', 'k8s.1234') }}</code>
+                {% if g.user.role == 'student' %}
+                &nbsp;|&nbsp; <button class="btn btn-sm" onclick="showSshKey('{{ name }}')">查看 SSH 密钥</button>
+                {% endif %}
             </div>
         </div>
         {% endfor %}
@@ -67,6 +87,19 @@
     </div>
 </div>
 
+<div class="modal-overlay" id="key-modal">
+    <div class="modal-card" style="width:600px">
+        <h3 style="margin-bottom:12px">SSH 密钥</h3>
+        <div style="font-size:13px">
+            <label style="font-weight:500;display:block;margin-bottom:4px">私钥：</label>
+            <textarea id="key-private" readonly style="width:100%;height:180px;font-family:monospace;font-size:12px;padding:8px;border:1px solid #d9d9d9;border-radius:4px;background:#f5f5f5"></textarea>
+            <label style="font-weight:500;display:block;margin:8px 0 4px">公钥：</label>
+            <textarea id="key-public" readonly style="width:100%;height:60px;font-family:monospace;font-size:12px;padding:8px;border:1px solid #d9d9d9;border-radius:4px;background:#f5f5f5"></textarea>
+        </div>
+        <div style="margin-top:12px"><button class="btn" onclick="closeKeyModal()">关闭</button></div>
+    </div>
+</div>
+
 <style>
 .btn{display:inline-flex;align-items:center;padding:6px 16px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#333;font-size:13px;cursor:pointer;transition:all .2s}
 .btn:hover{border-color:#1890ff;color:#1890ff}
@@ -81,9 +114,11 @@
 .form-control{width:100%;padding:6px 10px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;outline:none;transition:border-color .2s;box-sizing:border-box}
 .form-control:focus{border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.2)}
 .cluster-item{border:1px solid #f0f0f0;border-radius:6px;padding:12px;margin-bottom:10px}
-.cluster-header{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+.cluster-header{display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap}
 .cluster-vms{display:flex;gap:6px;flex-wrap:wrap}
-.vm-tag{display:inline-block;padding:2px 8px;background:#e6f7ff;border:1px solid #91d5ff;border-radius:3px;font-size:12px;color:#1890ff}
+.vm-tag{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:#e6f7ff;border:1px solid #91d5ff;border-radius:3px;font-size:12px;color:#1890ff}
+.vm-btn{padding:1px 6px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
+.vm-btn:hover{background:#1890ff;color:#fff}
 
 .k8s-badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500}
 .k8s-pending{background:#fff7e6;border:1px solid #ffd591;color:#d46b08}
@@ -176,6 +211,10 @@ async function createCluster() {
             node_cores: parseInt($('form-node-cores').value) || 4,
             node_memory: parseInt($('form-node-mem').value) || 4096,
             password: $('form-password').value.trim() || 'k8s.1234',
+            {% if g.user.role == 'teacher' %}
+            group_id: parseInt($('form-group').value) || null,
+            class_id: parseInt($('form-class').value) || null,
+            {% endif %}
         };
         if (!body.pve_node) throw new Error('请选择 PVE 服务器');
         const result = await api('POST', '/create', body);
@@ -189,8 +228,47 @@ async function createCluster() {
     }
 }
 
+async function batchCreate() {
+    const groupSelect = $('form-group');
+    const selected = [];
+    for (let i = 0; i < groupSelect.options.length; i++) {
+        if (groupSelect.options[i].selected) selected.push(parseInt(groupSelect.options[i].value));
+    }
+    if (!selected.length || (selected.length === 1 && !selected[0])) {
+        alert('请按住 Ctrl 键选择多个组');
+        return;
+    }
+    $('btn-batch').disabled = true;
+    $('create-result').innerHTML = '';
+    $('modal-title').textContent = '批量创建集群';
+    showModal(true);
+    updateProgress(0, '正在启动批量任务');
+    try {
+        const sel = $('form-server');
+        const opt = sel.options[sel.selectedIndex];
+        const pve_node = (opt && opt.dataset && opt.dataset.node) || '';
+        const result = await api('POST', '/batch-create', {
+            group_ids: selected.filter(x => x),
+            pve_server_id: parseInt($('form-server').value) || 0,
+            pve_node: pve_node,
+            template_vmid: parseInt($('form-template').value) || 9000,
+            master_count: parseInt($('form-master-count').value) || 1,
+            node_count: parseInt($('form-node-count').value) || 1,
+            master_cores: parseInt($('form-master-cores').value) || 4,
+            master_memory: parseInt($('form-master-mem').value) || 4096,
+            node_cores: parseInt($('form-node-cores').value) || 4,
+            node_memory: parseInt($('form-node-mem').value) || 4096,
+            password: $('form-password').value.trim() || 'k8s.1234',
+        });
+        updateProgress(100, '已启动 ' + (result.task_ids || []).length + ' 个任务', 'success');
+        setTimeout(() => { showModal(false); location.reload(); }, 2000);
+    } catch (e) {
+        updateProgress(0, e.message, 'error');
+        $('btn-batch').disabled = false;
+    }
+}
+
 async function deployK8s(name) {
-    $('btn-create').disabled = true;
     $('create-result').innerHTML = '';
     $('modal-title').textContent = '正在部署 K8s';
     showModal(true);
@@ -203,7 +281,6 @@ async function deployK8s(name) {
         pollTask(result.task_id, { successMsg: 'K8s 部署完成', errorPrefix: '部署失败' });
     } catch (e) {
         updateProgress(0, e.message, 'error');
-        $('btn-create').disabled = false;
     }
 }
 
@@ -215,13 +292,39 @@ async function deleteCluster(name) {
     $('modal-links').innerHTML = '';
     try {
         const result = await api('DELETE', '/clusters/' + encodeURIComponent(name));
-        pollTask(result.task_id, {
-            successMsg: '集群已删除',
-            errorPrefix: '删除失败'
-        });
+        pollTask(result.task_id, { successMsg: '集群已删除', errorPrefix: '删除失败' });
     } catch (e) {
         updateProgress(0, '删除失败: ' + e.message, 'error');
     }
+}
+
+async function vmAction(node, vmid, action) {
+    try {
+        const res = await fetch('/api/pve/vms/' + encodeURIComponent(node) + '/' + vmid + '/' + action, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '操作失败');
+        alert(action === 'start' ? '已启动' : '已停止');
+    } catch (e) {
+        alert('操作失败: ' + e.message);
+    }
+}
+
+async function showSshKey(name) {
+    try {
+        const data = await api('GET', '/clusters/' + encodeURIComponent(name) + '/ssh-key');
+        $('key-private').value = data.private_key || '(无)';
+        $('key-public').value = data.public_key || '(无)';
+        $('key-modal').className = 'modal-overlay show';
+    } catch (e) {
+        alert('获取密钥失败: ' + e.message);
+    }
+}
+
+function closeKeyModal() {
+    $('key-modal').className = 'modal-overlay';
 }
 
 async function loadPVEServers() {
@@ -241,6 +344,39 @@ async function loadPVEServers() {
     }
 }
 
+{% if g.user.role == 'teacher' %}
+async function loadClasses() {
+    try {
+        const res = await fetch('/api/classes');
+        const classes = await res.json();
+        const classSel = $('form-class');
+        classes.forEach(c => {
+            const opt = document.createElement('option');
+            opt.value = c.id;
+            opt.textContent = c.name;
+            classSel.appendChild(opt);
+        });
+    } catch (e) { console.warn('加载班级列表失败:', e); }
+}
+
+async function loadGroups() {
+    const classId = $('form-class').value;
+    const groupSel = $('form-group');
+    groupSel.innerHTML = '<option value="">-- 不绑定组（演示集群） --</option>';
+    if (!classId) return;
+    try {
+        const res = await fetch('/api/classes/' + classId + '/groups');
+        const groups = await res.json();
+        groups.forEach(g => {
+            const opt = document.createElement('option');
+            opt.value = g.group_id || g.id;
+            opt.textContent = g.group_name || g.name;
+            groupSel.appendChild(opt);
+        });
+    } catch (e) { console.warn('加载组列表失败:', e); }
+}
+{% endif %}
+
 async function uploadSshKey(name) {
     const el = $('create-result');
     el.innerHTML = '正在上传 SSH 私钥...';
@@ -255,6 +391,12 @@ async function uploadSshKey(name) {
     }
 }
 
-document.addEventListener('DOMContentLoaded', loadPVEServers);
+document.addEventListener('DOMContentLoaded', function() {
+    loadPVEServers();
+    {% if g.user.role == 'teacher' %}
+    loadClasses();
+    if ($('form-class')) $('form-class').addEventListener('change', loadGroups);
+    {% endif %}
+});
 </script>
 {% endblock %}

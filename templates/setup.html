@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>K8s Lab Platform - 初始化</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f0f2f5; }
+        .setup-card { background: #fff; border-radius: 8px; padding: 40px 36px; width: 420px; box-shadow: 0 2px 12px rgba(0,0,0,.08); }
+        .setup-card h1 { font-size: 20px; text-align: center; margin-bottom: 8px; color: #333; }
+        .setup-card h1 span { color: #1890ff; }
+        .setup-card .desc { font-size: 13px; color: #999; text-align: center; margin-bottom: 24px; }
+        .form-group { margin-bottom: 18px; }
+        .form-group label { display: block; font-size: 14px; color: #333; margin-bottom: 6px; font-weight: 500; }
+        .form-control { width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; outline: none; transition: border-color .2s; box-sizing: border-box; }
+        .form-control:focus { border-color: #1890ff; box-shadow: 0 0 0 2px rgba(24,144,255,.2); }
+        .btn { display: block; width: 100%; padding: 9px 0; border: none; border-radius: 4px; background: #1890ff; color: #fff; font-size: 15px; cursor: pointer; transition: background .2s; }
+        .btn:hover { background: #40a9ff; }
+        .btn:disabled { background: #91caff; cursor: not-allowed; }
+        .error { color: #ff4d4f; font-size: 13px; margin-top: 10px; text-align: center; display: none; }
+    </style>
+</head>
+<body>
+    <div class="setup-card">
+        <h1>欢迎使用 K8s Lab <span>Platform</span></h1>
+        <div class="desc">首次运行，请创建管理员账号</div>
+        <div class="form-group">
+            <label>管理员用户名</label>
+            <input id="f-username" class="form-control" placeholder="admin" autocomplete="username">
+        </div>
+        <div class="form-group">
+            <label>管理员密码</label>
+            <input id="f-password" class="form-control" type="password" placeholder="至少 6 位" autocomplete="new-password">
+        </div>
+        <div class="form-group">
+            <label>确认密码</label>
+            <input id="f-confirm" class="form-control" type="password" placeholder="再次输入密码">
+        </div>
+        <button class="btn" id="btn-setup" onclick="setup()">初始化</button>
+        <div class="error" id="setup-error"></div>
+    </div>
+    <script>
+    async function setup() {
+        const btn = document.getElementById('btn-setup');
+        const err = document.getElementById('setup-error');
+        const username = document.getElementById('f-username').value.trim();
+        const password = document.getElementById('f-password').value;
+        const confirm = document.getElementById('f-confirm').value;
+        btn.disabled = true;
+        err.style.display = 'none';
+        if (!username || !password) { err.textContent = '请填写用户名和密码'; err.style.display = 'block'; btn.disabled = false; return; }
+        if (password.length < 6) { err.textContent = '密码长度至少 6 位'; err.style.display = 'block'; btn.disabled = false; return; }
+        if (password !== confirm) { err.textContent = '两次密码输入不一致'; err.style.display = 'block'; btn.disabled = false; return; }
+        try {
+            const res = await fetch('/api/setup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || '初始化失败');
+            window.location.href = '/';
+        } catch (e) {
+            err.textContent = e.message;
+            err.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+        }
+    }
+    document.addEventListener('keydown', function(e) { if (e.key === 'Enter') setup(); });
+    </script>
+</body>
+</html>
