@@ -7,8 +7,8 @@ from urllib.parse import quote
 from sqlalchemy.exc import IntegrityError
 
 from modules.db import (
-    Cluster, delete_cluster_db, get_config, load_cluster, load_clusters,
-    save_cluster, get_session,
+    Cluster, delete_cluster_db, get_config, get_pve_server, load_cluster,
+    load_clusters, save_cluster, get_session,
 )
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.pve_client import PVEClient, PVEError
@@ -135,10 +135,15 @@ def _openwrt_client():
     )
 
 
-def _pve_client():
-    cfg = get_config("pve")
-    if not cfg:
-        raise K8sError(f"PVE 未配置，请先在页面中保存配置")
+def _pve_client(server_id=None):
+    if server_id:
+        cfg = get_pve_server(server_id)
+        if not cfg:
+            raise K8sError(f"PVE 服务器 (ID={server_id}) 不存在")
+    else:
+        cfg = get_config("pve")
+        if not cfg:
+            raise K8sError(f"PVE 未配置，请先在页面中保存配置")
     missing = [k for k in ("host", "user", "token_name", "token_value") if not cfg.get(k)]
     if missing:
         raise K8sError(f"PVE 配置不完整: {', '.join(missing)}")
@@ -171,7 +176,7 @@ def delete_cluster(name, status_callback=None, log_callback=None):
     if not cluster:
         raise K8sError(f"Cluster {name} not found")
     _num = name.split("_")[1]
-    pve = _pve_client()
+    pve = _pve_client(server_id=cluster.get("pve_server_id"))
     pve.connect()
     _vms = list(cluster.get("vms", {}).items())
     _total = len(_vms)
@@ -277,7 +282,8 @@ def delete_cluster_async(name):
 
 def create_cluster(master_count, node_count, master_cores, master_memory,
                    node_cores, node_memory, pve_node, template_vmid,
-                   password="k8s.1234", status_callback=None, log_callback=None):
+                   password="k8s.1234", pve_server_id=0,
+                   status_callback=None, log_callback=None):
     def report(progress, message):
         if status_callback:
             status_callback(progress, message)
@@ -340,6 +346,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         "ssh_private_key": priv_key,
         "ssh_public_key": pub_key,
         "pve_node": pve_node,
+        "pve_server_id": pve_server_id,
         "template_vmid": template_vmid,
         "ssh_port": 50000 + num,
         "vms": {},
@@ -428,10 +435,10 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
     client_cores = max(2, master_cores)
     client_memory = max(2048, master_memory)
 
-    pve_cfg = get_config("pve")
+    pve_cfg = get_pve_server(pve_server_id) if pve_server_id else get_config("pve")
     _log(f"PVE: 正在连接 {pve_cfg.get('host', '?') if pve_cfg else '?'}:{pve_cfg.get('port', 8006) if pve_cfg else '?'}")
     report(45, "正在连接 PVE...")
-    pve = _pve_client()
+    pve = _pve_client(server_id=pve_server_id if pve_server_id else None)
     version = pve.connect()
     _log(f"PVE: 连接成功, 版本 {version.get('version', '?') if isinstance(version, dict) else version}")
     try:
@@ -629,6 +636,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         "ssh_public_key": pub_key,
         "password": password,
         "pve_node": pve_node,
+        "pve_server_id": pve_server_id,
         "template_vmid": template_vmid,
         "vms": vms,
         "ssh_port": _ssh_port,
@@ -644,7 +652,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
 def create_cluster_async(master_count, node_count, master_cores, master_memory,
                          node_cores, node_memory, pve_node, template_vmid,
-                         password="k8s.1234"):
+                         password="k8s.1234", pve_server_id=0):
     task_id = _new_task_id()
     _update_task(task_id, status="running", progress=0, message="正在初始化...")
 
@@ -662,6 +670,7 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                 node_cores, node_memory,
                 pve_node, template_vmid,
                 password=password,
+                pve_server_id=pve_server_id,
                 status_callback=_cb,
                 log_callback=_log,
             )
@@ -695,7 +704,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     _log(f"开始部署 K8s: 集群 {name}")
 
-    pve = _pve_client()
+    pve = _pve_client(server_id=cluster.get("pve_server_id"))
     pve.connect()
     _log("PVE 连接成功")
 
@@ -1067,6 +1076,25 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             _log(f"kubectl 安装失败（可手动安装）: {e}")
     else:
         _log("kubectl 已存在，跳过安装")
+
+    # ── 部署验证 ──
+    report(98.5, "正在验证集群部署...")
+    _log("开始验证集群连通性")
+    try:
+        _log("验证 DNS 解析: nslookup kubernetes.default.svc.cluster.local")
+        _sh("nslookup kubernetes.default.svc.cluster.local || nslookup kubernetes.default || echo 'DNS 验证跳过'", timeout=30)
+        _log("DNS 验证完成")
+    except Exception as e:
+        _log(f"DNS 验证警告: {e}")
+
+    _log("验证 SSH 连通性到 master 节点")
+    if masters:
+        first_master_ip = master_ips[masters[0]]
+        try:
+            _sh(f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{first_master_ip} 'echo SSH_OK'", timeout=30)
+            _log(f"SSH 连通性验证完成: root@{first_master_ip}")
+        except Exception as e:
+            _log(f"SSH 验证警告: {e}")
 
     report(99, "正在保存 K8s 部署状态...")
     _log("更新集群 K8s 状态为 installed")

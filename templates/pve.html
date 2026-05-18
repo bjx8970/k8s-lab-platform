@@ -2,39 +2,61 @@
 {% block page_heading %}PVE连接管理{% endblock %}
 {% block content %}
 
-<div class="card" style="margin-bottom:16px;max-width:720px">
-    <h3 style="margin-bottom:16px">PVE连接配置</h3>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-        <div class="form-group">
-            <label>Host *</label>
-            <input id="cfg-host" class="form-control" placeholder="192.168.1.100" value="{{ config.get('host','') }}">
+<div style="margin-bottom:16px">
+    <button class="btn btn-primary" onclick="openAddModal()">+ 新增服务器</button>
+</div>
+
+<div id="server-list"></div>
+
+<div class="modal-overlay" id="modal-overlay">
+    <div class="modal-card">
+        <h3 id="modal-title" style="margin-bottom:16px">新增 PVE 服务器</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="form-group">
+                <label>命名 *</label>
+                <input id="f-name" class="form-control" placeholder="如: 机房A">
+            </div>
+            <div class="form-group">
+                <label>服务器 IP *</label>
+                <input id="f-host" class="form-control" placeholder="192.168.1.100">
+            </div>
+            <div class="form-group">
+                <label>端口</label>
+                <input id="f-port" class="form-control" type="number" value="8006">
+            </div>
+            <div class="form-group">
+                <label>用户 *</label>
+                <input id="f-user" class="form-control" placeholder="root@pam">
+            </div>
+            <div class="form-group">
+                <label>API Name *</label>
+                <input id="f-token-name" class="form-control" placeholder="my-token">
+            </div>
+            <div class="form-group">
+                <label>API Token *</label>
+                <input id="f-token-value" class="form-control" type="password" placeholder="xxxxxxxx-xxxx-...">
+            </div>
+            <div class="form-group">
+                <label>节点名 *</label>
+                <input id="f-node" class="form-control" placeholder="pve1">
+            </div>
         </div>
-        <div class="form-group">
-            <label>Port</label>
-            <input id="cfg-port" class="form-control" type="number" value="{{ config.get('port',8006) }}">
-        </div>
-        <div class="form-group">
-            <label>User *</label>
-            <input id="cfg-user" class="form-control" placeholder="root@pam" value="{{ config.get('user','') }}">
-        </div>
-        <div class="form-group">
-            <label>API Token Name</label>
-            <input id="cfg-token-name" class="form-control" placeholder="my-token" value="{{ config.get('token_name','') }}">
-        </div>
-        <div class="form-group">
-            <label>API Token Value</label>
-            <input id="cfg-token-value" class="form-control" type="password" placeholder="xxxxxxxx-xxxx-..." value="{{ config.get('token_value','') }}">
-        </div>
-        <div class="form-group" style="display:flex;align-items:center;gap:8px;padding-top:6px">
-            <input id="cfg-ssl" type="checkbox" {% if config.get('verify_ssl') %}checked{% endif %}>
-            <label for="cfg-ssl" style="margin:0">Verify SSL</label>
+        <div id="form-error" style="color:#ff4d4f;font-size:13px;margin-top:8px;display:none"></div>
+        <div style="margin-top:16px;display:flex;gap:8px">
+            <button class="btn btn-primary" id="btn-save" onclick="saveServer()">保存</button>
+            <button class="btn" onclick="closeModal()">取消</button>
         </div>
     </div>
-    <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
-        <button class="btn btn-primary" onclick="saveConfig()">保存配置</button>
-        <button class="btn" onclick="testConnection()">测试连接</button>
+</div>
+
+<div class="modal-overlay" id="node-modal-overlay">
+    <div class="modal-card" style="width:640px">
+        <h3 style="margin-bottom:16px">PVE 节点列表</h3>
+        <div id="node-list-content" style="font-size:13px;max-height:400px;overflow-y:auto"></div>
+        <div style="margin-top:12px">
+            <button class="btn" onclick="closeNodeModal()">关闭</button>
+        </div>
     </div>
-    <div id="conn-result" style="margin-top:10px;font-size:14px"></div>
 </div>
 
 <style>
@@ -42,68 +64,231 @@
 .btn:hover{border-color:#1890ff;color:#1890ff}
 .btn-primary{background:#1890ff;border-color:#1890ff;color:#fff}
 .btn-primary:hover{background:#40a9ff;border-color:#40a9ff;color:#fff}
+.btn-sm{padding:3px 10px;font-size:12px}
+.btn-danger{color:#ff4d4f;border-color:#ff4d4f}
+.btn-danger:hover{background:#ff4d4f;color:#fff}
 .form-group{margin-bottom:12px}
 .form-group label{display:block;font-size:13px;color:#333;margin-bottom:4px;font-weight:500}
 .form-control{width:100%;padding:6px 10px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;outline:none;transition:border-color .2s;box-sizing:border-box}
 .form-control:focus{border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.2)}
+
+.server-card{border:1px solid #f0f0f0;border-radius:6px;padding:16px;margin-bottom:10px;max-width:720px}
+.server-card .row{display:flex;align-items:center;justify-content:space-between}
+.server-card .info{flex:1}
+.server-card .name{font-size:15px;font-weight:600;color:#333}
+.server-card .meta{font-size:12px;color:#999;margin-top:4px}
+.server-card .meta span{margin-right:16px}
+.server-card .actions{display:flex;gap:6px;flex-shrink:0}
+.server-card .actions .btn{padding:4px 12px;font-size:12px}
+.conn-ok{color:#52c41a;font-size:12px;margin-top:4px}
+.conn-err{color:#ff4d4f;font-size:12px;margin-top:4px}
+
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.45);z-index:1000;justify-content:center;align-items:flex-start;padding-top:10vh}
+.modal-overlay.show{display:flex}
+.modal-card{background:#fff;border-radius:8px;padding:28px 32px;width:500px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.2)}
 </style>
 
 <script>
-const API_BASE = '/api/pve';
+const API = '/api/pve';
+let _editingId = null;
 
 function $(id) { return document.getElementById(id); }
+
+function show(el) { if (typeof el === 'string') el = $(el); el.style.display = 'flex'; }
+function hide(el) { if (typeof el === 'string') el = $(el); el.style.display = 'none'; }
 
 async function api(method, path, body) {
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
     if (body) opts.body = JSON.stringify(body);
-    const res = await fetch(API_BASE + path, opts);
+    const res = await fetch(API + path, opts);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Request failed');
     return data;
 }
 
-function getConfig() {
+async function loadServers() {
+    const el = $('server-list');
+    el.innerHTML = '加载中...';
+    try {
+        const servers = await api('GET', '/servers');
+        if (!servers.length) {
+            el.innerHTML = '<p style="color:#999;font-size:14px">暂无 PVE 服务器，请点击上方按钮添加</p>';
+            return;
+        }
+        el.innerHTML = servers.map(s => renderCard(s)).join('');
+    } catch (e) {
+        el.innerHTML = '<p style="color:#ff4d4f">加载失败: ' + e.message + '</p>';
+    }
+}
+
+function renderCard(s) {
+    return '<div class="server-card" id="card-' + s.id + '">' +
+        '<div class="row">' +
+            '<div class="info">' +
+                '<div class="name">' + esc(s.name) + '</div>' +
+                '<div class="meta">' +
+                    '<span>IP: ' + esc(s.host) + '</span>' +
+                    '<span>端口: ' + s.port + '</span>' +
+                    '<span>用户: ' + esc(s.user) + '</span>' +
+                    '<span>Token: ' + esc(s.token_name) + '</span>' +
+                    '<span>节点: ' + esc(s.node) + '</span>' +
+                '</div>' +
+                '<div id="status-' + s.id + '"></div>' +
+            '</div>' +
+            '<div class="actions">' +
+                '<button class="btn btn-sm" onclick="testServer(' + s.id + ')">测试连接</button>' +
+                '<button class="btn btn-sm" onclick="viewNodes(' + s.id + ')">查看节点</button>' +
+                '<button class="btn btn-sm" onclick="openEditModal(' + s.id + ')">编辑</button>' +
+                '<button class="btn btn-sm btn-danger" onclick="deleteServer(' + s.id + ')">删除</button>' +
+            '</div>' +
+        '</div>' +
+    '</div>';
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+async function testServer(id) {
+    const el = $('status-' + id);
+    el.innerHTML = '测试中...';
+    el.className = '';
+    try {
+        const data = await api('POST', '/servers/' + id + '/test');
+        el.innerHTML = '✅ ' + (data.version ? '版本: ' + (data.version.version || JSON.stringify(data.version)) : data.message);
+        el.className = 'conn-ok';
+    } catch (e) {
+        el.innerHTML = '❌ ' + e.message;
+        el.className = 'conn-err';
+    }
+}
+
+async function viewNodes(id) {
+    const overlay = $('node-modal-overlay');
+    const content = $('node-list-content');
+    content.innerHTML = '加载中...';
+    show(overlay);
+    try {
+        const nodes = await api('GET', '/servers/' + id + '/nodes');
+        if (!nodes.length) {
+            content.innerHTML = '<p style="color:#999">暂无节点</p>';
+            return;
+        }
+        content.innerHTML = nodes.map(n =>
+            '<div style="padding:6px 0;border-bottom:1px solid #f0f0f0">' +
+                '<strong>' + esc(n.node) + '</strong>' +
+                '<span style="color:#999;margin-left:12px">状态: ' + (n.status || '?') + '</span>' +
+                '<span style="color:#999;margin-left:12px">CPU: ' + (n.cpu || '?') + '</span>' +
+                '<span style="color:#999;margin-left:12px">内存: ' + (n.mem ? Math.round(n.mem/1024/1024/1024) + 'GB' : '?') + '</span>' +
+            '</div>'
+        ).join('');
+    } catch (e) {
+        content.innerHTML = '<p style="color:#ff4d4f">获取节点失败: ' + e.message + '</p>';
+    }
+}
+
+function closeNodeModal() { hide('node-modal-overlay'); }
+
+function openAddModal() {
+    _editingId = null;
+    $('modal-title').textContent = '新增 PVE 服务器';
+    $('f-name').value = '';
+    $('f-host').value = '';
+    $('f-port').value = '8006';
+    $('f-user').value = '';
+    $('f-token-name').value = '';
+    $('f-token-value').value = '';
+    $('f-node').value = '';
+    $('form-error').style.display = 'none';
+    $('btn-save').textContent = '保存';
+    show('modal-overlay');
+}
+
+async function openEditModal(id) {
+    _editingId = id;
+    $('modal-title').textContent = '编辑 PVE 服务器';
+    $('btn-save').textContent = '保存';
+    $('form-error').style.display = 'none';
+    show('modal-overlay');
+    $('f-name').value = '';
+    $('f-host').value = '';
+    $('f-port').value = '8006';
+    $('f-user').value = '';
+    $('f-token-name').value = '';
+    $('f-token-value').value = '';
+    $('f-node').value = '';
+    try {
+        const servers = await api('GET', '/servers');
+        const s = servers.find(x => x.id === id);
+        if (!s) { throw new Error('服务器不存在'); }
+        $('f-name').value = s.name;
+        $('f-host').value = s.host;
+        $('f-port').value = s.port;
+        $('f-user').value = s.user;
+        $('f-token-name').value = s.token_name;
+        $('f-token-value').value = '****';
+        $('f-node').value = s.node;
+    } catch (e) {
+        $('form-error').textContent = '加载失败: ' + e.message;
+        $('form-error').style.display = 'block';
+    }
+}
+
+function closeModal() { hide('modal-overlay'); _editingId = null; }
+
+function getFormData() {
     return {
-        host: $('cfg-host').value.trim(),
-        port: parseInt($('cfg-port').value) || 8006,
-        user: $('cfg-user').value.trim(),
-        token_name: $('cfg-token-name').value.trim(),
-        token_value: $('cfg-token-value').value,
-        verify_ssl: $('cfg-ssl').checked,
+        name: $('f-name').value.trim(),
+        host: $('f-host').value.trim(),
+        port: parseInt($('f-port').value) || 8006,
+        user: $('f-user').value.trim(),
+        token_name: $('f-token-name').value.trim(),
+        token_value: $('f-token-value').value,
+        node: $('f-node').value.trim(),
     };
 }
 
-async function saveConfig() {
-    const el = $('conn-result');
-    el.innerHTML = '保存中...';
-    el.style.color = '#666';
+async function saveServer() {
+    const data = getFormData();
+    const errEl = $('form-error');
+    errEl.style.display = 'none';
+    const missing = [];
+    if (!data.name) missing.push('命名');
+    if (!data.host) missing.push('服务器 IP');
+    if (!data.user) missing.push('用户');
+    if (!data.token_name) missing.push('API Name');
+    if (!data.token_value || data.token_value === '****') missing.push('API Token');
+    if (!data.node) missing.push('节点名');
+    if (missing.length) {
+        errEl.textContent = '请填写必填项: ' + missing.join(', ');
+        errEl.style.display = 'block';
+        return;
+    }
+    $('btn-save').disabled = true;
     try {
-        const cfg = getConfig();
-        if (!cfg.host || !cfg.user || !cfg.token_name || !cfg.token_value) {
-            throw new Error('host、user、token_name、token_value 均为必填项');
+        if (_editingId) {
+            await api('PUT', '/servers/' + _editingId, data);
+        } else {
+            await api('POST', '/servers', data);
         }
-        await api('POST', '/config', cfg);
-        el.innerHTML = '✅ 配置已保存';
-        el.style.color = '#52c41a';
+        closeModal();
+        loadServers();
     } catch (e) {
-        el.innerHTML = '❌ ' + e.message;
-        el.style.color = '#ff4d4f';
+        errEl.textContent = '保存失败: ' + e.message;
+        errEl.style.display = 'block';
+    } finally {
+        $('btn-save').disabled = false;
     }
 }
 
-async function testConnection() {
-    const el = $('conn-result');
-    el.innerHTML = '测试中...';
-    el.style.color = '#666';
+async function deleteServer(id) {
+    if (!confirm('确定删除此 PVE 服务器？')) return;
     try {
-        const cfg = getConfig();
-        const data = await api('POST', '/test', cfg);
-        el.innerHTML = '✅ ' + data.message;
-        el.style.color = '#52c41a';
+        await api('DELETE', '/servers/' + id);
+        loadServers();
     } catch (e) {
-        el.innerHTML = '❌ ' + e.message;
-        el.style.color = '#ff4d4f';
+        alert('删除失败: ' + e.message);
     }
 }
+
+document.addEventListener('DOMContentLoaded', loadServers);
 </script>
 {% endblock %}

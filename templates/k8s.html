@@ -5,7 +5,7 @@
 <div class="card" style="margin-bottom:16px;max-width:640px">
     <h3 style="margin-bottom:16px">新建集群</h3>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-        <div class="form-group"><label>PVE 节点</label><input id="form-node" class="form-control" placeholder="pve"></div>
+        <div class="form-group"><label>PVE 服务器</label><select id="form-server" class="form-control"><option value="">-- 请选择 --</option></select></div>
         <div class="form-group"><label>模板 VMID</label><input id="form-template" class="form-control" type="number" value="9000"></div>
         <div class="form-group"><label>主节点数量</label><input id="form-master-count" class="form-control" type="number" value="1" min="1"></div>
         <div class="form-group"><label>子节点数量</label><input id="form-node-count" class="form-control" type="number" value="1" min="0"></div>
@@ -162,8 +162,12 @@ async function createCluster() {
     showModal(true);
     updateProgress(0, '正在启动');
     try {
+        const sel = $('form-server');
+        const opt = sel.options[sel.selectedIndex];
+        const pve_node = (opt && opt.dataset && opt.dataset.node) || '';
         const body = {
-            pve_node: $('form-node').value.trim(),
+            pve_server_id: parseInt($('form-server').value) || 0,
+            pve_node: pve_node,
             template_vmid: parseInt($('form-template').value) || 9000,
             master_count: parseInt($('form-master-count').value) || 1,
             node_count: parseInt($('form-node-count').value) || 1,
@@ -173,7 +177,7 @@ async function createCluster() {
             node_memory: parseInt($('form-node-mem').value) || 4096,
             password: $('form-password').value.trim() || 'k8s.1234',
         };
-        if (!body.pve_node) throw new Error('请输入 PVE 节点');
+        if (!body.pve_node) throw new Error('请选择 PVE 服务器');
         const result = await api('POST', '/create', body);
         $('modal-links').innerHTML =
             '<a href="/k8s/logs/' + result.task_id + '" target="_blank" ' +
@@ -220,6 +224,23 @@ async function deleteCluster(name) {
     }
 }
 
+async function loadPVEServers() {
+    try {
+        const res = await fetch('/api/pve/servers');
+        const servers = await res.json();
+        const sel = $('form-server');
+        servers.forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s.id;
+            opt.textContent = s.name + ' (' + s.host + ')';
+            opt.dataset.node = s.node || '';
+            sel.appendChild(opt);
+        });
+    } catch (e) {
+        console.warn('加载 PVE 服务器列表失败:', e);
+    }
+}
+
 async function uploadSshKey(name) {
     const el = $('create-result');
     el.innerHTML = '正在上传 SSH 私钥...';
@@ -233,5 +254,7 @@ async function uploadSshKey(name) {
         el.style.color = '#ff4d4f';
     }
 }
+
+document.addEventListener('DOMContentLoaded', loadPVEServers);
 </script>
 {% endblock %}

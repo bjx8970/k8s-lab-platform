@@ -4,11 +4,14 @@ from functools import wraps
 from flask import Flask, render_template, request, jsonify
 
 from modules.db import (
-    get_config, init_db, migrate_config_from_json, migrate_from_json, set_config,
+    create_pve_server, delete_pve_server, get_config, get_db_config, get_db_status, get_pve_server,
+    init_db, list_pve_servers, migrate_config_from_json, migrate_data_from_sqlite, migrate_from_json,
+    set_config, set_db_config, update_pve_server,
 )
 from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, list_clusters, get_cluster, delete_cluster, get_task_status, K8sError
+from modules.pg_client import PGClient, PGError
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
@@ -20,13 +23,18 @@ migrate_config_from_json("pve", os.path.join(_base_dir, ".pve_config.json"))
 migrate_config_from_json("openwrt", os.path.join(_base_dir, ".openwrt_config.json"))
 
 
-def get_pve_client():
-    cfg = get_config("pve")
-    if not cfg:
-        raise PVEError(f"PVE 未配置，请先在页面中保存配置")
+def get_pve_client(server_id=None):
+    if server_id:
+        cfg = get_pve_server(server_id)
+        if not cfg:
+            raise PVEError(f"PVE 服务器 (ID={server_id}) 不存在")
+    else:
+        cfg = get_config("pve")
+        if not cfg:
+            raise PVEError(f"PVE 未配置，请先在页面中保存配置")
     missing = [k for k in ("host", "user", "token_name", "token_value") if not cfg.get(k)]
     if missing:
-        raise PVEError(f"PVE 配置不完整: {', '.join(missing)}，请先在页面中保存配置")
+        raise PVEError(f"PVE 配置不完整: {', '.join(missing)}")
     return PVEClient(
         host=cfg["host"],
         user=cfg["user"],
@@ -74,8 +82,15 @@ def k8s():
 
 @app.route("/pve")
 def pve():
-    cfg = get_config("pve") or {}
-    return render_template("pve.html", config=cfg)
+    servers = list_pve_servers()
+    return render_template("pve.html", servers=servers)
+
+
+@app.route("/db")
+def db_config_page():
+    cfg = get_db_config()
+    safe = {k: v for k, v in cfg.items() if k != "password"}
+    return render_template("db_config.html", config=safe)
 
 
 @app.route("/api/pve/config", methods=["GET", "POST"])
@@ -91,6 +106,73 @@ def pve_config():
     cfg = get_config("pve") or {}
     safe = {k: v for k, v in cfg.items() if k != "token_value"}
     return jsonify(safe)
+
+
+@app.route("/api/pve/servers", methods=["GET"])
+@api_error_handler
+def pve_list_servers():
+    return jsonify(list_pve_servers())
+
+
+@app.route("/api/pve/servers", methods=["POST"])
+@api_error_handler
+def pve_create_server():
+    data = request.get_json() or {}
+    missing = [k for k in ("name", "host", "user", "token_name", "token_value") if not data.get(k)]
+    if missing:
+        return jsonify({"error": f"缺少必填项: {', '.join(missing)}"}), 400
+    sid = create_pve_server(data)
+    return jsonify({"id": sid, "message": "服务器已创建"}), 201
+
+
+@app.route("/api/pve/servers/<int:sid>", methods=["PUT"])
+@api_error_handler
+def pve_update_server(sid):
+    data = request.get_json() or {}
+    result = update_pve_server(sid, data)
+    if result is None:
+        return jsonify({"error": "服务器不存在"}), 404
+    return jsonify({"message": "服务器已更新"})
+
+
+@app.route("/api/pve/servers/<int:sid>", methods=["DELETE"])
+@api_error_handler
+def pve_delete_server(sid):
+    delete_pve_server(sid)
+    return jsonify({"message": "服务器已删除"})
+
+
+@app.route("/api/pve/servers/<int:sid>/test", methods=["POST"])
+@api_error_handler
+def pve_test_server(sid):
+    cfg = get_pve_server(sid)
+    if not cfg:
+        return jsonify({"error": "服务器不存在"}), 404
+    client = PVEClient(
+        host=cfg["host"],
+        user=cfg["user"],
+        token_name=cfg["token_name"],
+        token_value=cfg["token_value"],
+        verify_ssl=False,
+        port=cfg.get("port", 8006),
+    )
+    version = client.connect()
+    return jsonify({"message": "连接成功", "version": version})
+
+
+@app.route("/api/pve/servers/<int:sid>/nodes", methods=["GET"])
+@api_error_handler
+def pve_server_nodes(sid):
+    client = get_pve_client(server_id=sid)
+    return jsonify(client.get_nodes())
+
+
+@app.route("/api/pve/servers/<int:sid>/vms", methods=["GET"])
+@api_error_handler
+def pve_server_vms(sid):
+    node = request.args.get("node")
+    client = get_pve_client(server_id=sid)
+    return jsonify(client.get_vms(node))
 
 
 @app.route("/api/pve/test", methods=["POST"])
@@ -112,14 +194,16 @@ def pve_test_connection():
 @app.route("/api/pve/nodes", methods=["GET"])
 @api_error_handler
 def pve_get_nodes():
-    client = get_pve_client()
+    server_id = request.args.get("server_id", type=int)
+    client = get_pve_client(server_id=server_id)
     return jsonify(client.get_nodes())
 
 
 @app.route("/api/pve/debug", methods=["GET"])
 @api_error_handler
 def pve_debug():
-    client = get_pve_client()
+    server_id = request.args.get("server_id", type=int)
+    client = get_pve_client(server_id=server_id)
     nodes_raw = client.get_nodes()
     result = {"nodes": nodes_raw, "vms_by_node": {}}
     for n in nodes_raw:
@@ -136,7 +220,8 @@ def pve_debug():
 @api_error_handler
 def pve_get_vms():
     node = request.args.get("node")
-    client = get_pve_client()
+    server_id = request.args.get("server_id", type=int)
+    client = get_pve_client(server_id=server_id)
     return jsonify(client.get_vms(node))
 
 
@@ -158,7 +243,8 @@ def pve_get_vm_config(node, vmid):
 @api_error_handler
 def pve_get_templates():
     node = request.args.get("node")
-    client = get_pve_client()
+    server_id = request.args.get("server_id", type=int)
+    client = get_pve_client(server_id=server_id)
     return jsonify(client.get_templates(node))
 
 
@@ -614,6 +700,7 @@ def k8s_create_cluster():
     pve_node = data.get("pve_node", "")
     template_vmid = int(data.get("template_vmid", 9000))
     password = data.get("password", "k8s.1234")
+    pve_server_id = int(data.get("pve_server_id", 0))
 
     if master_count < 1:
         return jsonify({"error": "主节点数量至少为 1"}), 400
@@ -630,6 +717,7 @@ def k8s_create_cluster():
         node_cores, node_memory,
         pve_node, template_vmid,
         password=password,
+        pve_server_id=pve_server_id,
     )
     safe = {k: v for k, v in cluster.items() if k != "ssh_private_key"}
     return jsonify({"name": name, "cluster": safe}), 201
@@ -655,6 +743,7 @@ def k8s_create_cluster_async_route():
     pve_node = data.get("pve_node", "")
     template_vmid = int(data.get("template_vmid", 9000))
     password = data.get("password", "k8s.1234")
+    pve_server_id = int(data.get("pve_server_id", 0))
 
     if master_count < 1:
         return jsonify({"error": "主节点数量至少为 1"}), 400
@@ -671,6 +760,7 @@ def k8s_create_cluster_async_route():
         node_cores, node_memory,
         pve_node, template_vmid,
         password=password,
+        pve_server_id=pve_server_id,
     )
     return jsonify({"task_id": task_id}), 202
 
@@ -748,6 +838,66 @@ def k8s_upload_ssh_key(name):
 @k8s_api_error_handler
 def k8s_logs_page(task_id):
     return render_template("k8s_logs.html", task_id=task_id)
+
+
+# ── Database config ──
+
+@app.route("/api/db/config", methods=["GET", "POST"])
+def db_config():
+    if request.method == "POST":
+        data = request.get_json() or {}
+        set_db_config(data)
+        return jsonify({"message": "配置已保存，请重启应用生效"})
+    cfg = get_db_config()
+    safe = {k: v for k, v in cfg.items() if k != "password"}
+    return jsonify({"config": safe})
+
+
+@app.route("/api/db/status", methods=["GET"])
+def db_status():
+    return jsonify(get_db_status())
+
+
+@app.route("/api/db/test", methods=["POST"])
+def db_test():
+    data = request.get_json() or {}
+    host = data.get("host", "")
+    port = data.get("port", 5432)
+    user = data.get("user", "")
+    password = data.get("password", "")
+    database = data.get("database", "postgres")
+
+    client = PGClient(
+        host=host, port=port, user=user,
+        password=password, database=database,
+    )
+    try:
+        version = client.connect()
+        return jsonify({"version": version, "ok": True})
+    except PGError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        client.close()
+
+
+@app.route("/api/db/init", methods=["POST"])
+def db_init():
+    try:
+        init_db()
+        return jsonify({"message": "数据库初始化完成"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/db/migrate", methods=["POST"])
+def db_migrate():
+    try:
+        result = migrate_data_from_sqlite()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":

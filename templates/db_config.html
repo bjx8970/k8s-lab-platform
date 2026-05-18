@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block page_heading %}数据库管理{% endblock %}
+{% block content %}
+
+<div class="card" style="margin-bottom:16px">
+    <h3>当前状态</h3>
+    <div id="db-status" style="font-size:14px;color:#666;margin-top:8px">加载中...</div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+    <h3>数据库配置</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="form-group">
+            <label>数据库类型</label>
+            <select id="f-type" class="form-control" onchange="onTypeChange()">
+                <option value="sqlite">SQLite</option>
+                <option value="postgresql">PostgreSQL</option>
+            </select>
+        </div>
+    </div>
+    <div id="pg-fields" style="display:none;margin-top:12px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="form-group">
+                <label>Host *</label>
+                <input id="f-host" class="form-control" placeholder="127.0.0.1">
+            </div>
+            <div class="form-group">
+                <label>Port</label>
+                <input id="f-port" class="form-control" type="number" value="5432">
+            </div>
+            <div class="form-group">
+                <label>User *</label>
+                <input id="f-user" class="form-control" placeholder="postgres">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input id="f-password" class="form-control" type="password">
+            </div>
+            <div class="form-group" style="grid-column:1/-1">
+                <label>Database *</label>
+                <input id="f-database" class="form-control" placeholder="k8s_lab">
+            </div>
+        </div>
+    </div>
+    <div id="form-error" style="color:#ff4d4f;font-size:13px;margin-top:8px;display:none"></div>
+    <div style="margin-top:12px;display:flex;gap:8px">
+        <button class="btn btn-primary" onclick="saveConfig()">保存配置</button>
+        <button class="btn" id="btn-test" onclick="testConnection()">测试连接</button>
+    </div>
+    <div id="test-result" style="margin-top:8px;font-size:13px"></div>
+    <div id="restart-hint" style="margin-top:8px;color:#fa8c16;font-size:13px;display:none">配置已保存，请重启应用使新配置生效</div>
+</div>
+
+<div class="card" style="margin-bottom:16px" id="pg-actions" style="display:none">
+    <h3>数据管理</h3>
+    <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn" onclick="initDB()">初始化数据库表</button>
+        <button class="btn" onclick="migrateData()">从 SQLite 迁移数据</button>
+    </div>
+    <div id="action-result" style="margin-top:8px;font-size:13px"></div>
+</div>
+
+<style>
+.btn{display:inline-flex;align-items:center;padding:6px 16px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#333;font-size:13px;cursor:pointer;transition:all .2s}
+.btn:hover{border-color:#1890ff;color:#1890ff}
+.btn-primary{background:#1890ff;border-color:#1890ff;color:#fff}
+.btn-primary:hover{background:#40a9ff;border-color:#40a9ff;color:#fff}
+.form-group{margin-bottom:12px}
+.form-group label{display:block;font-size:13px;color:#333;margin-bottom:4px;font-weight:500}
+.form-control{width:100%;padding:6px 10px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;outline:none;transition:border-color .2s;box-sizing:border-box}
+.form-control:focus{border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.2)}
+</style>
+
+<script>
+const API = '/api/db';
+function $(id) { return document.getElementById(id); }
+
+async function load() {
+    try {
+        const r = await fetch(API + '/config');
+        const data = await r.json();
+        const cfg = data.config || {};
+        $('f-type').value = cfg.type || 'sqlite';
+        if (cfg.type === 'postgresql') {
+            $('f-host').value = cfg.host || '';
+            $('f-port').value = cfg.port || 5432;
+            $('f-user').value = cfg.user || '';
+            $('f-database').value = cfg.database || '';
+            $('f-password').value = cfg.password ? '****' : '';
+        }
+        onTypeChange();
+    } catch(e) {}
+
+    try {
+        const r = await fetch(API + '/status');
+        const s = await r.json();
+        var html = '类型: <strong>' + s.type + '</strong> | ' +
+            '状态: <strong style="color:' + (s.connected ? '#52c41a' : '#ff4d4f') + '">' +
+            (s.connected ? '已连接' : '连接失败') + '</strong> | ' +
+            '集群数: <strong>' + (s.cluster_count || 0) + '</strong>';
+        if (s.host) html += ' | ' + s.host + '/' + s.database;
+        $('db-status').innerHTML = html;
+        if (s.type === 'postgresql' && s.connected) {
+            $('pg-actions').style.display = 'block';
+        }
+    } catch(e) {}
+}
+
+function onTypeChange() {
+    var t = $('f-type').value;
+    $('pg-fields').style.display = t === 'postgresql' ? 'block' : 'none';
+    $('btn-test').style.display = t === 'postgresql' ? '' : 'none';
+}
+
+async function saveConfig() {
+    var cfg = {
+        type: $('f-type').value,
+        host: $('f-host').value.trim(),
+        port: parseInt($('f-port').value) || 5432,
+        user: $('f-user').value.trim(),
+        password: $('f-password').value,
+        database: $('f-database').value.trim(),
+    };
+    if (cfg.type === 'postgresql') {
+        if (!cfg.host || !cfg.user || !cfg.database) {
+            $('form-error').textContent = '请填写 Host、User 和 Database';
+            $('form-error').style.display = 'block';
+            return;
+        }
+    }
+    try {
+        await fetch(API + '/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(cfg)
+        });
+        $('form-error').style.display = 'none';
+        $('restart-hint').style.display = 'block';
+    } catch(e) {
+        $('form-error').textContent = '保存失败';
+        $('form-error').style.display = 'block';
+    }
+}
+
+async function testConnection() {
+    var el = $('test-result');
+    el.style.color = '#666';
+    el.textContent = '测试中...';
+    try {
+        var r = await fetch(API + '/test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                host: $('f-host').value.trim(),
+                port: parseInt($('f-port').value) || 5432,
+                user: $('f-user').value.trim(),
+                password: $('f-password').value,
+                database: $('f-database').value.trim() || 'postgres',
+            })
+        });
+        var data = await r.json();
+        if (!r.ok) throw new Error(data.error || '失败');
+        el.style.color = '#52c41a';
+        el.textContent = '连接成功，版本: ' + data.version;
+    } catch(e) {
+        el.style.color = '#ff4d4f';
+        el.textContent = '' + e.message;
+    }
+}
+
+async function initDB() {
+    var el = $('action-result');
+    el.style.color = '#666';
+    el.textContent = '初始化中...';
+    try {
+        var r = await fetch(API + '/init', { method: 'POST' });
+        var data = await r.json();
+        if (!r.ok) throw new Error(data.error || '失败');
+        el.style.color = '#52c41a';
+        el.textContent = data.message;
+        load();
+    } catch(e) {
+        el.style.color = '#ff4d4f';
+        el.textContent = '' + e.message;
+    }
+}
+
+async function migrateData() {
+    if (!confirm('将从 SQLite 迁移数据到 PostgreSQL，继续？')) return;
+    var el = $('action-result');
+    el.style.color = '#666';
+    el.textContent = '迁移中...';
+    try {
+        var r = await fetch(API + '/migrate', { method: 'POST' });
+        var data = await r.json();
+        if (!r.ok) throw new Error(data.error || '失败');
+        el.style.color = '#52c41a';
+        el.textContent = data.message;
+        load();
+    } catch(e) {
+        el.style.color = '#ff4d4f';
+        el.textContent = '' + e.message;
+    }
+}
+
+document.addEventListener('DOMContentLoaded', load);
+</script>
+{% endblock %}
