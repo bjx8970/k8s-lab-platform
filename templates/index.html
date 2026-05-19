@@ -109,7 +109,8 @@ function renderClassCards(clusters) {
     for (var name in clusters) {
         var c = clusters[name];
         if (c.group_id) continue;
-        var key = c.class_name || '__其他__';
+        if (!c.class_name) continue;
+        var key = c.class_name;
         if (!grouped[key]) { grouped[key] = []; classOrder.push(key); }
         grouped[key].push({name: name, data: c});
     }

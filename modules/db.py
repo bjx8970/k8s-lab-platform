@@ -969,7 +969,7 @@ def list_group_members(group_id):
         if not user_ids:
             return []
         users = session.query(User).filter(User.id.in_(user_ids)).all()
-        return [{"id": u.id, "username": u.username, "role": u.role} for u in users]
+        return [{"id": u.id, "username": u.username, "name": u.name, "role": u.role} for u in users]
     finally:
         session.close()
 
@@ -982,7 +982,7 @@ def list_group_members_batch(group_ids):
             return {}
         user_ids = list(set(m.user_id for m in members))
         users = session.query(User).filter(User.id.in_(user_ids)).all()
-        user_map = {u.id: {"id": u.id, "username": u.username, "role": u.role} for u in users}
+        user_map = {u.id: {"id": u.id, "username": u.username, "name": u.name, "role": u.role} for u in users}
         from collections import defaultdict
         result = defaultdict(list)
         for m in members:
@@ -1064,3 +1064,25 @@ def get_student_group_ids(user_id):
         return [m.group_id for m in memberships]
     finally:
         session.close()
+
+
+def detach_clusters_from_group(group_id):
+    with session_scope(commit=True) as session:
+        session.query(Cluster).filter_by(group_id=group_id).update({"group_id": None})
+
+
+def detach_clusters_from_class(class_id):
+    with session_scope(commit=True) as session:
+        session.query(Cluster).filter_by(class_id=class_id).update({"class_id": None, "group_id": None})
+
+
+def list_cluster_names_by_class_id(class_id):
+    with session_scope() as session:
+        clusters = session.query(Cluster).filter_by(class_id=class_id).all()
+        return [c.name for c in clusters]
+
+
+def list_cluster_names_by_group_id(group_id):
+    with session_scope() as session:
+        clusters = session.query(Cluster).filter_by(group_id=group_id).all()
+        return [c.name for c in clusters]

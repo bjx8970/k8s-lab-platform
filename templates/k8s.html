@@ -131,7 +131,7 @@ async function loadClusters() {
                 if (k8sStatus !== 'installed' && k8sStatus !== 'installing') {
                     headerBtns += '<button class="btn btn-sm" onclick="deployK8s(\'' + esc(name) + '\')">部署 K8s</button>';
                 }
-                headerBtns += '<button class="btn btn-sm btn-danger" onclick="deleteCluster(\'' + esc(name) + '\')">删除</button>';
+                headerBtns += '<button class="btn btn-sm btn-danger" onclick="deleteCluster(event, \'' + esc(name) + '\')">删除</button>';
             }
             let vmsHtml = '';
             if (c.vms) {
@@ -297,8 +297,10 @@ async function deployK8s(name) {
     }
 }
 
-async function deleteCluster(name) {
+async function deleteCluster(event, name) {
     if (!confirm('确定删除集群 ' + name + ' ？\n这将释放所有虚拟机并清理 OpenWrt 配置。')) return;
+    var btn = event && event.target;
+    if (btn) { btn.disabled = true; btn.textContent = '删除中...'; }
     _forceDeleteName = name;
     try {
         await api('DELETE', '/clusters/' + encodeURIComponent(name));
@@ -306,6 +308,8 @@ async function deleteCluster(name) {
         loadClusters();
     } catch (e) {
         showToast('❌ 删除失败: ' + e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '删除'; }
     }
 }
 

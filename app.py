@@ -11,6 +11,8 @@ from modules.db import (
     get_config, get_db_config, get_db_status, get_group, get_pve_server,
     get_student_group_ids, get_students_created_by, get_user, get_user_by_username,
     get_user_cluster_ids, get_user_groups, init_db, is_db_configured, list_classes,
+    list_cluster_names_by_class_id, list_cluster_names_by_group_id,
+    detach_clusters_from_group, detach_clusters_from_class,
     list_group_members, list_group_members_batch, list_groups, list_groups_batch, list_pve_servers, list_users,
     get_or_create_group, migrate_config_from_json,
     migrate_from_json, reload_db_engine, remove_group_member, save_cluster,
@@ -493,8 +495,17 @@ def api_delete_class(cid):
         return jsonify({"error": "课程不存在"}), 404
     if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
         return jsonify({"error": "只能删除自己创建的课程"}), 403
+    cluster_names = list_cluster_names_by_class_id(cid)
+    detach_clusters_from_class(cid)
+    task_ids = []
+    for name in cluster_names:
+        tid = delete_cluster_async(name, created_by=g.user["id"])
+        task_ids.append(tid)
     delete_class(cid)
-    return jsonify({"message": "课程已删除"})
+    return jsonify({
+        "message": f"课程已删除，已提交 {len(cluster_names)} 个集群释放任务",
+        "task_ids": task_ids,
+    })
 
 
 @app.route("/api/classes/template", methods=["GET"])
@@ -660,8 +671,17 @@ def api_delete_group(gid):
         return jsonify({"error": "组不存在"}), 404
     if g.user["role"] == "teacher" and grp.get("created_by") != g.user["id"]:
         return jsonify({"error": "只能删除自己创建的组"}), 403
+    cluster_names = list_cluster_names_by_group_id(gid)
+    detach_clusters_from_group(gid)
+    task_ids = []
+    for name in cluster_names:
+        tid = delete_cluster_async(name, created_by=g.user["id"])
+        task_ids.append(tid)
     delete_group(gid)
-    return jsonify({"message": "组已删除"})
+    return jsonify({
+        "message": f"组已删除，已提交 {len(cluster_names)} 个集群释放任务",
+        "task_ids": task_ids,
+    })
 
 
 # ── Group Member API ──
@@ -1712,6 +1732,49 @@ def k8s_cluster_vm_action_all(name):
             results.append({"vm": vm_name, "status": "ok"})
         except Exception as e:
             results.append({"vm": vm_name, "status": "failed", "error": str(e)})
+    ok = sum(1 for r in results if r["status"] == "ok")
+    return jsonify({"results": results, "message": f"{ok}/{len(results)}"})
+
+
+@app.route("/api/classes/<int:cid>/vm-action-all", methods=["POST"])
+@login_required
+def api_class_vm_action_all(cid):
+    cls = get_class(cid)
+    if not cls:
+        return jsonify({"error": "课程不存在"}), 404
+    if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
+        return jsonify({"error": "只能操作自己创建的课程"}), 403
+    if g.user["role"] == "student":
+        return jsonify({"error": "无权操作"}), 403
+    data = request.get_json() or {}
+    action = data.get("action", "")
+    if action not in ("start", "stop"):
+        return jsonify({"error": "无效操作"}), 400
+
+    cluster_names = list_cluster_names_by_class_id(cid)
+    if not cluster_names:
+        return jsonify({"error": "该课程下没有集群"}), 400
+
+    results = []
+    client_cache = {}
+    for name in cluster_names:
+        cluster = get_cluster(name)
+        if not cluster or not cluster.get("vms"):
+            continue
+        server_id = cluster.get("pve_server_id")
+        if server_id not in client_cache:
+            client_cache[server_id] = get_pve_client(server_id=server_id)
+        client = client_cache[server_id]
+        for vm_name, vm_info in cluster["vms"].items():
+            try:
+                if action == "start":
+                    client.start_vm(vm_info["node"], vm_info["vmid"])
+                else:
+                    client.stop_vm(vm_info["node"], vm_info["vmid"])
+                results.append({"cluster": name, "vm": vm_name, "status": "ok"})
+            except Exception as e:
+                results.append({"cluster": name, "vm": vm_name, "status": "failed", "error": str(e)})
+
     ok = sum(1 for r in results if r["status"] == "ok")
     return jsonify({"results": results, "message": f"{ok}/{len(results)}"})
 
