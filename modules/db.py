@@ -294,6 +294,7 @@ def init_db():
     Base.metadata.create_all(engine)
     _ensure_db_indexes()
     _migrate_user_name()
+    _migrate_pve_template_vmid()
     migrate_pve_config()
 
 
@@ -372,6 +373,17 @@ def _migrate_user_name():
     try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE users ADD COLUMN name VARCHAR(128) DEFAULT ''"))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _migrate_pve_template_vmid():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE pve_servers ADD COLUMN template_vmid INTEGER DEFAULT 9000"))
             conn.commit()
     except Exception:
         pass

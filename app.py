@@ -18,7 +18,7 @@ from modules.db import (
 )
 from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
-from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, K8sError
+from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, cancel_task, K8sError, force_delete_cluster
 from modules.pg_client import PGClient, PGError
 
 app = Flask(__name__)
@@ -1548,6 +1548,14 @@ def k8s_delete_cluster(name):
     return jsonify({"task_id": task_id}), 202
 
 
+@app.route("/api/k8s/clusters/<name>/force", methods=["DELETE"])
+@login_required
+@admin_required
+def k8s_force_delete_cluster(name):
+    force_delete_cluster(name)
+    return jsonify({"message": "集群已强制删除"})
+
+
 @app.route("/api/k8s/create", methods=["POST"])
 @login_required
 @teacher_or_admin_required
@@ -1626,6 +1634,16 @@ def k8s_get_task(task_id):
     if not status:
         return jsonify({"error": "任务不存在"}), 404
     return jsonify(status)
+
+
+@app.route("/api/k8s/tasks/<task_id>/cancel", methods=["POST"])
+@login_required
+@k8s_api_error_handler
+def k8s_cancel_task(task_id):
+    ok = cancel_task(task_id)
+    if not ok:
+        return jsonify({"error": "任务不存在"}), 404
+    return jsonify({"message": "取消请求已发送"})
 
 
 @app.route("/api/k8s/clusters/<name>/ssh-key", methods=["GET"])
