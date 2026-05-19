@@ -1515,7 +1515,6 @@ def k8s_create_cluster():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    template_vmid = int(data.get("template_vmid", 9000))
     password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
 
@@ -1525,14 +1524,12 @@ def k8s_create_cluster():
         return jsonify({"error": "子节点数量至少为 1"}), 400
     if not pve_node:
         return jsonify({"error": "请选择 PVE 节点"}), 400
-    if not template_vmid:
-        return jsonify({"error": "请选择模板 VMID"}), 400
 
     name, cluster = create_cluster(
         master_count, node_count,
         master_cores, master_memory,
         node_cores, node_memory,
-        pve_node, template_vmid,
+        pve_node,
         password=password,
         pve_server_id=pve_server_id,
     )
@@ -1564,7 +1561,6 @@ def k8s_create_cluster_async_route():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    template_vmid = int(data.get("template_vmid", 9000))
     password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
     group_id = data.get("group_id")
@@ -1576,14 +1572,12 @@ def k8s_create_cluster_async_route():
         return jsonify({"error": "子节点数量至少为 1"}), 400
     if not pve_node:
         return jsonify({"error": "请选择 PVE 节点"}), 400
-    if not template_vmid:
-        return jsonify({"error": "请选择模板 VMID"}), 400
 
     task_id = create_cluster_async(
         master_count, node_count,
         master_cores, master_memory,
         node_cores, node_memory,
-        pve_node, template_vmid,
+        pve_node,
         password=password,
         pve_server_id=pve_server_id,
         group_id=group_id,
@@ -1609,7 +1603,6 @@ def k8s_batch_create_clusters():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    template_vmid = int(data.get("template_vmid", 9000))
     password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
 
@@ -1617,7 +1610,7 @@ def k8s_batch_create_clusters():
         group_ids, master_count, node_count,
         master_cores, master_memory,
         node_cores, node_memory,
-        pve_node, template_vmid,
+        pve_node,
         password=password,
         pve_server_id=pve_server_id,
         created_by=g.user["id"],

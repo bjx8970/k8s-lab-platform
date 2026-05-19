@@ -43,7 +43,6 @@
         <h3 style="margin-bottom:16px">新建集群</h3>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
             <div class="form-group"><label>PVE 服务器</label><select id="form-server" class="form-control"><option value="">-- 请选择 --</option></select></div>
-            <div class="form-group"><label>模板 VMID</label><input id="form-template" class="form-control" type="number" value="9000"></div>
             <div class="form-group"><label>主节点数量</label><input id="form-master-count" class="form-control" type="number" value="1" min="1"></div>
             <div class="form-group"><label>子节点数量</label><input id="form-node-count" class="form-control" type="number" value="1" min="0"></div>
             <div class="form-group"><label>主节点 CPU 核心</label><input id="form-master-cores" class="form-control" type="number" value="4"></div>
@@ -90,7 +89,7 @@
 <script>
 const API = '/api/k8s';
 const USER_ROLE = '{{ g.user.role }}';
-const OPENWRT_HOST = '{{ get_config("openwrt").get("host", "") }}';
+const OPENWRT_HOST = '{{ (get_config("openwrt") or {}).get("host", "") }}';
 
 function $(id) { return document.getElementById(id); }
 
@@ -236,7 +235,6 @@ async function createCluster() {
         const body = {
             pve_server_id: parseInt($('form-server').value) || 0,
             pve_node: pve_node,
-            template_vmid: parseInt($('form-template').value) || 9000,
             master_count: parseInt($('form-master-count').value) || 1,
             node_count: parseInt($('form-node-count').value) || 1,
             master_cores: parseInt($('form-master-cores').value) || 4,
@@ -286,7 +284,6 @@ async function batchCreate() {
             group_ids: selected.filter(x => x),
             pve_server_id: parseInt($('form-server').value) || 0,
             pve_node: pve_node,
-            template_vmid: parseInt($('form-template').value) || 9000,
             master_count: parseInt($('form-master-count').value) || 1,
             node_count: parseInt($('form-node-count').value) || 1,
             master_cores: parseInt($('form-master-cores').value) || 4,

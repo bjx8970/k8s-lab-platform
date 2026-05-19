@@ -314,7 +314,7 @@ def delete_cluster_async(name):
 
 
 def create_cluster(master_count, node_count, master_cores, master_memory,
-                   node_cores, node_memory, pve_node, template_vmid,
+                   node_cores, node_memory, pve_node,
                    password="k8s.1234", pve_server_id=0, group_id=None,
                    class_id=None, created_by=None,
                    status_callback=None, log_callback=None):
@@ -329,7 +329,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
     _log(f"开始创建集群: master={master_count}, node={node_count}, "
          f"cores=(master={master_cores}, node={node_cores}), "
          f"memory=(master={master_memory}MB, node={node_memory}MB)")
-    _log(f"PVE 节点: {pve_node}, 模板 VMID: {template_vmid}")
+    _log(f"PVE 节点: {pve_node}")
     with session_scope(commit=True) as session:
         try:
             num = _allocate_cluster_id(session)
@@ -465,6 +465,14 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
     pve = _pve_client(server_id=pve_server_id if pve_server_id else None)
     version = pve.connect()
     _log(f"PVE: 连接成功, 版本 {version.get('version', '?') if isinstance(version, dict) else version}")
+
+    template_vmid = pve_cfg.get("template_vmid") if pve_cfg else None
+    if not template_vmid:
+        template_vmid = 9000
+        _log(f"PVE: 未配置模板 VMID，使用默认值 {template_vmid}")
+    else:
+        _log(f"PVE: 模板 VMID = {template_vmid}")
+
     try:
         configs = [
             ("client", f"client-k8s{num}", client_cores, client_memory),
@@ -517,6 +525,41 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             _log(f"VM {vm_name}: 创建成功, VMID = {newid}")
             vms[vm_name] = {"node": pve_node, "vmid": newid, "mac": mac, "role": role}
             created_vms.append((vm_name, pve_node, newid))
+
+        # ── 预分配 IP（开机前写入 DHCP 静态绑定，不依赖 Guest Agent）──
+        _ip_prefix = f"10.100.{num}"
+        _ip_list = (
+            [f"{_ip_prefix}.101"] +
+            [f"{_ip_prefix}.{111 + i}" for i in range(master_count)] +
+            [f"{_ip_prefix}.{121 + i}" for i in range(node_count)]
+        )
+        for _vm_name, _ip in zip(list(vms.keys()), _ip_list):
+            vms[_vm_name]["ip"] = _ip
+            _log(f"VM {_vm_name}: 预分配 IP = {_ip}")
+
+        _log("批量写入 DHCP 静态绑定和端口转发...")
+        try:
+            _dhcp_lock = _openwrt_lock()
+            with _dhcp_lock:
+                _ow_dhcp = _openwrt_client()
+                _ow_dhcp.connect()
+                try:
+                    for _vm_name, _vi in vms.items():
+                        _ow_dhcp.create_dhcp_host(
+                            _vm_name, _vi["ip"], _vi["mac"], skip_restart=True)
+                        _log(f"DHCP 绑定: {_vm_name} → {_vi['ip']} ({_vi['mac']})")
+                    _ow_dhcp.exec("/etc/init.d/dnsmasq reload", tolerant=True)
+                    _log("dnsmasq 已重载")
+
+                    _cli_ip = next(_vi["ip"] for _vi in vms.values()
+                                   if _vi.get("role") == "client")
+                    _ow_dhcp.create_redirect(cluster_name, 50000 + num, _cli_ip, "22")
+                    _log(f"端口转发: WAN:{50000 + num} → {_cli_ip}:22")
+                    report(95, f"端口转发已配置: WAN:{50000 + num} → {_cli_ip}:22")
+                finally:
+                    _ow_dhcp.close()
+        except Exception as e:
+            _log(f"DHCP/端口转发配置异常 ({e})")
 
         report(92, "正在启动虚拟机...")
         for vm_name, node, vmid in created_vms:
@@ -598,37 +641,6 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             except Exception as e:
                 _log(f"VM {vm_name}: 重启跳过 ({e})")
 
-        _ssh_port = 50000 + num
-        report(96, "正在配置 DHCP 主机绑定和端口转发...")
-        try:
-            ow_lock = _openwrt_lock()
-            with ow_lock:
-                ow2 = _openwrt_client()
-                ow2.connect()
-                try:
-                    for vm_name, vm_info in vms.items():
-                        _log(f"VM {vm_name}: 等待 Guest Agent 获取 IP")
-                        try:
-                            pve.wait_for_guest_agent(vm_info["node"], vm_info["vmid"], timeout=120)
-                        except Exception as e:
-                            _log(f"VM {vm_name}: Guest Agent 未响应 ({e})")
-                            continue
-                        ip = pve.get_vm_ip(vm_info["node"], vm_info["vmid"])
-                        _log(f"VM {vm_name}: IP = {ip}, MAC = {vm_info['mac']}")
-                        if ip and vm_info["mac"]:
-                            ow2.create_dhcp_host(vm_name, ip, vm_info["mac"])
-                            _log(f"VM {vm_name}: DHCP 主机绑定完成")
-                            if vm_info["role"] == "client":
-                                ow2.create_redirect(
-                                    cluster_name, _ssh_port,
-                                    ip, "22")
-                                _log(f"Client VM: 端口转发配置完成 WAN:{_ssh_port} → {ip}:22")
-                                report(96, f"端口转发已配置: WAN:{_ssh_port} → {ip}:22")
-                finally:
-                    ow2.close()
-        except Exception as e:
-            _log(f"DHCP/端口转发配置异常 ({e})")
-
     except Exception as e:
         _log(f"错误: {e}")
         _log("回滚: 释放已创建的虚拟机")
@@ -665,7 +677,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         "pve_server_id": pve_server_id,
         "template_vmid": template_vmid,
         "vms": vms,
-        "ssh_port": _ssh_port,
+        "ssh_port": 50000 + num,
         "client_mac": _client_mac,
         "group_id": group_id,
         "class_id": class_id,
@@ -680,7 +692,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
 
 def create_cluster_async(master_count, node_count, master_cores, master_memory,
-                         node_cores, node_memory, pve_node, template_vmid,
+                         node_cores, node_memory, pve_node,
                          password="k8s.1234", pve_server_id=0,
                          group_id=None, class_id=None, created_by=None):
     task_id = _new_task_id()
@@ -702,7 +714,7 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                 master_count, node_count,
                 master_cores, master_memory,
                 node_cores, node_memory,
-                pve_node, template_vmid,
+                pve_node,
                 password=password,
                 pve_server_id=pve_server_id,
                 group_id=group_id,
@@ -1012,21 +1024,23 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     _log(f"master 节点: {masters}")
     _log(f"node 节点:   {nodes}")
 
-    # Resolve hostnames to IPs via PVE guest agent
+    # Resolve IPs: 优先使用预分配的 IP，fallback 到 Guest Agent
     report(82, "正在获取节点 IP 地址...")
-    _log("通过 Guest Agent 获取所有节点 IP")
+    _log("获取节点 IP（优先使用预分配 IP，fallback Guest Agent）")
     master_ips = {}
     node_ips = {}
     for vm_name in masters + nodes:
         vm_info = cluster["vms"][vm_name]
-        ip = None
-        try:
-            ip = pve.get_vm_ip(vm_info["node"], vm_info["vmid"])
-        except Exception:
-            pass
+        ip = vm_info.get("ip")
         if ip:
-            _log(f"{vm_name}: {ip}")
+            _log(f"{vm_name}: 使用预分配 IP = {ip}")
         else:
+            try:
+                ip = pve.get_vm_ip(vm_info["node"], vm_info["vmid"])
+                _log(f"{vm_name}: Guest Agent IP = {ip}")
+            except Exception:
+                pass
+        if not ip:
             _log(f"{vm_name}: 无法获取 IP，使用主机名")
         role = vm_info.get("role")
         if role == "master":
@@ -1181,7 +1195,7 @@ def deploy_k8s_async(name):
 def batch_create_clusters(group_ids, master_count, node_count,
                           master_cores, master_memory,
                           node_cores, node_memory,
-                          pve_node, template_vmid,
+                          pve_node,
                           password="k8s.1234",
                           pve_server_id=0,
                           created_by=None,
@@ -1201,7 +1215,7 @@ def batch_create_clusters(group_ids, master_count, node_count,
                 master_count, node_count,
                 master_cores, master_memory,
                 node_cores, node_memory,
-                pve_node, template_vmid,
+                pve_node,
                 password=password,
                 pve_server_id=pve_server_id,
                 group_id=gid,
@@ -1234,7 +1248,7 @@ def batch_create_clusters(group_ids, master_count, node_count,
 def batch_create_clusters_async(group_ids, master_count, node_count,
                                 master_cores, master_memory,
                                 node_cores, node_memory,
-                                pve_node, template_vmid,
+                                pve_node,
                                 password="k8s.1234",
                                 pve_server_id=0,
                                 created_by=None):
@@ -1254,7 +1268,7 @@ def batch_create_clusters_async(group_ids, master_count, node_count,
                 group_ids, master_count, node_count,
                 master_cores, master_memory,
                 node_cores, node_memory,
-                pve_node, template_vmid,
+                pve_node,
                 password=password,
                 pve_server_id=pve_server_id,
                 created_by=created_by,

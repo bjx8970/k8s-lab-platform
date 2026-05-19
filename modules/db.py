@@ -115,6 +115,7 @@ class PVEServer(Base):
     token_name = Column(String(64), nullable=False)
     token_value = Column(String(256), nullable=False)
     node = Column(String(64), default="")
+    template_vmid = Column(Integer, default=9000)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -225,8 +226,8 @@ def list_pve_servers():
             "token_name": s.token_name,
             "token_value": "****",
             "node": s.node,
+            "template_vmid": s.template_vmid,
         } for s in servers]
-
 
 def get_pve_server(server_id):
     with session_scope() as session:
@@ -242,6 +243,7 @@ def get_pve_server(server_id):
             "token_name": s.token_name,
             "token_value": s.token_value,
             "node": s.node,
+            "template_vmid": s.template_vmid,
         }
 
 
@@ -255,6 +257,7 @@ def create_pve_server(data):
             token_name=data["token_name"],
             token_value=data["token_value"],
             node=data.get("node", ""),
+            template_vmid=int(data.get("template_vmid", 9000)),
         )
         session.add(s)
         return s.id
@@ -273,6 +276,7 @@ def update_pve_server(server_id, data):
         if "token_value" in data and data["token_value"] and data["token_value"] != "****":
             s.token_value = data["token_value"]
         if "node" in data: s.node = data["node"]
+        if "template_vmid" in data: s.template_vmid = int(data["template_vmid"])
         return s.id
 
 
