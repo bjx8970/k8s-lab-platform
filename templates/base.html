@@ -177,8 +177,11 @@
             {% if g.user.role in ('admin', 'teacher') %}
             <li><a href="/users" class="{% if request.path == '/users' %}active{% endif %}"><span class="icon">&#128101;</span> 用户管理</a></li>
             <li><a href="/classes" class="{% if request.path == '/classes' %}active{% endif %}"><span class="icon">&#128218;</span> 课程管理</a></li>
-            {% endif %}
             <li><a href="/k8s" class="{% if request.path == '/k8s' %}active{% endif %}"><span class="icon">&#9729;</span> K8s集群管理</a></li>
+            {% endif %}
+            {% if g.user.role == 'student' %}
+            <li><a href="/" class="{% if request.path == '/' %}active{% endif %}"><span class="icon">&#9729;</span> 我的集群</a></li>
+            {% endif %}
             {% if g.user.role == 'admin' %}
             <li><a href="/pve" class="{% if request.path == '/pve' %}active{% endif %}"><span class="icon">&#9881;</span> PVE连接管理</a></li>
             <li><a href="/openwrt" class="{% if request.path == '/openwrt' %}active{% endif %}"><span class="icon">&#9729;</span> OpenWrt管理</a></li>

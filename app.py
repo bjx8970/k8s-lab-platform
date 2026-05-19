@@ -775,7 +775,7 @@ def api_error_handler(f):
 @login_required
 def index():
     if g.user["role"] == "student":
-        return redirect("/k8s")
+        return render_template("student.html")
     return render_template("index.html")
 
 
