@@ -1,17 +1,20 @@
 {% extends "base.html" %}
-{% block page_heading %}班级管理{% endblock %}
+{% block page_heading %}课程管理{% endblock %}
 {% block content %}
 
-<div style="margin-bottom:12px">
-  <button class="btn btn-primary" onclick="openClassModal(null)">+ 新增班级</button>
+<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
+  <button class="btn btn-primary" onclick="openClassModal(null)">+ 新增课程</button>
+  <button class="btn" onclick="downloadClassTemplate()">下载模板</button>
+  <button class="btn" onclick="document.getElementById('import-file').click()" style="margin-left:4px">导入</button>
+  <input type="file" id="import-file" accept=".csv" style="display:none" onchange="importClasses(this)">
 </div>
 
 <div id="class-list" style="font-size:14px">加载中...</div>
 
 <div class="modal-overlay" id="class-modal">
   <div class="modal-card">
-    <h3 id="class-modal-title" style="margin-bottom:16px">新增班级</h3>
-    <div class="form-group"><label>班级名称 *</label><input id="f-class-name" class="form-control"></div>
+    <h3 id="class-modal-title" style="margin-bottom:16px">新增课程</h3>
+    <div class="form-group"><label>课程名称 *</label><input id="f-class-name" class="form-control"></div>
     <div class="form-group"><label>描述</label><input id="f-class-desc" class="form-control"></div>
     <div id="class-form-error" style="color:#ff4d4f;font-size:13px;margin-top:8px;display:none"></div>
     <div style="margin-top:14px;display:flex;gap:8px">
@@ -47,29 +50,16 @@
 </div>
 
 <style>
-.btn{display:inline-flex;align-items:center;padding:6px 16px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#333;font-size:13px;cursor:pointer;transition:all .2s}
-.btn:hover{border-color:#1890ff;color:#1890ff}
-.btn-primary{background:#1890ff;border-color:#1890ff;color:#fff}
-.btn-primary:hover{background:#40a9ff;border-color:#40a9ff;color:#fff}
-.btn-sm{padding:3px 10px;font-size:12px}
-.btn-danger{color:#ff4d4f;border-color:#ff4d4f}
-.btn-danger:hover{background:#ff4d4f;color:#fff}
-.form-group{margin-bottom:12px}
-.form-group label{display:block;font-size:13px;color:#333;margin-bottom:4px;font-weight:500}
-.form-control{width:100%;padding:6px 10px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;outline:none;transition:border-color .2s;box-sizing:border-box}
-.form-control:focus{border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.2)}
-.class-card{border:1px solid #f0f0f0;border-radius:6px;padding:14px 16px;margin-bottom:10px}
+.class-card{border:1px solid #f0f0f0;border-radius:10px;padding:14px 16px;margin-bottom:10px;box-shadow:var(--card-shadow);border-left:4px solid var(--primary)}
 .class-card .class-header{display:flex;align-items:center;justify-content:space-between;cursor:pointer}
 .class-card .class-header .name{font-size:15px;font-weight:600;color:#333}
 .class-card .class-header .meta{font-size:12px;color:#999}
 .class-card .class-body{padding-top:10px;margin-top:10px;border-top:1px solid #f0f0f0}
-.group-item{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;background:#fafafa;border-radius:4px;margin-bottom:6px;font-size:13px}
+.group-item{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:#fafafa;border-radius:6px;margin-bottom:6px;font-size:13px;transition:background .15s}
+.group-item:hover{background:#f0f5ff}
 .group-item .group-name{font-weight:500}
 .group-item .group-actions{display:flex;gap:6px}
 .badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;background:#e6f7ff;color:#1890ff}
-.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.45);z-index:1000;justify-content:center;align-items:flex-start;padding-top:8vh}
-.modal-overlay.show{display:flex}
-.modal-card{background:#fff;border-radius:8px;padding:28px 32px;width:460px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.2);max-height:80vh;overflow-y:auto}
 </style>
 
 <script>
@@ -97,10 +87,12 @@ async function loadClasses() {
   el.innerHTML = '加载中...';
   try {
     const classes = await api('GET', 'classes');
-    if (!classes.length) { el.innerHTML = '<p style="color:#999;margin-top:12px">暂无班级</p>'; return; }
+    if (!classes.length) { el.innerHTML = '<p style="color:#999;margin-top:12px">暂无课程</p>'; return; }
+    const classIds = classes.map(c => c.id);
+    const groupsByClass = classIds.length ? await api('GET', '/api/classes/groups?class_ids=' + classIds.join(',')) : {};
     let html = '';
     for (const c of classes) {
-      const groups = await api('GET', 'classes/' + c.id + '/groups');
+      const groups = groupsByClass[c.id] || [];
       html += '<div class="class-card" data-id="' + c.id + '">' +
         '<div class="class-header" onclick="toggleClass(this)">' +
           '<div><span class="name">' + esc(c.name) + '</span> <span class="meta">' + (c.description || '') + '</span></div>' +
@@ -142,7 +134,7 @@ function toggleClass(el) {
 
 function openClassModal(cls) {
   _editingClassId = cls ? cls.id : null;
-  $('class-modal-title').textContent = cls ? '编辑班级' : '新增班级';
+  $('class-modal-title').textContent = cls ? '编辑课程' : '新增课程';
   $('f-class-name').value = cls ? cls.name : '';
   $('f-class-desc').value = cls ? (cls.description || '') : '';
   $('class-form-error').style.display = 'none';
@@ -155,7 +147,7 @@ async function saveClass() {
   const name = $('f-class-name').value.trim();
   const desc = $('f-class-desc').value.trim();
   const err = $('class-form-error');
-  if (!name) { err.textContent = '班级名称不能为空'; err.style.display = 'block'; return; }
+  if (!name) { err.textContent = '课程名称不能为空'; err.style.display = 'block'; return; }
   try {
     if (_editingClassId) {
       await api('PUT', 'classes/' + _editingClassId, { name, description: desc });
@@ -171,7 +163,7 @@ async function saveClass() {
 }
 
 async function deleteClass(id) {
-  if (!confirm('确定删除此班级及其所有组？')) return;
+  if (!confirm('确定删除此课程及其所有组？')) return;
   try {
     await api('DELETE', 'classes/' + id);
     loadClasses();
@@ -271,6 +263,32 @@ async function removeMember(userId) {
   } catch (e) {
     $('member-msg').textContent = e.message;
   }
+}
+
+function downloadClassTemplate() {
+  window.location.href = '/api/classes/template';
+}
+
+async function importClasses(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const res = await fetch('/api/classes/import', { method: 'POST', body: formData });
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || '导入失败');
+    let msg = '✅ 成功添加 ' + result.created + ' 个成员';
+    if (result.skipped) msg += '，跳过 ' + result.skipped + ' 个（已存在）';
+    if (result.errors.length) {
+      msg += '\n⚠️ ' + result.errors.length + ' 个错误：\n' + result.errors.slice(0, 5).join('\n');
+    }
+    alert(msg);
+    loadClasses();
+  } catch (e) {
+    alert('导入失败: ' + e.message);
+  }
+  input.value = '';
 }
 
 document.addEventListener('DOMContentLoaded', loadClasses);

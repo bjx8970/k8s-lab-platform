@@ -60,19 +60,7 @@
 </div>
 
 <style>
-.btn{display:inline-flex;align-items:center;padding:6px 16px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#333;font-size:13px;cursor:pointer;transition:all .2s}
-.btn:hover{border-color:#1890ff;color:#1890ff}
-.btn-primary{background:#1890ff;border-color:#1890ff;color:#fff}
-.btn-primary:hover{background:#40a9ff;border-color:#40a9ff;color:#fff}
-.btn-sm{padding:3px 10px;font-size:12px}
-.btn-danger{color:#ff4d4f;border-color:#ff4d4f}
-.btn-danger:hover{background:#ff4d4f;color:#fff}
-.form-group{margin-bottom:12px}
-.form-group label{display:block;font-size:13px;color:#333;margin-bottom:4px;font-weight:500}
-.form-control{width:100%;padding:6px 10px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;outline:none;transition:border-color .2s;box-sizing:border-box}
-.form-control:focus{border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.2)}
-
-.server-card{border:1px solid #f0f0f0;border-radius:6px;padding:16px;margin-bottom:10px;max-width:720px}
+.server-card{border:1px solid #f0f0f0;border-radius:10px;padding:16px;margin-bottom:10px;max-width:720px;border-left:4px solid var(--primary);box-shadow:var(--card-shadow)}
 .server-card .row{display:flex;align-items:center;justify-content:space-between}
 .server-card .info{flex:1}
 .server-card .name{font-size:15px;font-weight:600;color:#333}
@@ -82,10 +70,6 @@
 .server-card .actions .btn{padding:4px 12px;font-size:12px}
 .conn-ok{color:#52c41a;font-size:12px;margin-top:4px}
 .conn-err{color:#ff4d4f;font-size:12px;margin-top:4px}
-
-.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.45);z-index:1000;justify-content:center;align-items:flex-start;padding-top:10vh}
-.modal-overlay.show{display:flex}
-.modal-card{background:#fff;border-radius:8px;padding:28px 32px;width:500px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.2)}
 </style>
 
 <script>

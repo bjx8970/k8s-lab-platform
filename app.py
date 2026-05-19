@@ -1,23 +1,24 @@
 import os
 from functools import wraps
 
-from flask import Flask, render_template, request, jsonify, session, redirect, g
+from flask import Flask, render_template, request, jsonify, session, redirect, g, make_response
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from modules.db import (
     add_group_member, check_user_in_class_group, count_classes, count_groups, count_users,
     create_class, create_group, create_pve_server, create_user, delete_class, delete_group,
-    delete_pve_server, delete_user, find_cluster_by_vm, get_class, get_classes_for_student,
+    delete_pve_server, delete_user, find_cluster_by_vm, get_class, get_class_by_name, get_classes_for_student,
     get_config, get_db_config, get_db_status, get_group, get_pve_server,
     get_student_group_ids, get_students_created_by, get_user, get_user_by_username,
     get_user_cluster_ids, get_user_groups, init_db, is_db_configured, list_classes,
-    list_group_members, list_group_members_batch, list_groups, list_pve_servers, list_users, migrate_config_from_json,
+    list_group_members, list_group_members_batch, list_groups, list_groups_batch, list_pve_servers, list_users,
+    get_or_create_group, migrate_config_from_json,
     migrate_from_json, reload_db_engine, remove_group_member, save_cluster,
     set_config, set_db_config, update_class, update_pve_server, update_user,
 )
 from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
-from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, list_clusters, get_cluster, delete_cluster, get_task_status, K8sError
+from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, K8sError
 from modules.pg_client import PGClient, PGError
 
 app = Flask(__name__)
@@ -31,24 +32,29 @@ if is_db_configured():
     migrate_config_from_json("openwrt", os.path.join(_base_dir, ".openwrt_config.json"))
 
 
+@app.context_processor
+def inject_globals():
+    return dict(get_config=get_config)
+
+
 # ── Auth helpers ──
 
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         if "user_id" not in session:
-            if request.is_json:
+            if request.path.startswith("/api/"):
                 return jsonify({"error": "未登录，请先登录"}), 401
             return redirect("/login")
         g.user = get_user(session["user_id"])
         if not g.user:
             session.clear()
-            if request.is_json:
+            if request.path.startswith("/api/"):
                 return jsonify({"error": "用户不存在"}), 401
             return redirect("/login")
         if not g.user.get("is_active"):
             session.clear()
-            if request.is_json:
+            if request.path.startswith("/api/"):
                 return jsonify({"error": "用户已被禁用"}), 403
             return redirect("/login")
         return f(*args, **kwargs)
@@ -60,7 +66,7 @@ def role_required(*roles):
         @wraps(f)
         def wrapper(*args, **kwargs):
             if g.user.get("role") not in roles:
-                if request.is_json:
+                if request.path.startswith("/api/"):
                     return jsonify({"error": "权限不足"}), 403
                 return render_template("403.html"), 403
             return f(*args, **kwargs)
@@ -78,6 +84,15 @@ def teacher_required(f):
 
 def teacher_or_admin_required(f):
     return role_required("admin", "teacher")(f)
+
+
+def _decode_csv(content):
+    for enc in ("utf-8-sig", "gbk", "gb2312"):
+        try:
+            return content.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
 
 
 # ── Setup / Login / Logout ──
@@ -239,7 +254,7 @@ def api_db_config():
 @login_required
 def api_users_me():
     u = g.user
-    result = {"id": u["id"], "username": u["username"], "role": u["role"]}
+    result = {"id": u["id"], "username": u["username"], "name": u.get("name", ""), "role": u["role"]}
     if u["role"] == "student":
         result["classes"] = get_classes_for_student(u["id"])
     elif u["role"] == "teacher":
@@ -254,12 +269,7 @@ def api_list_users():
     if g.user["role"] == "admin":
         users = list_users(role=role_filter)
     elif g.user["role"] == "teacher":
-        if role_filter == "student":
-            users = get_students_created_by(g.user["id"])
-        elif role_filter == "teacher":
-            return jsonify([])
-        else:
-            users = get_students_created_by(g.user["id"])
+        users = list_users(role="student")
     else:
         return jsonify({"error": "权限不足"}), 403
     return jsonify(users)
@@ -272,10 +282,13 @@ def api_create_user():
     username = data.get("username", "").strip()
     password = data.get("password", "").strip()
     role = data.get("role", "student")
+    name = data.get("name", "").strip()
     if not username or not password:
         return jsonify({"error": "用户名和密码不能为空"}), 400
     if role not in ("admin", "teacher", "student"):
         return jsonify({"error": "无效的角色"}), 400
+    if role == "admin":
+        return jsonify({"error": "无法创建管理员"}), 403
     if g.user["role"] == "teacher" and role != "student":
         return jsonify({"error": "教师只能创建学生用户"}), 403
     if g.user["role"] != "admin" and role in ("admin", "teacher"):
@@ -287,9 +300,86 @@ def api_create_user():
         "username": username,
         "password_hash": generate_password_hash(password),
         "role": role,
+        "name": name,
         "created_by": g.user["id"],
     })
     return jsonify({"id": uid, "message": "用户创建成功"}), 201
+
+
+@app.route("/api/users/template", methods=["GET"])
+@login_required
+@teacher_or_admin_required
+def api_users_template():
+    import csv, io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    if g.user["role"] == "admin":
+        writer.writerow(["username", "password", "name", "role"])
+        writer.writerow(["zhangsan", "123456", "张三", "student"])
+    else:
+        writer.writerow(["username", "password", "name"])
+        writer.writerow(["lisi", "123456", "李四"])
+    resp = make_response(output.getvalue().encode("gbk"))
+    resp.headers["Content-Type"] = "text/csv; charset=gbk"
+    resp.headers["Content-Disposition"] = "attachment; filename=user_import_template.csv"
+    return resp
+
+
+@app.route("/api/users/import", methods=["POST"])
+@login_required
+@teacher_or_admin_required
+def api_users_import():
+    import csv, io
+    if "file" not in request.files:
+        return jsonify({"error": "请上传 CSV 文件"}), 400
+    file = request.files["file"]
+    if not file.filename or not file.filename.endswith(".csv"):
+        return jsonify({"error": "仅支持 .csv 文件"}), 400
+    content = _decode_csv(file.read())
+    reader = csv.DictReader(io.StringIO(content))
+    required_cols_teacher = {"username", "password", "name"}
+    required_cols_admin = {"username", "password", "name", "role"}
+    if g.user["role"] == "admin":
+        if not reader.fieldnames or not required_cols_admin.issubset(reader.fieldnames):
+            return jsonify({"error": "CSV 格式错误，需要列: username, password, name, role"}), 400
+    else:
+        if not reader.fieldnames or not required_cols_teacher.issubset(reader.fieldnames):
+            return jsonify({"error": "CSV 格式错误，需要列: username, password, name"}), 400
+
+    result = {"created": 0, "skipped": 0, "errors": []}
+    for row_num, row in enumerate(reader, start=2):
+        username = (row.get("username") or "").strip()
+        password = (row.get("password") or "").strip()
+        name = (row.get("name") or "").strip()
+        role = (row.get("role") or "student").strip()
+
+        if not username or not password:
+            result["errors"].append(f"第 {row_num} 行: username 和 password 不能为空")
+            continue
+        if g.user["role"] == "teacher":
+            role = "student"
+        elif role not in ("student", "teacher"):
+            result["errors"].append(f"第 {row_num} 行: 无效的角色 '{role}'")
+            continue
+        elif role == "admin":
+            result["errors"].append(f"第 {row_num} 行: 无法创建管理员")
+            continue
+        existing = get_user_by_username(username)
+        if existing:
+            result["skipped"] += 1
+            continue
+        try:
+            create_user({
+                "username": username,
+                "password_hash": generate_password_hash(password),
+                "role": role,
+                "name": name,
+                "created_by": g.user["id"],
+            })
+            result["created"] += 1
+        except Exception as e:
+            result["errors"].append(f"第 {row_num} 行: {str(e)}")
+    return jsonify(result)
 
 
 @app.route("/api/users/<int:uid>", methods=["PUT"])
@@ -309,6 +399,8 @@ def api_update_user(uid):
         update_data["password_hash"] = generate_password_hash(data["password"].strip())
     if "is_active" in data:
         update_data["is_active"] = data["is_active"]
+    if "name" in data:
+        update_data["name"] = data["name"].strip()
     if update_data:
         update_user(uid, update_data)
     return jsonify({"message": "用户已更新"})
@@ -405,7 +497,112 @@ def api_delete_class(cid):
     return jsonify({"message": "班级已删除"})
 
 
+@app.route("/api/classes/template", methods=["GET"])
+@login_required
+@teacher_or_admin_required
+def api_classes_template():
+    import csv, io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["班级名称", "组名称", "用户名"])
+    writer.writerow(["示例班级", "示例组", "student_username"])
+    resp = make_response(output.getvalue().encode("gbk"))
+    resp.headers["Content-Type"] = "text/csv; charset=gbk"
+    resp.headers["Content-Disposition"] = "attachment; filename=class_import_template.csv"
+    return resp
+
+
+@app.route("/api/classes/import", methods=["POST"])
+@login_required
+@teacher_or_admin_required
+def api_classes_import():
+    import csv, io
+    if "file" not in request.files:
+        return jsonify({"error": "请上传 CSV 文件"}), 400
+    file = request.files["file"]
+    if not file.filename or not file.filename.endswith(".csv"):
+        return jsonify({"error": "仅支持 .csv 文件"}), 400
+    content = _decode_csv(file.read())
+    reader = csv.DictReader(io.StringIO(content))
+    required_cols = {"班级名称", "组名称", "用户名"}
+    if not reader.fieldnames or not required_cols.issubset(reader.fieldnames):
+        return jsonify({"error": "CSV 格式错误，需要列: 班级名称, 组名称, 用户名"}), 400
+
+    result = {"created": 0, "skipped": 0, "errors": []}
+    for row_num, row in enumerate(reader, start=2):
+        class_name = (row.get("班级名称") or "").strip()
+        group_name = (row.get("组名称") or "").strip()
+        username = (row.get("用户名") or "").strip()
+        if not class_name or not group_name or not username:
+            result["errors"].append(f"第 {row_num} 行: 班级名称、组名称、用户名不能为空")
+            continue
+        created_by_filter = g.user["id"] if g.user["role"] == "teacher" else None
+        class_obj = get_class_by_name(class_name, created_by=created_by_filter)
+        if not class_obj:
+            result["errors"].append(f"第 {row_num} 行: 班级 '{class_name}' 不存在")
+            continue
+        user_obj = get_user_by_username(username)
+        if not user_obj:
+            result["errors"].append(f"第 {row_num} 行: 用户 '{username}' 不存在")
+            continue
+        try:
+            group_id = get_or_create_group(class_obj["id"], group_name, g.user["id"])
+            add_group_member(group_id, user_obj["id"])
+            result["created"] += 1
+        except ValueError as e:
+            result["skipped"] += 1
+        except Exception as e:
+            result["errors"].append(f"第 {row_num} 行: {str(e)}")
+    return jsonify(result)
+
+
 # ── Group API ──
+
+@app.route("/api/classes/groups", methods=["GET"])
+@login_required
+def api_list_groups_batch():
+    class_ids_str = request.args.get("class_ids", "")
+    if not class_ids_str:
+        return jsonify({})
+    try:
+        class_ids = [int(x) for x in class_ids_str.split(",")]
+    except ValueError:
+        return jsonify({"error": "无效的 class_ids 参数"}), 400
+
+    if g.user["role"] == "student":
+        groups = get_user_groups(g.user["id"])
+        result = {}
+        for grp in groups:
+            cid = str(grp["class_id"])
+            result.setdefault(cid, []).append({
+                "id": grp["group_id"],
+                "name": grp["group_name"],
+                "class_id": grp["class_id"],
+            })
+        return jsonify(result)
+
+    if g.user["role"] == "teacher":
+        teacher_classes = list_classes(created_by=g.user["id"])
+        allowed_ids = [c["id"] for c in teacher_classes]
+        class_ids = [cid for cid in class_ids if cid in allowed_ids]
+
+    if not class_ids:
+        return jsonify({})
+
+    groups_by_class = list_groups_batch(class_ids)
+    all_group_ids = [g["id"] for groups in groups_by_class.values() for g in groups]
+    members_by_group = list_group_members_batch(all_group_ids) if all_group_ids else {}
+
+    result = {}
+    for cid, groups in groups_by_class.items():
+        enriched = []
+        for grp in groups:
+            grp["members"] = members_by_group.get(grp["id"], [])
+            grp["member_count"] = len(grp["members"])
+            enriched.append(grp)
+        result[str(cid)] = enriched
+    return jsonify(result)
+
 
 @app.route("/api/classes/<int:cid>/groups", methods=["GET"])
 @login_required
@@ -527,9 +724,11 @@ def get_pve_client(server_id=None):
 
 
 def _check_vm_access(node, vmid):
+    cluster = find_cluster_by_vm(node, vmid)
+    if cluster:
+        g._vm_cluster = cluster
     if g.user["role"] == "admin":
         return True
-    cluster = find_cluster_by_vm(node, vmid)
     if not cluster:
         return False
     if g.user["role"] == "teacher":
@@ -555,6 +754,8 @@ def api_error_handler(f):
 @app.route("/")
 @login_required
 def index():
+    if g.user["role"] == "student":
+        return redirect("/k8s")
     return render_template("index.html")
 
 
@@ -575,11 +776,7 @@ def classes():
 @app.route("/k8s")
 @login_required
 def k8s():
-    clusters = list_clusters()
-    clusters = _filter_clusters(clusters)
-    ow_cfg = get_config("openwrt") or {}
-    openwrt_host = ow_cfg.get("host", "")
-    return render_template("k8s.html", clusters=clusters, openwrt_host=openwrt_host)
+    return render_template("k8s.html")
 
 
 @app.route("/pve")
@@ -756,7 +953,7 @@ def pve_get_vms():
 def pve_get_vm_status(node, vmid):
     if not _check_vm_access(node, vmid):
         return jsonify({"error": "无权访问该虚拟机"}), 403
-    client = get_pve_client()
+    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
     return jsonify(client.get_vm_status(node, vmid))
 
 
@@ -766,7 +963,7 @@ def pve_get_vm_status(node, vmid):
 def pve_get_vm_config(node, vmid):
     if not _check_vm_access(node, vmid):
         return jsonify({"error": "无权访问该虚拟机"}), 403
-    client = get_pve_client()
+    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
     return jsonify(client.get_vm_config(node, vmid))
 
 
@@ -830,7 +1027,7 @@ def pve_create_vm():
 def pve_start_vm(node, vmid):
     if not _check_vm_access(node, vmid):
         return jsonify({"error": "无权访问该虚拟机"}), 403
-    client = get_pve_client()
+    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
     result = client.start_vm(node, vmid)
     return jsonify(result)
 
@@ -843,7 +1040,7 @@ def pve_stop_vm(node, vmid):
         return jsonify({"error": "无权访问该虚拟机"}), 403
     data = request.get_json() or {}
     force = data.get("force", False)
-    client = get_pve_client()
+    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
     result = client.stop_vm(node, vmid, force)
     return jsonify(result)
 
@@ -856,7 +1053,7 @@ def pve_release_vm(node, vmid):
         return jsonify({"error": "无权访问该虚拟机"}), 403
     data = request.get_json() or {}
     purge = data.get("purge", True)
-    client = get_pve_client()
+    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
     result = client.release_vm(node, vmid, purge)
     return jsonify(result)
 
@@ -1416,20 +1613,16 @@ def k8s_batch_create_clusters():
     password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
 
-    task_ids = []
-    for gid in group_ids:
-        tid = create_cluster_async(
-            master_count, node_count,
-            master_cores, master_memory,
-            node_cores, node_memory,
-            pve_node, template_vmid,
-            password=password,
-            pve_server_id=pve_server_id,
-            group_id=gid,
-            created_by=g.user["id"],
-        )
-        task_ids.append(tid)
-    return jsonify({"task_ids": task_ids, "message": f"已启动 {len(task_ids)} 个集群创建任务"}), 202
+    task_id = batch_create_clusters_async(
+        group_ids, master_count, node_count,
+        master_cores, master_memory,
+        node_cores, node_memory,
+        pve_node, template_vmid,
+        password=password,
+        pve_server_id=pve_server_id,
+        created_by=g.user["id"],
+    )
+    return jsonify({"task_id": task_id}), 202
 
 
 @app.route("/api/k8s/tasks/<task_id>", methods=["GET"])
@@ -1472,42 +1665,37 @@ def k8s_deploy_cluster(name):
     return jsonify({"task_id": task_id}), 202
 
 
-@app.route("/api/k8s/clusters/<name>/upload-ssh-key", methods=["POST"])
+@app.route("/api/k8s/clusters/<name>/vm-action-all", methods=["POST"])
 @login_required
 @k8s_api_error_handler
-def k8s_upload_ssh_key(name):
+def k8s_cluster_vm_action_all(name):
     if not _check_cluster_access(name):
         return jsonify({"error": "无权操作该集群"}), 403
     cluster = get_cluster(name)
     if not cluster:
-        return jsonify({"error": "Cluster not found"}), 404
-
-    priv_key = cluster.get("ssh_private_key", "")
-    if not priv_key:
-        return jsonify({"error": "No SSH private key found for this cluster"}), 400
-
-    client_vm = None
+        return jsonify({"error": "集群不存在"}), 404
+    if g.user["role"] == "student":
+        return jsonify({"error": "无权操作"}), 403
+    data = request.get_json() or {}
+    action = data.get("action", "")
+    if action not in ("start", "stop"):
+        return jsonify({"error": "无效操作"}), 400
+    client = get_pve_client(server_id=cluster.get("pve_server_id"))
+    results = []
     for vm_name, vm_info in cluster.get("vms", {}).items():
-        if vm_name.startswith("client-"):
-            client_vm = vm_info
-            break
-    if not client_vm:
-        return jsonify({"error": "No client VM found in this cluster"}), 400
+        try:
+            if action == "start":
+                client.start_vm(vm_info["node"], vm_info["vmid"])
+            else:
+                client.stop_vm(vm_info["node"], vm_info["vmid"])
+            results.append({"vm": vm_name, "status": "ok"})
+        except Exception as e:
+            results.append({"vm": vm_name, "status": "failed", "error": str(e)})
+    ok = sum(1 for r in results if r["status"] == "ok")
+    return jsonify({"results": results, "message": f"{ok}/{len(results)}"})
 
-    client = get_pve_client()
-    client.connect()
-    node = client_vm["node"]
-    vmid = client_vm["vmid"]
 
-    client.guest_exec(node, vmid,
-        ["sh", "-c", "mkdir -p /home/k8s/.ssh && chmod 700 /home/k8s/.ssh"])
-    client.guest_exec(node, vmid,
-        ["tee", "/home/k8s/.ssh/id_rsa"], input_data=priv_key)
-    client.guest_exec(node, vmid,
-        ["chmod", "600", "/home/k8s/.ssh/id_rsa"])
-    client.guest_exec(node, vmid,
-        ["chown", "-R", "k8s:k8s", "/home/k8s/.ssh"])
-    return jsonify({"message": "SSH private key uploaded to client VM"})
+@app.route("/api/k8s/clusters/<name>/upload-ssh-key", methods=["POST"])
 
 
 @app.route("/k8s/logs/<task_id>")

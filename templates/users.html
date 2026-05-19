@@ -2,10 +2,15 @@
 {% block page_heading %}用户管理{% endblock %}
 {% block content %}
 
-{% if g.user.role == 'admin' %}
-<div style="margin-bottom:12px">
+{% if g.user.role == 'admin' or g.user.role == 'teacher' %}
+<div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
   <button class="btn btn-primary" onclick="openModal(null)">+ 新增用户</button>
+  <button class="btn" onclick="downloadUserTemplate()">下载模板</button>
+  <button class="btn" onclick="document.getElementById('import-users-file').click()">导入用户</button>
+  <input type="file" id="import-users-file" accept=".csv" style="display:none" onchange="importUsers(this)">
 </div>
+{% endif %}
+{% if g.user.role == 'admin' %}
 <div style="margin-bottom:12px">
   <button class="btn btn-sm {% if role_filter == 'teacher' %}btn-active{% endif %}" onclick="switchRole('teacher')">教师</button>
   <button class="btn btn-sm {% if role_filter == 'student' %}btn-active{% endif %}" onclick="switchRole('student')">学生</button>
@@ -18,13 +23,13 @@
   <div class="modal-card">
     <h3 id="modal-title" style="margin-bottom:16px">新增用户</h3>
     <div class="form-group"><label>用户名 *</label><input id="f-username" class="form-control"></div>
+    <div class="form-group"><label>姓名</label><input id="f-name" class="form-control"></div>
     <div class="form-group"><label>密码 *</label><input id="f-password" class="form-control" type="password"></div>
     {% if g.user.role == 'admin' %}
     <div class="form-group"><label>角色</label>
       <select id="f-role" class="form-control">
         <option value="student">学生</option>
         <option value="teacher">教师</option>
-        <option value="admin">管理员</option>
       </select>
     </div>
     {% endif %}
@@ -36,31 +41,12 @@
   </div>
 </div>
 
-<style>
-.btn{display:inline-flex;align-items:center;padding:6px 16px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#333;font-size:13px;cursor:pointer;transition:all .2s}
-.btn:hover{border-color:#1890ff;color:#1890ff}
-.btn-primary{background:#1890ff;border-color:#1890ff;color:#fff}
-.btn-primary:hover{background:#40a9ff;border-color:#40a9ff;color:#fff}
-.btn-sm{padding:3px 10px;font-size:12px}
-.btn-active{background:#1890ff;border-color:#1890ff;color:#fff}
-.btn-danger{color:#ff4d4f;border-color:#ff4d4f}
-.btn-danger:hover{background:#ff4d4f;color:#fff}
-.form-group{margin-bottom:12px}
-.form-group label{display:block;font-size:13px;color:#333;margin-bottom:4px;font-weight:500}
-.form-control{width:100%;padding:6px 10px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;outline:none;transition:border-color .2s;box-sizing:border-box}
-.form-control:focus{border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.2)}
-table{width:100%;border-collapse:collapse}
-th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #f0f0f0;font-size:13px}
-th{color:#999;font-weight:500;font-size:12px;text-transform:uppercase}
-.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.45);z-index:1000;justify-content:center;align-items:flex-start;padding-top:12vh}
-.modal-overlay.show{display:flex}
-.modal-card{background:#fff;border-radius:8px;padding:28px 32px;width:420px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.2);max-height:80vh;overflow-y:auto}
-</style>
-
 <script>
 const API = '/api/users';
 let _editingId = null;
 let _roleFilter = '{{ role_filter if role_filter else "student" }}';
+const IS_TEACHER = '{{ g.user.role }}' === 'teacher';
+const CURRENT_USER_ID = {{ g.user.id }};
 
 function $(id) { return document.getElementById(id); }
 
@@ -85,14 +71,15 @@ async function loadUsers() {
   const el = $('user-list');
   el.innerHTML = '加载中...';
   try {
-    const users = await apiReq('GET', '?role=' + _roleFilter);
+    let users = await apiReq('GET', '?role=' + _roleFilter);
+    if (IS_TEACHER) users = users.filter(u => u.created_by === CURRENT_USER_ID);
     if (!users.length) { el.innerHTML = '<p style="color:#999;margin-top:12px">暂无用户</p>'; return; }
-    let html = '<table><tr><th>ID</th><th>用户名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr>';
+    let html = '<table><tr><th>用户名</th><th>姓名</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr>';
     users.forEach(u => {
       const roleLabel = {'admin':'管理员','teacher':'教师','student':'学生'}[u.role] || u.role;
       html += '<tr>' +
-        '<td>' + u.id + '</td>' +
         '<td><strong>' + esc(u.username) + '</strong></td>' +
+        '<td>' + esc(u.name || '') + '</td>' +
         '<td>' + roleLabel + '</td>' +
         '<td>' + (u.is_active ? '<span style="color:#52c41a">正常</span>' : '<span style="color:#ff4d4f">禁用</span>') + '</td>' +
         '<td style="color:#999;font-size:12px">' + (u.created_at || '').slice(0, 10) + '</td>' +
@@ -113,6 +100,7 @@ function openModal(user) {
   _editingId = user ? user.id : null;
   $('modal-title').textContent = user ? '编辑用户' : '新增用户';
   $('f-username').value = user ? user.username : '';
+  $('f-name').value = user ? (user.name || '') : '';
   $('f-password').value = '';
   if ($('f-role')) $('f-role').value = user ? user.role : 'student';
   $('form-error').style.display = 'none';
@@ -135,7 +123,7 @@ async function saveUser() {
   const password = $('f-password').value;
   if (!username) { err.textContent = '用户名不能为空'; err.style.display = 'block'; return; }
   if (!_editingId && !password) { err.textContent = '密码不能为空'; err.style.display = 'block'; return; }
-  const body = { username };
+  const body = { username, name: $('f-name').value.trim() };
   if (password) body.password = password;
   if ($('f-role') && !_editingId) body.role = $('f-role').value;
   $('btn-save').disabled = true;
@@ -163,6 +151,32 @@ async function deleteUser(id) {
   } catch (e) {
     alert('删除失败: ' + e.message);
   }
+}
+
+function downloadUserTemplate() {
+  window.location.href = '/api/users/template';
+}
+
+async function importUsers(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const formData = new FormData();
+  formData.append('file', file);
+  try {
+    const res = await fetch('/api/users/import', { method: 'POST', body: formData });
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || '导入失败');
+    let msg = '✅ 成功创建 ' + result.created + ' 个用户';
+    if (result.skipped) msg += '，跳过 ' + result.skipped + ' 个（已存在）';
+    if (result.errors.length) {
+      msg += '\n⚠️ ' + result.errors.length + ' 个错误：\n' + result.errors.slice(0, 5).join('\n');
+    }
+    alert(msg);
+    loadUsers();
+  } catch (e) {
+    alert('导入失败: ' + e.message);
+  }
+  input.value = '';
 }
 
 document.addEventListener('DOMContentLoaded', loadUsers);

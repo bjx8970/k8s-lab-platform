@@ -125,6 +125,7 @@ class User(Base):
     username = Column(String(64), unique=True, nullable=False, index=True)
     password_hash = Column(String(256), nullable=False)
     role = Column(String(16), nullable=False, default="student")
+    name = Column(String(128), default="")
     is_active = Column(Boolean, default=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=func.now())
@@ -288,6 +289,7 @@ def init_db():
             raise RuntimeError("数据库未配置")
     Base.metadata.create_all(engine)
     _ensure_db_indexes()
+    _migrate_user_name()
     migrate_pve_config()
 
 
@@ -360,10 +362,31 @@ def _ensure_db_indexes():
         conn.commit()
 
 
+def _migrate_user_name():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN name VARCHAR(128) DEFAULT ''"))
+            conn.commit()
+    except Exception:
+        pass
+
+
 def load_clusters():
     with session_scope() as session:
         clusters = session.query(Cluster).options(selectinload(Cluster.vms)).all()
-        return {c.name: _cluster_to_dict(c) for c in clusters}
+        class_ids = list(set(c.class_id for c in clusters if c.class_id))
+        class_map = {}
+        if class_ids:
+            for cls in session.query(SchoolClass).filter(SchoolClass.id.in_(class_ids)).all():
+                class_map[cls.id] = cls.name
+        result = {}
+        for c in clusters:
+            d = _cluster_to_dict(c)
+            d["class_name"] = class_map.get(c.class_id, "")
+            result[c.name] = d
+        return result
 
 
 def load_cluster(name):
@@ -504,6 +527,7 @@ def _user_to_dict(u):
     return {
         "id": u.id,
         "username": u.username,
+        "name": u.name,
         "role": u.role,
         "is_active": u.is_active,
         "password_hash": u.password_hash,
@@ -519,6 +543,7 @@ def create_user(data):
             username=data["username"],
             password_hash=data["password_hash"],
             role=data.get("role", "student"),
+            name=data.get("name", ""),
             created_by=data.get("created_by"),
         )
         session.add(u)
@@ -582,10 +607,10 @@ def update_user(user_id, data):
             u.username = data["username"]
         if "password_hash" in data:
             u.password_hash = data["password_hash"]
-        if "role" in data:
-            u.role = data["role"]
         if "is_active" in data:
             u.is_active = data["is_active"]
+        if "name" in data:
+            u.name = data["name"]
         session.commit()
         return u.id
     except Exception:
@@ -655,6 +680,17 @@ def get_class(class_id):
         }
     finally:
         session.close()
+
+
+def get_class_by_name(name, created_by=None):
+    with session_scope() as session:
+        q = session.query(SchoolClass).filter_by(name=name)
+        if created_by is not None:
+            q = q.filter_by(created_by=created_by)
+        c = q.first()
+        if not c:
+            return None
+        return {"id": c.id, "name": c.name, "created_by": c.created_by}
 
 
 def list_classes(created_by=None):
@@ -766,6 +802,17 @@ def create_group(data):
         session.close()
 
 
+def get_or_create_group(class_id, group_name, created_by):
+    with session_scope(commit=True) as session:
+        g = session.query(Group).filter_by(class_id=class_id, name=group_name).first()
+        if g:
+            return g.id
+        g = Group(name=group_name, class_id=class_id, created_by=created_by)
+        session.add(g)
+        session.flush()
+        return g.id
+
+
 def get_group(group_id):
     session = get_session()
     try:
@@ -799,6 +846,27 @@ def list_groups(class_id=None, created_by=None):
             "created_by": g.created_by,
             "created_at": g.created_at.isoformat() if g.created_at else None,
         } for g in groups]
+    finally:
+        session.close()
+
+
+def list_groups_batch(class_ids):
+    session = get_session()
+    try:
+        groups = session.query(Group).filter(
+            Group.class_id.in_(class_ids)
+        ).order_by(Group.created_at.desc()).all()
+        from collections import defaultdict
+        result = defaultdict(list)
+        for g in groups:
+            result[g.class_id].append({
+                "id": g.id,
+                "name": g.name,
+                "class_id": g.class_id,
+                "created_by": g.created_by,
+                "created_at": g.created_at.isoformat() if g.created_at else None,
+            })
+        return dict(result)
     finally:
         session.close()
 

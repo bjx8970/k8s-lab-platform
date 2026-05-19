@@ -162,7 +162,7 @@ class PVEClient:
             if status.get("status") != "running":
                 return {"message": f"VM {vmid} is not running"}
             action = "stop" if force else "shutdown"
-            self.api.nodes(node).qemu(vmid).status[action].post()
+            getattr(self.api.nodes(node).qemu(vmid).status, action).post()
             return {"message": f"VM {vmid} stopped"}
         except Exception as e:
             raise PVEError(f"Failed to stop VM {vmid}: {e}") from e

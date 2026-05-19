@@ -696,6 +696,8 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
         _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
         _concurrency_semaphore.acquire()
         try:
+            def _create_cb(p, m):
+                _update_task(task_id, progress=int(p * 0.5), message=m)
             name, cluster = create_cluster(
                 master_count, node_count,
                 master_cores, master_memory,
@@ -706,12 +708,17 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                 group_id=group_id,
                 class_id=class_id,
                 created_by=created_by,
-                status_callback=_cb,
+                status_callback=_create_cb,
                 log_callback=_log,
             )
+            _append_log(task_id, "虚拟机创建完成，自动开始部署 K8s...")
+            def _deploy_cb(p, m):
+                _update_task(task_id, progress=50 + int(p * 0.5), message=m)
+            deploy_k8s(name, status_callback=_deploy_cb, log_callback=_log)
+            cluster = load_cluster(name)
             safe = {k: v for k, v in cluster.items() if k != "ssh_private_key"}
             _update_task(task_id, status="completed", progress=100,
-                         message="集群创建完成", result={"name": name, "cluster": safe})
+                         message="集群创建并部署 K8s 完成", result={"name": name, "cluster": safe})
         except Exception as e:
             _update_task(task_id, status="error", progress=0,
                          message=str(e), error=str(e))
@@ -1167,5 +1174,102 @@ def deploy_k8s_async(name):
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     
+    _cleanup_old_tasks()
+    return task_id
+
+
+def batch_create_clusters(group_ids, master_count, node_count,
+                          master_cores, master_memory,
+                          node_cores, node_memory,
+                          pve_node, template_vmid,
+                          password="k8s.1234",
+                          pve_server_id=0,
+                          created_by=None,
+                          status_callback=None, log_callback=None):
+    def report(p, m):
+        if status_callback: status_callback(p, m)
+    def _log(msg):
+        if log_callback: log_callback(msg)
+
+    total = len(group_ids)
+    results = []
+    for idx, gid in enumerate(group_ids):
+        prefix = f"[{idx + 1}/{total}] "
+        _log(f"{prefix}开始为分组 ID={gid} 创建集群")
+        try:
+            name, cluster = create_cluster(
+                master_count, node_count,
+                master_cores, master_memory,
+                node_cores, node_memory,
+                pve_node, template_vmid,
+                password=password,
+                pve_server_id=pve_server_id,
+                group_id=gid,
+                created_by=created_by,
+                status_callback=lambda p, m, idx=idx, total=total: report(
+                    int((idx * 100 + p * 0.5) / total), m
+                ),
+                log_callback=lambda m, prefix=prefix: _log(prefix + m),
+            )
+            _log(f"{prefix}虚拟机创建完成，自动部署 K8s...")
+            deploy_k8s(
+                name,
+                status_callback=lambda p, m, idx=idx, total=total: report(
+                    int((idx * 100 + 50 + p * 0.5) / total), m
+                ),
+                log_callback=lambda m, prefix=prefix: _log(prefix + m),
+            )
+            results.append({"group_id": gid, "name": name, "status": "success"})
+            report(int((idx + 1) * 100 / total), f"分组 {idx + 1}/{total} 完成")
+        except Exception as e:
+            _log(f"{prefix}失败: {e}，跳过本组")
+            results.append({"group_id": gid, "status": "failed", "error": str(e)})
+            report(int((idx + 1) * 100 / total), f"分组 {idx + 1}/{total} 失败，继续下一组")
+
+    ok = sum(1 for r in results if r["status"] == "success")
+    report(100, f"批量创建完成，成功 {ok}/{total} 组")
+    return results
+
+
+def batch_create_clusters_async(group_ids, master_count, node_count,
+                                master_cores, master_memory,
+                                node_cores, node_memory,
+                                pve_node, template_vmid,
+                                password="k8s.1234",
+                                pve_server_id=0,
+                                created_by=None):
+    task_id = _new_task_id()
+    _update_task(task_id, status="running", progress=0, message="排队中...")
+
+    def _cb(p, m):
+        _update_task(task_id, progress=p, message=m)
+    def _log(m):
+        _append_log(task_id, m)
+
+    def _run():
+        _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
+        _concurrency_semaphore.acquire()
+        try:
+            results = batch_create_clusters(
+                group_ids, master_count, node_count,
+                master_cores, master_memory,
+                node_cores, node_memory,
+                pve_node, template_vmid,
+                password=password,
+                pve_server_id=pve_server_id,
+                created_by=created_by,
+                status_callback=_cb,
+                log_callback=_log,
+            )
+            _update_task(task_id, status="completed", progress=100,
+                         message="批量创建完成", result={"results": results})
+        except Exception as e:
+            _update_task(task_id, status="error", progress=0,
+                         message=str(e), error=str(e))
+        finally:
+            _concurrency_semaphore.release()
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
     _cleanup_old_tasks()
     return task_id
