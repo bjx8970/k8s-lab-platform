@@ -314,10 +314,10 @@ def api_users_template():
     output = io.StringIO()
     writer = csv.writer(output)
     if g.user["role"] == "admin":
-        writer.writerow(["username", "password", "name", "role"])
+        writer.writerow(["用户名", "密码", "姓名", "角色"])
         writer.writerow(["zhangsan", "123456", "张三", "student"])
     else:
-        writer.writerow(["username", "password", "name"])
+        writer.writerow(["用户名", "密码", "姓名"])
         writer.writerow(["lisi", "123456", "李四"])
     resp = make_response(output.getvalue().encode("gbk"))
     resp.headers["Content-Type"] = "text/csv; charset=gbk"
@@ -337,24 +337,24 @@ def api_users_import():
         return jsonify({"error": "仅支持 .csv 文件"}), 400
     content = _decode_csv(file.read())
     reader = csv.DictReader(io.StringIO(content))
-    required_cols_teacher = {"username", "password", "name"}
-    required_cols_admin = {"username", "password", "name", "role"}
+    required_cols_teacher = {"用户名", "密码", "姓名"}
+    required_cols_admin = {"用户名", "密码", "姓名", "角色"}
     if g.user["role"] == "admin":
         if not reader.fieldnames or not required_cols_admin.issubset(reader.fieldnames):
-            return jsonify({"error": "CSV 格式错误，需要列: username, password, name, role"}), 400
+            return jsonify({"error": "CSV 格式错误，需要列: 用户名, 密码, 姓名, 角色"}), 400
     else:
         if not reader.fieldnames or not required_cols_teacher.issubset(reader.fieldnames):
-            return jsonify({"error": "CSV 格式错误，需要列: username, password, name"}), 400
+            return jsonify({"error": "CSV 格式错误，需要列: 用户名, 密码, 姓名"}), 400
 
     result = {"created": 0, "skipped": 0, "errors": []}
     for row_num, row in enumerate(reader, start=2):
-        username = (row.get("username") or "").strip()
-        password = (row.get("password") or "").strip()
-        name = (row.get("name") or "").strip()
-        role = (row.get("role") or "student").strip()
+        username = (row.get("用户名") or "").strip()
+        password = (row.get("密码") or "").strip()
+        name = (row.get("姓名") or "").strip()
+        role = (row.get("角色") or "student").strip()
 
         if not username or not password:
-            result["errors"].append(f"第 {row_num} 行: username 和 password 不能为空")
+            result["errors"].append(f"第 {row_num} 行: 用户名和密码不能为空")
             continue
         if g.user["role"] == "teacher":
             role = "student"
