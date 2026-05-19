@@ -18,7 +18,7 @@ from modules.db import (
 )
 from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
-from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, cancel_task, K8sError, force_delete_cluster
+from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster
 from modules.pg_client import PGClient, PGError
 
 app = Flask(__name__)
@@ -1544,7 +1544,7 @@ def k8s_create_cluster():
 def k8s_delete_cluster(name):
     if not _check_cluster_access(name):
         return jsonify({"error": "无权操作该集群"}), 403
-    task_id = delete_cluster_async(name)
+    task_id = delete_cluster_async(name, created_by=g.user["id"])
     return jsonify({"task_id": task_id}), 202
 
 
@@ -1613,8 +1613,9 @@ def k8s_batch_create_clusters():
     pve_node = data.get("pve_node", "")
     password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
+    class_id = data.get("class_id")
 
-    task_id = batch_create_clusters_async(
+    task_ids = batch_create_clusters_async(
         group_ids, master_count, node_count,
         master_cores, master_memory,
         node_cores, node_memory,
@@ -1622,8 +1623,17 @@ def k8s_batch_create_clusters():
         password=password,
         pve_server_id=pve_server_id,
         created_by=g.user["id"],
+        class_id=class_id,
     )
-    return jsonify({"task_id": task_id}), 202
+    return jsonify({"task_ids": task_ids, "count": len(task_ids)}), 202
+
+
+@app.route("/api/k8s/tasks", methods=["GET"])
+@login_required
+@k8s_api_error_handler
+def k8s_list_tasks():
+    created_by = None if g.user["role"] == "admin" else g.user["id"]
+    return jsonify({"tasks": list_tasks(created_by=created_by)})
 
 
 @app.route("/api/k8s/tasks/<task_id>", methods=["GET"])
@@ -1672,7 +1682,7 @@ def k8s_deploy_cluster(name):
         return jsonify({"error": "集群不存在"}), 404
     if cluster.get("status") != "running":
         return jsonify({"error": "集群状态异常，无法部署 K8s"}), 400
-    task_id = deploy_k8s_async(name)
+    task_id = deploy_k8s_async(name, created_by=g.user["id"])
     return jsonify({"task_id": task_id}), 202
 
 

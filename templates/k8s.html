@@ -13,21 +13,7 @@
     <div id="cluster-list" style="font-size:14px">加载中...</div>
 </div>
 
-<div class="modal-overlay" id="modal-overlay">
-    <div class="modal-card">
-        <h3 id="modal-title" style="margin-bottom:16px">正在创建集群</h3>
-        <div class="progress-bar">
-            <div class="progress-fill" id="progress-fill" style="width:0%"></div>
-        </div>
-        <div id="step-indicator" style="margin-top:10px;font-size:13px;font-weight:500;color:#333">初始化...</div>
-        <div id="step-detail" style="margin-top:4px;font-size:12px;color:#999"></div>
-        <div id="modal-links" style="margin-top:12px;font-size:13px"></div>
-        <button id="btn-cancel-task" class="btn btn-danger" onclick="cancelCurrentTask()"
-                style="margin-top:12px;display:none">取消创建</button>
-        <button id="btn-force-delete" class="btn btn-danger" onclick="forceDeleteCluster()"
-                style="margin-top:12px;display:none">强制删除（仅清理数据库）</button>
-    </div>
-</div>
+<div id="toast-container" style="position:fixed;top:70px;right:20px;z-index:2000;display:flex;flex-direction:column;gap:8px"></div>
 
 <div class="modal-overlay" id="key-modal">
     <div class="modal-card" style="width:600px">
@@ -114,8 +100,18 @@ async function api(method, path, body) {
     return data;
 }
 
-let _pollTimer = null;
-let _currentTaskId = null;
+function showToast(msg, type) {
+    type = type || 'info';
+    var c = document.getElementById('toast-container');
+    var t = document.createElement('div');
+    t.style.cssText = 'padding:10px 16px;border-radius:6px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,.12);background:#fff;border-left:4px solid ' + (type === 'success' ? '#52c41a' : type === 'error' ? '#ff4d4f' : '#1890ff') + ';animation:fadeIn .3s;max-width:360px';
+    t.textContent = msg;
+    c.appendChild(t);
+    setTimeout(function() { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 300); }, 3000);
+}
+var styleToast = document.createElement('style');
+styleToast.textContent = '@keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}';
+document.head.appendChild(styleToast);
 
 async function loadClusters() {
     const el = $('cluster-list');
@@ -189,81 +185,10 @@ async function refreshVmStatuses(clusters) {
     await Promise.all(tasks);
 }
 
-function showModal(show) {
-    $('modal-overlay').className = 'modal-overlay' + (show ? ' show' : '');
-    if (show) $('btn-force-delete').style.display = 'none';
-}
-
-function updateProgress(pct, msg, cls) {
-    const fill = $('progress-fill');
-    const indicator = $('step-indicator');
-    const detail = $('step-detail');
-    fill.style.width = pct + '%';
-    fill.className = 'progress-fill' + (cls ? ' ' + cls : '');
-    if (msg) {
-        const parts = msg.split('，');
-        indicator.textContent = parts[0];
-        detail.textContent = parts.slice(1).join('，');
-    }
-}
-
-async function pollTask(taskId, opts) {
-    opts = opts || {};
-    const successMsg = opts.successMsg || '集群创建成功';
-    const errorPrefix = opts.errorPrefix || '创建失败';
-    try {
-        const data = await api('GET', '/tasks/' + taskId);
-        updateProgress(data.progress || 0, data.message || '');
-        if (data.status === 'completed') {
-            updateProgress(100, successMsg, 'success');
-            $('btn-cancel-task').style.display = 'none';
-            $('btn-force-delete').style.display = 'none';
-            setTimeout(() => { showModal(false); location.reload(); }, 500);
-            return;
-        }
-        if (data.status === 'cancelled') {
-            updateProgress(0, '任务已取消', 'error');
-            $('btn-cancel-task').disabled = true;
-            $('btn-cancel-task').textContent = '已取消';
-            $('btn-force-delete').style.display = 'none';
-            return;
-        }
-        if (data.status === 'error') {
-            updateProgress(0, errorPrefix + ': ' + (data.error || data.message || '未知错误'), 'error');
-            $('btn-cancel-task').style.display = 'none';
-            if (opts.isDelete && USER_ROLE === 'admin') {
-                $('btn-force-delete').style.display = '';
-            }
-            return;
-        }
-        _pollTimer = setTimeout(() => pollTask(taskId, opts), 3000);
-    } catch (e) {
-        updateProgress(0, '获取状态失败: ' + e.message, 'error');
-    }
-}
-
-async function cancelCurrentTask() {
-    if (!_currentTaskId) return;
-    if (!confirm('确定要取消当前任务吗？已创建的虚拟机将被清理。')) return;
-    const btn = $('btn-cancel-task');
-    btn.disabled = true;
-    btn.textContent = '正在取消...';
-    try {
-        await api('POST', '/tasks/' + _currentTaskId + '/cancel');
-    } catch (e) {
-        alert('取消失败: ' + e.message);
-        btn.disabled = false;
-        btn.textContent = '取消创建';
-    }
-}
-
 async function createCluster() {
     closeCreateForm();
     $('btn-create').disabled = true;
     $('create-result').innerHTML = '';
-    $('modal-title').textContent = '正在创建集群';
-    showModal(true);
-    updateProgress(0, '正在启动');
     try {
         const sel = $('form-server');
         const opt = sel.options[sel.selectedIndex];
@@ -287,15 +212,12 @@ async function createCluster() {
             {% endif %}
         };
         if (!body.pve_node) throw new Error('请选择 PVE 服务器');
-        const result = await api('POST', '/create', body);
-        _currentTaskId = result.task_id;
-        $('modal-links').innerHTML =
-            '<a href="/k8s/logs/' + result.task_id + '" target="_blank" ' +
-            'style="color:#1890ff;text-decoration:none">📋 查看详细日志</a>';
-        $('btn-cancel-task').style.display = '';
-        pollTask(result.task_id, { successMsg: '集群创建成功', errorPrefix: '创建失败' });
+        await api('POST', '/create', body);
+        showToast('✅ 创建任务已提交，可在右上角查看进度', 'success');
+        loadClusters();
     } catch (e) {
-        updateProgress(0, e.message, 'error');
+        showToast('❌ 创建失败: ' + e.message, 'error');
+    } finally {
         $('btn-create').disabled = false;
     }
 }
@@ -311,15 +233,13 @@ async function batchCreate() {
     }
     $('btn-batch').disabled = true;
     $('create-result').innerHTML = '';
-    $('modal-title').textContent = '批量创建集群';
-    showModal(true);
-    updateProgress(0, '正在启动批量任务');
     try {
         const sel = $('form-server');
         const opt = sel.options[sel.selectedIndex];
         const pve_node = (opt && opt.dataset && opt.dataset.node) || '';
         const result = await api('POST', '/batch-create', {
             group_ids: selected.filter(x => x),
+            class_id: parseInt($('form-class').value) || null,
             pve_server_id: parseInt($('form-server').value) || 0,
             pve_node: pve_node,
             master_count: parseInt($('form-master-count').value) || 1,
@@ -330,14 +250,11 @@ async function batchCreate() {
             node_memory: parseInt($('form-node-mem').value) || 4096,
             password: $('form-password').value.trim() || 'k8s.1234',
         });
-        _currentTaskId = result.task_id;
-        $('modal-links').innerHTML =
-            '<a href="/k8s/logs/' + result.task_id + '" target="_blank" ' +
-            'style="color:#1890ff;text-decoration:none">📋 查看详细日志</a>';
-        $('btn-cancel-task').style.display = '';
-        pollTask(result.task_id, { successMsg: '批量创建完成', errorPrefix: '批量创建失败' });
+        showToast('✅ 已提交 ' + (result.count || selected.length) + ' 个创建任务，可在右上角查看进度', 'success');
+        loadClusters();
     } catch (e) {
-        updateProgress(0, e.message, 'error');
+        showToast('❌ 批量创建失败: ' + e.message, 'error');
+    } finally {
         $('btn-batch').disabled = false;
     }
 }
@@ -371,33 +288,24 @@ async function clusterVmAction(name, action) {
 }
 
 async function deployK8s(name) {
-    $('create-result').innerHTML = '';
-    $('modal-title').textContent = '正在部署 K8s';
-    showModal(true);
-    updateProgress(0, '正在启动');
     try {
-        const result = await api('POST', '/clusters/' + encodeURIComponent(name) + '/deploy');
-        $('modal-links').innerHTML =
-            '<a href="/k8s/logs/' + result.task_id + '" target="_blank" ' +
-            'style="color:#1890ff;text-decoration:none">📋 查看详细日志</a>';
-        pollTask(result.task_id, { successMsg: 'K8s 部署完成', errorPrefix: '部署失败' });
+        await api('POST', '/clusters/' + encodeURIComponent(name) + '/deploy');
+        showToast('✅ 部署任务已提交，可在右上角查看进度', 'success');
+        loadClusters();
     } catch (e) {
-        updateProgress(0, e.message, 'error');
+        showToast('❌ 部署失败: ' + e.message, 'error');
     }
 }
 
 async function deleteCluster(name) {
     if (!confirm('确定删除集群 ' + name + ' ？\n这将释放所有虚拟机并清理 OpenWrt 配置。')) return;
     _forceDeleteName = name;
-    showModal(true);
-    $('modal-title').textContent = '正在删除集群';
-    updateProgress(0, '正在初始化');
-    $('modal-links').innerHTML = '';
     try {
-        const result = await api('DELETE', '/clusters/' + encodeURIComponent(name));
-        pollTask(result.task_id, { successMsg: '集群已删除', errorPrefix: '删除失败', isDelete: true, clusterName: name });
+        await api('DELETE', '/clusters/' + encodeURIComponent(name));
+        showToast('✅ 删除任务已提交，可在右上角查看进度', 'success');
+        loadClusters();
     } catch (e) {
-        updateProgress(0, '删除失败: ' + e.message, 'error');
+        showToast('❌ 删除失败: ' + e.message, 'error');
     }
 }
 

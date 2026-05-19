@@ -14,32 +14,152 @@
         <div class="label">K8s集群数</div>
         <div class="value" id="stat-clusters">-</div>
     </div>
+    {% if g.user.role == 'admin' %}
     <div class="stat-card">
         <div class="label">PVE连接数</div>
         <div class="value" id="stat-pve">-</div>
     </div>
+    {% endif %}
 </div>
 <div class="card">
     <p>欢迎使用 K8s Lab Platform 管理后台，{{ g.user.username }}（{{ {'admin':'管理员','teacher':'教师','student':'学生'}.get(g.user.role, g.user.role) }}）。</p>
 </div>
+
+{% if g.user.role == 'teacher' %}
+<div id="class-clusters-section" style="margin-top:24px"></div>
+{% endif %}
+
 <script>
+const USER_ROLE = '{{ g.user.role }}';
+
+function escStats(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 async function loadStats() {
     try {
-        const [users, classes, pve] = await Promise.all([
+        const promises = [
             fetch('/api/users').then(r => r.json()),
             fetch('/api/classes').then(r => r.json()),
-            fetch('/api/pve/servers').then(r => r.json()),
-        ]);
-        document.getElementById('stat-users').textContent = Array.isArray(users) ? users.length : '0';
-        document.getElementById('stat-classes').textContent = Array.isArray(classes) ? classes.length : '0';
-        document.getElementById('stat-pve').textContent = Array.isArray(pve) ? pve.length : '0';
+        ];
+        if (USER_ROLE !== 'teacher') {
+            promises.push(fetch('/api/pve/servers').then(r => r.json()));
+        }
+        const results = await Promise.all(promises);
+        document.getElementById('stat-users').textContent = Array.isArray(results[0]) ? results[0].length : '0';
+        document.getElementById('stat-classes').textContent = Array.isArray(results[1]) ? results[1].length : '0';
+        if (USER_ROLE !== 'teacher' && results[2]) {
+            document.getElementById('stat-pve').textContent = Array.isArray(results[2]) ? results[2].length : '0';
+        }
     } catch(e) {}
     try {
         const r = await fetch('/api/k8s/clusters');
-        const clusters = await r.json();
+        var clusters = await r.json();
         document.getElementById('stat-clusters').textContent = Object.keys(clusters).length;
+        if (USER_ROLE === 'teacher') renderClassCards(clusters);
     } catch(e) {}
 }
+
+var _badgeStyles = {
+    'pending': 'background:#fff7e6;border:1px solid #ffd591;color:#d46b08',
+    'installing': 'background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff',
+    'installed': 'background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a',
+    'failed': 'background:#fff2f0;border:1px solid #ffccc7;color:#ff4d4f',
+};
+var _labelMap = {'pending':'未部署','installing':'部署中','installed':'已部署','failed':'部署失败'};
+
+async function clusterVmAction(name, action) {
+    var msg = action === 'start' ? '启动' : '停止';
+    if (!confirm('确定' + msg + '集群 ' + name + ' 的所有虚拟机？')) return;
+    try {
+        var r = await fetch('/api/k8s/clusters/' + encodeURIComponent(name) + '/vm-action-all', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: action }),
+        });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '操作失败');
+        alert(msg + '完成');
+        var cl = await (await fetch('/api/k8s/clusters')).json();
+        renderClassCards(cl);
+    } catch (e) {
+        alert(msg + '失败: ' + e.message);
+    }
+}
+
+async function vmAction(node, vmid, action) {
+    try {
+        var r = await fetch('/api/pve/vms/' + encodeURIComponent(node) + '/' + vmid + '/' + action, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}',
+        });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '操作失败');
+        alert(action === 'start' ? '已启动' : '已停止');
+    } catch (e) {
+        alert('操作失败: ' + e.message);
+    }
+}
+
+function renderClassCards(clusters) {
+    var grouped = {};
+    var classOrder = [];
+    for (var name in clusters) {
+        var c = clusters[name];
+        if (c.group_id) continue;
+        var key = c.class_name || '__其他__';
+        if (!grouped[key]) { grouped[key] = []; classOrder.push(key); }
+        grouped[key].push({name: name, data: c});
+    }
+
+    var html = '';
+    for (var ci = 0; ci < classOrder.length; ci++) {
+        var clsName = classOrder[ci];
+        var items = grouped[clsName];
+        html += '<div class="card" style="margin-bottom:16px">' +
+            '<h3 style="margin-bottom:12px;font-size:16px">📚 ' + escStats(clsName) + ' (' + items.length + ' 个集群)</h3>';
+        for (var ii = 0; ii < items.length; ii++) {
+            var item = items[ii];
+            var c = item.data;
+            var name = item.name;
+            var label = c.group_name || '演示集群';
+            var k8s = c.k8s_status || 'pending';
+            var k8sLabel = _labelMap[k8s] || k8s;
+            var badgeStyle = _badgeStyles[k8s] || _badgeStyles['pending'];
+            var sshInfo = 'SSH: <code>' + escStats('{{ (get_config("openwrt") or {}).get("host", "") }}') + ':' + (c.ssh_port || '') + '</code> 用户: <code>k8s</code> 密码: <code>' + escStats(c.password || 'k8s.1234') + '</code>';
+            var vmsHtml = '';
+            if (c.vms) {
+                for (var vn in c.vms) {
+                    var v = c.vms[vn];
+                    vmsHtml += '<span style="background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff;border-radius:5px;font-size:12px;padding:3px 8px;display:inline-flex;align-items:center;gap:4px">' +
+                        escStats(vn) + ' (' + v.role + ')' +
+                        '<button onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'start\')" style="padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2">▶</button>' +
+                        '<button onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'stop\')" style="padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2">⏹</button>' +
+                        '</span>';
+                }
+            }
+            html += '<div style="border:1px solid #f0f0f0;border-radius:8px;padding:14px 16px;margin-bottom:8px">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">' +
+                    '<strong style="font-size:15px">' + escStats(label) + '</strong>' +
+                    '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+                        '<button onclick="clusterVmAction(\'' + name + '\',\'start\')" style="padding:3px 10px;border:1px solid #91d5ff;border-radius:4px;background:#fff;color:#1890ff;font-size:12px;cursor:pointer">▶ 启动全部</button>' +
+                        '<button onclick="clusterVmAction(\'' + name + '\',\'stop\')" style="padding:3px 10px;border:1px solid #ffccc7;border-radius:4px;background:#fff;color:#ff4d4f;font-size:12px;cursor:pointer">⏹ 停止全部</button>' +
+                        '<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500;' + badgeStyle + '">' + k8sLabel + '</span>' +
+                    '</div>' +
+                '</div>' +
+                '<div style="margin-top:8px;font-size:12px;color:#666">' + sshInfo + '</div>' +
+                (vmsHtml ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' + vmsHtml + '</div>' : '') +
+            '</div>';
+        }
+        html += '</div>';
+    }
+    if (html) {
+        document.getElementById('class-clusters-section').innerHTML = html;
+    }
+}
+
 document.addEventListener('DOMContentLoaded', loadStats);
 </script>
 {% endblock %}

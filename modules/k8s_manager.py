@@ -32,7 +32,8 @@ def _new_task_id():
     return uuid.uuid4().hex[:12]
 
 
-def _update_task(task_id, status="running", progress=0, message="", result=None, error=None):
+def _update_task(task_id, status="running", progress=0, message="", result=None, error=None,
+                 created_by=None, queue=None):
     with _task_lock:
         entry = _task_store.get(task_id)
         if entry is None:
@@ -45,6 +46,10 @@ def _update_task(task_id, status="running", progress=0, message="", result=None,
             entry["result"] = result
         if error is not None:
             entry["error"] = error
+        if created_by is not None:
+            entry["created_by"] = created_by
+        if queue is not None:
+            entry["queue"] = queue
         entry["updated_at"] = _time.time()
         entry.setdefault("logs", []).append({
             "time": _time.strftime("%H:%M:%S"),
@@ -92,6 +97,25 @@ def cancel_task(task_id):
             entry["status"] = "cancelling"
             entry["message"] = "正在取消..."
         return True
+
+
+def list_tasks(created_by=None):
+    with _task_lock:
+        now = _time.time()
+        result = []
+        for tid, entry in list(_task_store.items()):
+            if created_by and entry.get("created_by") != created_by:
+                continue
+            result.append({
+                "task_id": tid,
+                "status": entry.get("status"),
+                "progress": entry.get("progress", 0),
+                "message": entry.get("message", ""),
+                "queue": entry.get("queue"),
+                "updated_at": entry.get("updated_at", 0),
+            })
+        result.sort(key=lambda t: t["updated_at"], reverse=True)
+        return result
 
 
 def _openwrt_lock():
@@ -300,9 +324,10 @@ def delete_cluster(name, status_callback=None, log_callback=None):
     report(100, f"集群 {name} 已删除")
 
 
-def delete_cluster_async(name):
+def delete_cluster_async(name, created_by=None):
     task_id = _new_task_id()
-    _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
+    _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
+                 created_by=created_by, queue="delete")
 
     def _cb(p, m):
         _update_task(task_id, progress=p, message=m)
@@ -728,7 +753,8 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                          password="k8s.1234", pve_server_id=0,
                          group_id=None, class_id=None, created_by=None):
     task_id = _new_task_id()
-    _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
+    _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
+                 created_by=created_by, queue="create")
 
     def _cb(progress, message):
         _update_task(task_id, progress=progress, message=message)
@@ -764,6 +790,7 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
             deploy_log = lambda m: _append_log(task_id, m)
 
             def _run_deploy():
+                _update_task(task_id, queue="deploy")
                 try:
                     deploy_k8s(name, status_callback=_deploy_cb, log_callback=deploy_log)
                     cluster = load_cluster(name)
@@ -1232,9 +1259,10 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     report(100, "K8s 部署完成")
 
 
-def deploy_k8s_async(name):
+def deploy_k8s_async(name, created_by=None):
     task_id = _new_task_id()
-    _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
+    _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
+                 created_by=created_by, queue="deploy")
 
     def _cb(progress, message):
         _update_task(task_id, progress=progress, message=message)
@@ -1321,44 +1349,20 @@ def batch_create_clusters_async(group_ids, master_count, node_count,
                                 pve_node,
                                 password="k8s.1234",
                                 pve_server_id=0,
-                                created_by=None):
-    task_id = _new_task_id()
-    _update_task(task_id, status="running", progress=0, message="排队中，等待资源...")
-
-    def _cb(p, m):
-        _update_task(task_id, progress=p, message=m)
-    def _log(m):
-        _append_log(task_id, m)
-
-    def _run():
-        _update_task(task_id, status="running", progress=0, message="正在初始化...")
-        ev = threading.Event()
-        _task_cancel_events[task_id] = ev
-        try:
-            results = batch_create_clusters(
-                group_ids, master_count, node_count,
-                master_cores, master_memory,
-                node_cores, node_memory,
-                pve_node,
-                password=password,
-                pve_server_id=pve_server_id,
-                created_by=created_by,
-                status_callback=_cb,
-                log_callback=_log,
-                cancel_event=ev,
-            )
-            _update_task(task_id, status="completed", progress=100,
-                         message="批量创建完成", result={"results": results})
-        except Exception as e:
-            if ev.is_set():
-                _update_task(task_id, status="cancelled", progress=0,
-                             message="任务已取消")
-            else:
-                _update_task(task_id, status="error", progress=0,
-                             message=str(e), error=str(e))
-        finally:
-            _task_cancel_events.pop(task_id, None)
-
-    scheduler.enqueue("create", Task("create", task_id, _run))
-    _cleanup_old_tasks()
-    return task_id
+                                created_by=None,
+                                class_id=None):
+    task_ids = []
+    for gid in group_ids:
+        tid = create_cluster_async(
+            master_count, node_count,
+            master_cores, master_memory,
+            node_cores, node_memory,
+            pve_node,
+            password=password,
+            pve_server_id=pve_server_id,
+            group_id=gid,
+            class_id=class_id,
+            created_by=created_by,
+        )
+        task_ids.append(tid)
+    return task_ids
