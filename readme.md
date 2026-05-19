@@ -1,6 +1,6 @@
 # K8s Lab Platform
 
-基于 Flask 的 Web 管理平台，自动化完成 PVE 虚拟机克隆 → OpenWrt 网络配置 → K8s 集群部署的全流程。
+基于 Flask 的 Web 管理平台，自动化完成 PVE 虚拟机克隆 → OpenWrt 网络配置 → K8s 集群部署的全流程。支持多用户 RBAC 权限管理（管理员/教师/学生）。
 
 ## 架构
 
@@ -14,6 +14,8 @@
 
 ## 功能
 
+- **用户与权限管理** — 管理员/教师/学生三级 RBAC，支持 CSV 批量导入用户
+- **课程与组管理** — 教师创建课程与组，学生分配到组，可按组批量创建集群
 - **PVE 连接管理** — 支持多 PVE 服务器，配置 API Token，查看节点/虚拟机/模板
 - **OpenWrt 管理** — 通过 SSH + UCI 管理 VLAN、接口、DHCP、dnsmasq、防火墙
 - **K8s 集群创建** — 一键完成：
@@ -60,15 +62,17 @@ pip install -r requirements.txt
 
 ## 配置
 
-启动后通过 Web 页面配置：
+首次启动会自动跳转数据库配置页面。完整配置流程如下：
 
-1. **PVE 配置** (`/pve`) — 添加一个或多个 PVE 服务器
+1. **数据库配置** (`/db-config`) — 首次启动时配置 PostgreSQL 连接（或使用默认 SQLite）
+2. **初始化管理员** (`/setup`) — 创建默认管理员账号
+3. **PVE 配置** (`/pve`) — 添加一个或多个 PVE 服务器
    - 名称、Host、User、Token Name、Token Value、Verify SSL、Port
-2. **OpenWrt 配置** (`/openwrt`) — 填写路由器 SSH 信息
+4. **OpenWrt 配置** (`/openwrt`) — 填写路由器 SSH 信息
    - Host、Username、Password、Port
-3. **数据库配置** (`/db`) — 切换 SQLite / PostgreSQL 模式
+5. **数据库管理** (`/db`) — 管理员可切换 SQLite / PostgreSQL 模式
 
-PVE 和 OpenWrt 配置保存在数据库的 `config` 表（单值）或 `pve_servers` 表（多服务器）。
+PVE 和 OpenWrt 配置保存在数据库的 `config` 表或 `pve_servers` 表。
 
 ## 启动
 
@@ -85,16 +89,46 @@ waitress-serve --host 0.0.0.0 --port 5000 app:app
 
 访问 http://localhost:5000
 
-## 创建集群
+## 使用流程
 
-1. 进入 **K8s 集群管理** (`/k8s`)
-2. 填写参数：
-   - PVE 服务器、PVE 节点、模板 VMID
-   - 主节点/子节点数量、CPU、内存
-   - client 密码（默认 `k8s.1234`）
-3. 点击"创建集群"，观察进度条
-4. 点击"查看详细日志"在新标签页打开实时日志
-5. 创建完成后可选择 **部署 K8s**，自动通过 kubeasz 安装 Kubernetes
+### 1. 用户管理 (`/users`)
+
+- 管理员可创建/编辑/删除管理员、教师、学生账号
+- 教师可创建/管理学生账号
+- 支持 CSV 模板下载和批量导入用户
+
+### 2. 课程与组管理 (`/classes`)
+
+- 教师创建课程和组，将学生分配到组
+- 支持 CSV 模板下载和批量导入课程、组、成员
+
+### 3. 创建集群 (`/k8s`)
+
+#### 单组创建
+- 选择 PVE 服务器、PVE 节点、模板 VMID
+- 设置主节点/子节点数量、CPU、内存
+- 选择目标组
+- 点击"创建集群"，观察进度条
+- 创建完成后可选择 **部署 K8s**
+
+#### 批量创建
+- 选择多个组，为每个组创建一个独立集群
+- 参数统一设置（节点数、规格、模板等）
+
+### 4. 集群管理
+
+- **查看详情** — 查看集群各 VM 状态、SSH 密钥
+- **启动/停止** — 一键启停集群所有虚拟机
+- **部署 K8s** — 自动通过 kubeasz 安装 Kubernetes
+- **删除集群** — 释放所有虚拟机并清理 OpenWrt 配置
+
+### 5. 角色说明
+
+| 角色 | 权限 |
+|---|---|
+| admin | 所有功能，包括 PVE/OpenWrt/数据库配置、用户管理 |
+| teacher | 创建课程、组、学生账号，管理自己创建的集群 |
+| student | 查看自己被分配的集群，启动/停止虚拟机 |
 
 ## 集群命名与网络规划
 
@@ -107,7 +141,7 @@ waitress-serve --host 0.0.0.0 --port 5000 app:app
 | 子网 | `10.100.N.0/24` |
 | 网关 | `10.100.N.1` |
 | dnsmasq | `k8s<N>` |
-| 虚拟机 | `client-k8s<N>`, `master1-k8s<N>`, `node1-k8s<N>` |
+| 虚拟机 | `client-k8s<N>`, `master{i}-k8s<N>`, `node{i}-k8s<N>` |
 | VMID | PVE API 自动分配 |
 | MAC | `52:54:00` 前缀 + 随机后缀 |
 | SSH 端口转发 | WAN:`50000+N` → client:22 |
@@ -132,8 +166,12 @@ waitress-serve --host 0.0.0.0 --port 5000 app:app
 │   ├── pve.html                # PVE 多服务器配置页面
 │   ├── openwrt.html            # OpenWrt 配置页面
 │   ├── db_config.html          # 数据库切换页面
-│   ├── users.html              # 用户页面
-│   └── classes.html            # 班级页面
+│   ├── db_setup.html           # 首次启动数据库配置向导
+│   ├── setup.html              # 初始管理员设置
+│   ├── users.html              # 用户管理页面
+│   ├── classes.html            # 课程与组管理页面
+│   ├── login.html              # 登录页面
+│   └── 403.html                # 权限不足页面
 ├── k8s_lab.db                  # SQLite 数据文件（运行后生成，.gitignore）
 └── requirements.txt            # Python 依赖
 ```
@@ -143,6 +181,8 @@ waitress-serve --host 0.0.0.0 --port 5000 app:app
 | 数据 | 存储位置 |
 |---|---|
 | 集群数据 | `clusters` + `vms` 表 |
+| 用户数据 | `users` 表 |
+| 课程/组数据 | `classes` + `groups` + `group_members` 表 |
 | PVE 配置 | `pve_servers` 表（多服务器）或 `config` 表（旧版单服务器） |
 | OpenWrt 配置 | `config` 表 |
 | 数据库模式 | `.db_config.json` 指定 `sqlite` 或 `postgresql` |

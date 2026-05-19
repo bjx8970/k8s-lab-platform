@@ -908,7 +908,7 @@ def add_group_member(group_id, user_id):
             user_id=user_id, class_id=group.class_id
         ).first()
         if existing:
-            raise ValueError("该学生已在本班级的其他组中")
+            raise ValueError("该学生已在本课程的其他组中")
         gm = GroupMember(group_id=group_id, user_id=user_id, class_id=group.class_id)
         session.add(gm)
         session.commit()
@@ -988,7 +988,7 @@ def get_user_groups(user_id):
                 "group_id": g.id,
                 "group_name": g.name,
                 "class_id": g.class_id,
-                "class_name": c.name if c else "未知班级",
+                "class_name": c.name if c else "未知课程",
             })
         return result
     finally:

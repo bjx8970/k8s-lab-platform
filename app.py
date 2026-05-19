@@ -189,7 +189,7 @@ def api_login():
     if user["role"] == "student":
         groups = get_user_groups(user["id"])
         if not groups:
-            return jsonify({"error": "您尚未被分配到班级组，请联系教师"}), 403
+            return jsonify({"error": "您尚未被分配到课程组，请联系教师"}), 403
     session["user_id"] = user["id"]
     return jsonify({"message": "登录成功", "user": {
         "id": user["id"], "username": user["username"], "role": user["role"],
@@ -440,13 +440,13 @@ def api_create_class():
     data = request.get_json() or {}
     name = data.get("name", "").strip()
     if not name:
-        return jsonify({"error": "班级名称不能为空"}), 400
+        return jsonify({"error": "课程名称不能为空"}), 400
     cid = create_class({
         "name": name,
         "description": data.get("description", ""),
         "created_by": g.user["id"],
     })
-    return jsonify({"id": cid, "message": "班级创建成功"}), 201
+    return jsonify({"id": cid, "message": "课程创建成功"}), 201
 
 
 @app.route("/api/classes/<int:cid>", methods=["GET"])
@@ -454,7 +454,7 @@ def api_create_class():
 def api_get_class(cid):
     cls = get_class(cid)
     if not cls:
-        return jsonify({"error": "班级不存在"}), 404
+        return jsonify({"error": "课程不存在"}), 404
     if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
         return jsonify({"error": "权限不足"}), 403
     if g.user["role"] == "student":
@@ -470,9 +470,9 @@ def api_get_class(cid):
 def api_update_class(cid):
     cls = get_class(cid)
     if not cls:
-        return jsonify({"error": "班级不存在"}), 404
+        return jsonify({"error": "课程不存在"}), 404
     if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
-        return jsonify({"error": "只能编辑自己创建的班级"}), 403
+        return jsonify({"error": "只能编辑自己创建的课程"}), 403
     data = request.get_json() or {}
     update_data = {}
     if "name" in data:
@@ -481,7 +481,7 @@ def api_update_class(cid):
         update_data["description"] = data["description"]
     if update_data:
         update_class(cid, update_data)
-    return jsonify({"message": "班级已更新"})
+    return jsonify({"message": "课程已更新"})
 
 
 @app.route("/api/classes/<int:cid>", methods=["DELETE"])
@@ -490,11 +490,11 @@ def api_update_class(cid):
 def api_delete_class(cid):
     cls = get_class(cid)
     if not cls:
-        return jsonify({"error": "班级不存在"}), 404
+        return jsonify({"error": "课程不存在"}), 404
     if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
-        return jsonify({"error": "只能删除自己创建的班级"}), 403
+        return jsonify({"error": "只能删除自己创建的课程"}), 403
     delete_class(cid)
-    return jsonify({"message": "班级已删除"})
+    return jsonify({"message": "课程已删除"})
 
 
 @app.route("/api/classes/template", methods=["GET"])
@@ -504,8 +504,8 @@ def api_classes_template():
     import csv, io
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["班级名称", "组名称", "用户名"])
-    writer.writerow(["示例班级", "示例组", "student_username"])
+    writer.writerow(["课程名称", "组名称", "用户名"])
+    writer.writerow(["示例课程", "示例组", "student_username"])
     resp = make_response(output.getvalue().encode("gbk"))
     resp.headers["Content-Type"] = "text/csv; charset=gbk"
     resp.headers["Content-Disposition"] = "attachment; filename=class_import_template.csv"
@@ -524,22 +524,22 @@ def api_classes_import():
         return jsonify({"error": "仅支持 .csv 文件"}), 400
     content = _decode_csv(file.read())
     reader = csv.DictReader(io.StringIO(content))
-    required_cols = {"班级名称", "组名称", "用户名"}
+    required_cols = {"课程名称", "组名称", "用户名"}
     if not reader.fieldnames or not required_cols.issubset(reader.fieldnames):
-        return jsonify({"error": "CSV 格式错误，需要列: 班级名称, 组名称, 用户名"}), 400
+        return jsonify({"error": "CSV 格式错误，需要列: 课程名称, 组名称, 用户名"}), 400
 
     result = {"created": 0, "skipped": 0, "errors": []}
     for row_num, row in enumerate(reader, start=2):
-        class_name = (row.get("班级名称") or "").strip()
+        class_name = (row.get("课程名称") or "").strip()
         group_name = (row.get("组名称") or "").strip()
         username = (row.get("用户名") or "").strip()
         if not class_name or not group_name or not username:
-            result["errors"].append(f"第 {row_num} 行: 班级名称、组名称、用户名不能为空")
+            result["errors"].append(f"第 {row_num} 行: 课程名称、组名称、用户名不能为空")
             continue
         created_by_filter = g.user["id"] if g.user["role"] == "teacher" else None
         class_obj = get_class_by_name(class_name, created_by=created_by_filter)
         if not class_obj:
-            result["errors"].append(f"第 {row_num} 行: 班级 '{class_name}' 不存在")
+            result["errors"].append(f"第 {row_num} 行: 课程 '{class_name}' 不存在")
             continue
         user_obj = get_user_by_username(username)
         if not user_obj:
@@ -609,7 +609,7 @@ def api_list_groups_batch():
 def api_list_groups(cid):
     cls = get_class(cid)
     if not cls:
-        return jsonify({"error": "班级不存在"}), 404
+        return jsonify({"error": "课程不存在"}), 404
     if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
         return jsonify({"error": "权限不足"}), 403
     if g.user["role"] == "student":
@@ -637,12 +637,12 @@ def api_create_group():
     name = data.get("name", "").strip()
     class_id = data.get("class_id")
     if not name or not class_id:
-        return jsonify({"error": "组名和班级ID不能为空"}), 400
+        return jsonify({"error": "组名和课程ID不能为空"}), 400
     cls = get_class(class_id)
     if not cls:
-        return jsonify({"error": "班级不存在"}), 404
+        return jsonify({"error": "课程不存在"}), 404
     if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
-        return jsonify({"error": "只能在自己创建的班级中创建组"}), 403
+        return jsonify({"error": "只能在自己创建的课程中创建组"}), 403
     gid = create_group({
         "name": name,
         "class_id": class_id,
