@@ -30,7 +30,7 @@
 {% endif %}
 
 <style>
-.vm-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#e6f7ff;border:1px solid #91d5ff;border-radius:5px;font-size:12px;color:#1890ff}
+.vm-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#f5f5f5;border:1px solid #d9d9d9;border-radius:5px;font-size:12px;color:#999}
 .vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
 .vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
 .vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
@@ -39,6 +39,7 @@
 
 <script>
 const USER_ROLE = '{{ g.user.role }}';
+var vmStatusCache = {};
 
 function escStats(s) {
     if (!s) return '';
@@ -143,7 +144,10 @@ function renderClassCards(clusters) {
             if (c.vms) {
                 for (var vn in c.vms) {
                     var v = c.vms[vn];
-                    vmsHtml += '<span class="vm-tag" id="vm-' + name + '-' + v.vmid + '">' +
+                    var _key = v.node + '_' + v.vmid;
+                    var _cached = vmStatusCache[_key];
+                    var _extra = _cached === 'running' ? ' vm-running' : (_cached === 'stopped' ? ' vm-stopped' : '');
+                    vmsHtml += '<span class="vm-tag' + _extra + '" id="vm-' + name + '-' + v.vmid + '">' +
                         escStats(vn) + ' (' + v.role + ')' +
                         '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'start\')">▶</button>' +
                         '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'stop\')">⏹</button>' +
@@ -197,6 +201,7 @@ async function refreshVmStatuses(clusters) {
         for (var key in (data.statuses || {})) {
             var st = data.statuses[key];
             var el = vmMap[key];
+            vmStatusCache[key] = st.status;
             if (el) el.className = 'vm-tag' + (st.status === 'running' ? ' vm-running' : ' vm-stopped');
         }
     } catch(e) {

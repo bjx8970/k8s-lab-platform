@@ -12,7 +12,7 @@
 .mycluster-item .mycluster-ssh .ssh-label{color:#666;display:inline-block;min-width:56px}
 .mycluster-item .mycluster-ssh code{background:#e8eaed;padding:2px 8px;border-radius:4px;font-family:SFMono-Regular,Consolas,monospace;font-size:13px;color:#d63384}
 .mycluster-item .mycluster-vms{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-.vm-tag{background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff;border-radius:5px;font-size:12px;padding:3px 8px;display:inline-flex;align-items:center;gap:4px}
+.vm-tag{background:#f5f5f5;border:1px solid #d9d9d9;color:#999;border-radius:5px;font-size:12px;padding:3px 8px;display:inline-flex;align-items:center;gap:4px}
 .vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
 .vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
 .vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
@@ -20,6 +20,8 @@
 </style>
 
 <script>
+var vmStatusCache = {};
+
 function esc(s) {
     if (!s) return '';
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -75,6 +77,7 @@ async function refreshVmStatuses(clusters) {
         for (var key in (data.statuses || {})) {
             var st = data.statuses[key];
             var el = vmMap[key];
+            vmStatusCache[key] = st.status;
             if (el) el.className = 'vm-tag' + (st.status === 'running' ? ' vm-running' : ' vm-stopped');
         }
     } catch(e) {
@@ -136,7 +139,10 @@ function renderCards(clusters) {
             if (c.vms) {
                 for (var vn in c.vms) {
                     var v = c.vms[vn];
-                    vmsHtml += '<span class="vm-tag" id="vm-' + esc(cname) + '-' + v.vmid + '">' +
+                    var _key = v.node + '_' + v.vmid;
+                    var _cached = vmStatusCache[_key];
+                    var _extra = _cached === 'running' ? ' vm-running' : (_cached === 'stopped' ? ' vm-stopped' : '');
+                    vmsHtml += '<span class="vm-tag' + _extra + '" id="vm-' + esc(cname) + '-' + v.vmid + '">' +
                         esc(vn) + ' (' + v.role + ')' +
                         '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'start\')">▶</button>' +
                         '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'stop\')">⏹</button>' +

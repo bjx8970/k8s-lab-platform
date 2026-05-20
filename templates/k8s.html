@@ -67,7 +67,7 @@
 .cluster-item:hover{box-shadow:var(--shadow-lg)}
 .cluster-header{display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap}
 .cluster-vms{display:flex;gap:6px;flex-wrap:wrap}
-.vm-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#e6f7ff;border:1px solid #91d5ff;border-radius:5px;font-size:12px;color:#1890ff}
+.vm-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#f5f5f5;border:1px solid #d9d9d9;border-radius:5px;font-size:12px;color:#999}
 .vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
 .vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
 .vm-btn{padding:1px 6px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
@@ -85,6 +85,7 @@ const USER_ROLE = '{{ g.user.role }}';
 const OPENWRT_HOST = '{{ (get_config("openwrt") or {}).get("host", "") }}';
 
 let _forceDeleteName = '';
+var vmStatusCache = {};
 
 function $(id) { return document.getElementById(id); }
 
@@ -139,7 +140,10 @@ async function loadClusters() {
             let vmsHtml = '';
             if (c.vms) {
                 for (const [vmName, vmInfo] of Object.entries(c.vms)) {
-                    vmsHtml += '<span class="vm-tag" id="vm-' + esc(name) + '-' + vmInfo.vmid + '">' +
+                    const _key = vmInfo.node + '_' + vmInfo.vmid;
+                    const _cached = vmStatusCache[_key];
+                    const _extra = _cached === 'running' ? ' vm-running' : (_cached === 'stopped' ? ' vm-stopped' : '');
+                    vmsHtml += '<span class="vm-tag' + _extra + '" id="vm-' + esc(name) + '-' + vmInfo.vmid + '">' +
                         esc(vmName) + ' (VMID ' + vmInfo.vmid + ')' +
                         (isAdminTeacher || isStudent
                             ? '<button class="vm-btn" onclick="vmAction(\'' + esc(vmInfo.node) + '\',' + vmInfo.vmid + ',\'start\')">▶</button>' +
@@ -194,6 +198,7 @@ async function refreshVmStatuses(clusters) {
         if (!res.ok) throw new Error(data.error || 'batch failed');
         for (const [key, st] of Object.entries(data.statuses || {})) {
             const el = vmMap[key];
+            vmStatusCache[key] = st.status;
             if (el) el.className = 'vm-tag' + (st.status === 'running' ? ' vm-running' : ' vm-stopped');
         }
     } catch {
