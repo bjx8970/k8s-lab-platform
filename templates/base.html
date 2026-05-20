@@ -377,10 +377,10 @@ function renderTaskRow(task, label, isDone) {
         type = type || 'info';
         var c = document.getElementById('global-toast-container');
         var t = document.createElement('div');
-        t.style.cssText = 'padding:10px 16px;border-radius:6px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,.12);background:#fff;border-left:4px solid ' + (type === 'success' ? '#52c41a' : type === 'error' ? '#ff4d4f' : '#1890ff') + ';animation:fadeIn .3s;max-width:360px';
+        t.style.cssText = 'padding:14px 20px;border-radius:8px;font-size:14px;box-shadow:0 6px 16px rgba(0,0,0,.15);animation:fadeIn .3s;max-width:420px;' + (type === 'success' ? 'background:#f6ffed;border-left:4px solid #52c41a;color:#389e0d' : type === 'error' ? 'background:#fff2f0;border-left:4px solid #ff4d4f;color:#cf1322' : 'background:#e6f7ff;border-left:4px solid #1890ff;color:#096dd9');
         t.textContent = msg;
         c.appendChild(t);
-        setTimeout(function() { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 300); }, 3000);
+        setTimeout(function() { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 300); }, 4000);
     }
 
     async function cancelTask(taskId) {
