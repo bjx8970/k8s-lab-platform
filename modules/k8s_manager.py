@@ -1018,7 +1018,28 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     # ── 加固 qemu-guest-agent (Restart=always + crontab 保活) ──
     report(28, "正在加固 qemu-guest-agent...")
-    _log("写入加固脚本 → /tmp/harden-agent.sh")
+    _log("client VM: 写入守护配置")
+    try:
+        _sh("""mkdir -p /etc/systemd/system/qemu-guest-agent.service.d
+cat > /etc/systemd/system/qemu-guest-agent.service.d/override.conf << 'ENDCFG'
+[Service]
+Restart=always
+RestartSec=10
+OOMScoreAdjust=-500
+ENDCFG
+systemctl daemon-reload
+(crontab -l 2>/dev/null | grep -v 'qemu-guest-agent'; echo '* * * * * systemctl is-active qemu-guest-agent || systemctl restart qemu-guest-agent') | crontab -""")
+        _log("client VM: 配置完成，重启 qemu-guest-agent...")
+        try:
+            _sh("systemctl restart qemu-guest-agent", timeout=10)
+        except Exception:
+            _log("client VM: qemu-guest-agent 重启超时（agent 已断开，配置已生效）")
+    except Exception as e:
+        _log(f"client VM: 加固失败 ({e})")
+        cluster["k8s_status"] = "failed"
+        save_cluster(name, cluster)
+        raise
+    _log("client VM: 写入远程加固脚本 → /tmp/harden-agent.sh")
     _sh("""cat > /tmp/harden-agent.sh << 'SCRIPT'
 set -e
 mkdir -p /etc/systemd/system/qemu-guest-agent.service.d
@@ -1032,8 +1053,6 @@ systemctl daemon-reload
 systemctl restart qemu-guest-agent
 (crontab -l 2>/dev/null | grep -v 'qemu-guest-agent'; echo '* * * * * systemctl is-active qemu-guest-agent || systemctl restart qemu-guest-agent') | crontab -
 SCRIPT""")
-    _log("client VM: 执行加固脚本")
-    _sh("bash /tmp/harden-agent.sh")
     for _vm_name, _vm_info in cluster.get("vms", {}).items():
         if _vm_info.get("role") == "client":
             continue
