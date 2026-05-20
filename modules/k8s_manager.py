@@ -732,7 +732,16 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             except Exception as e:
                 _log(f"VM {vm_name}: 启动跳过 ({e})")
 
-        report(94, "正在等待 client VM SSH 就绪...")
+        report(94, "正在重启虚拟机以刷新主机名...")
+        for vm_name, node, vmid in created_vms:
+            _log(f"VM {vm_name}: 发送重启命令")
+            try:
+                pve.reboot_vm(node, vmid)
+                _log(f"VM {vm_name}: 重启完成")
+            except Exception as e:
+                _log(f"VM {vm_name}: 重启跳过 ({e})")
+
+        report(96, "正在等待 client VM 就绪并配置 SSH...")
         client_vm = next((item for item in created_vms if item[0].startswith("client-")), None)
         if client_vm:
             _ow_cfg = get_config("openwrt")
@@ -745,7 +754,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             except Exception as e:
                 _log(f"Client VM {client_vm[0]}: SSH 未响应 ({e})")
 
-            report(95, "正在通过 SSH 配置 client 免密登录...")
+            report(98, "正在通过 SSH 配置 client 免密登录...")
             _log(f"Client VM {client_vm[0]}: SSH 上传私钥")
             try:
                 ssh = _SSHClient(_ssh_host, _ssh_port, "k8s", priv_key)
@@ -767,16 +776,8 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 _log(f"SSH: 公钥上传完成")
                 ssh.close()
             except Exception as e:
-                _log(f"Client VM {client_vm[0]}: SSH 配置异常 ({e})")
-
-        report(96, "正在重启虚拟机以刷新主机名...")
-        for vm_name, node, vmid in created_vms:
-            _log(f"VM {vm_name}: 发送重启命令")
-            try:
-                pve.reboot_vm(node, vmid)
-                _log(f"VM {vm_name}: 重启完成")
-            except Exception as e:
-                _log(f"VM {vm_name}: 重启跳过 ({e})")
+                _log(f"Client VM {client_vm[0]}: SSH 配置异常, 终止创建 ({e})")
+                raise K8sError(f"Client VM SSH 配置失败: {e}") from e
 
     except Exception as e:
         _log(f"错误: {e}")
@@ -954,13 +955,13 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
                 raise
 
     report(15, "正在复制 SSH 密钥到 /root/.ssh/...")
-    _existing_key = ssh.exec_with_output("cat /root/.ssh/id_rsa || true")
+    _existing_key = ssh.exec_with_output("sudo cat /root/.ssh/id_rsa 2>/dev/null || true")
     if _existing_key != _priv_key:
         _log("复制 SSH 私钥 → /root/.ssh/id_rsa")
         try:
-            ssh.exec("cp /home/k8s/.ssh/id_rsa /root/.ssh/id_rsa && "
-                     "chmod 600 /root/.ssh/id_rsa && "
-                     "chown root:root /root/.ssh/id_rsa")
+            ssh.exec("sudo cp /home/k8s/.ssh/id_rsa /root/.ssh/id_rsa && "
+                     "sudo chmod 600 /root/.ssh/id_rsa && "
+                     "sudo chown root:root /root/.ssh/id_rsa")
             _log("SSH 密钥复制完成")
         except K8sError as e:
             _log(f"SSH 密钥复制失败: {e}")
@@ -1050,7 +1051,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     if not ssh.dir_exists("/etc/kubeasz/roles"):
         _log("解压 kubeasz_offline.tgz → /etc")
         try:
-            ssh.exec("tar xzf /home/k8s/kubeasz_offline.tgz -C /etc", timeout=300)
+            ssh.exec("sudo tar xzf /home/k8s/kubeasz_offline.tgz -C /etc", timeout=300)
             _log("解压完成")
         except K8sError as e:
             _log(f"解压失败: {e}")
@@ -1077,7 +1078,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     # ── ezdown: create kubeasz container ──
     report(75, "正在创建 kubeasz 容器...")
-    _container_name = ssh.exec_with_output("docker ps -a --format '{{.Names}}' | grep -w kubeasz || true")
+    _container_name = ssh.exec_with_output("sudo docker ps -a --format '{{.Names}}' | grep -w kubeasz || true")
     if not _container_name:
         _log("执行: sudo /home/k8s/ezdown -S")
         try:
@@ -1097,7 +1098,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     if not ssh.dir_exists(cluster_dir):
         _log(f"执行: docker exec kubeasz ezctl new {name}")
         try:
-            ssh.exec(f"docker exec kubeasz ezctl new {name}", timeout=60)
+            ssh.exec(f"sudo docker exec kubeasz ezctl new {name}", timeout=60)
             _log("ezctl new 完成")
         except K8sError as e:
             _log(f"ezctl new 失败: {e}")
@@ -1134,7 +1135,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     # hosts: 读取已生成的文件，只替换三个占位符
     _log(f"读取已有 hosts 文件: {cluster_dir}/hosts")
-    _tmpl = ssh.exec_with_output(f"cat {cluster_dir}/hosts")
+    _tmpl = ssh.exec_with_output(f"sudo cat {cluster_dir}/hosts")
 
     _tmpl = _tmpl.replace("{{etcd_server}}", "\n".join(
         master_ips[m] for m in masters
@@ -1148,7 +1149,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     _log("写入 hosts 文件")
     try:
-        ssh.write_file(f"{cluster_dir}/hosts", _tmpl)
+        ssh.write_file(f"{cluster_dir}/hosts", _tmpl, sudo=True)
         _log("hosts 文件写入完成")
     except K8sError as e:
         _log(f"hosts 文件写入失败: {e}")
@@ -1158,7 +1159,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     # config.yml: INSTALL_SOURCE
     _log("修改 config.yml: INSTALL_SOURCE=offline")
-    ssh.exec(f"""sed -i 's/^INSTALL_SOURCE: "online"/INSTALL_SOURCE: "offline"/' {f_config}""")
+    ssh.exec(f"""sudo sed -i 's/^INSTALL_SOURCE: "online"/INSTALL_SOURCE: "offline"/' {f_config}""")
 
     # MASTER_CERT_HOSTS: 替换示例 IP 为第一个 master 的真实 IP (非致命)
     if masters:
@@ -1167,8 +1168,8 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
         _log(f"更新 MASTER_CERT_HOSTS: {_master0} → {_master0_ip}")
         _prefix = "'s/^  - \"10\\.1\\.1\\.1\"/  - \"'"
         _suffix = "'\"/'"
-        ssh.exec(f"sed -i {_prefix}{_master0_ip}{_suffix} {f_config} && "
-                 f"sed -i '/k8s\\.easzlab\\.io/s/^/#/' {f_config} || true")
+        ssh.exec(f"sudo sed -i {_prefix}{_master0_ip}{_suffix} {f_config} && "
+                 f"sudo sed -i '/k8s\\.easzlab\\.io/s/^/#/' {f_config} || true")
 
     # ── 实际安装 K8s ──
     report(92, "正在检查 K8s 集群安装状态...")
@@ -1209,8 +1210,8 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     if not ssh.file_exists("/usr/local/bin/kubectl"):
         _log("从 /etc/kubeasz/bin/kubectl 安装 kubectl")
         try:
-            ssh.exec("cp /etc/kubeasz/bin/kubectl /usr/local/bin/kubectl && "
-                     "chmod 755 /usr/local/bin/kubectl")
+            ssh.exec("sudo cp /etc/kubeasz/bin/kubectl /usr/local/bin/kubectl && "
+                     "sudo chmod 755 /usr/local/bin/kubectl")
             _log("kubectl 安装完成")
         except Exception as e:
             _log(f"kubectl 安装失败（可手动安装）: {e}")

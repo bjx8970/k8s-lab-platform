@@ -276,7 +276,7 @@ class OpenWrtClient:
         return _parse_uci_show(raw, section_type="redirect")
 
     def create_redirect(self, name, src_dport, dest_ip, dest_port,
-                        src="*", dest="lan", target="DNAT"):
+                        src="wan", dest="lan", target="DNAT"):
         self.exec("uci add firewall redirect")
         self._uci_set("firewall", "@redirect[-1]", "name", name)
         self._uci_set("firewall", "@redirect[-1]", "src", src)
