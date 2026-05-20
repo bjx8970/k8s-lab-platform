@@ -11,6 +11,8 @@ from modules.db import (
     get_config, get_db_config, get_db_status, get_group, get_pve_server,
     get_student_group_ids, get_students_created_by, get_user, get_user_by_username,
     get_user_cluster_ids, get_user_groups, init_db, is_db_configured, list_classes,
+    list_cluster_names_by_class_id, list_cluster_names_by_group_id,
+    detach_clusters_from_group, detach_clusters_from_class,
     list_group_members, list_group_members_batch, list_groups, list_groups_batch, list_pve_servers, list_users,
     get_or_create_group, migrate_config_from_json,
     migrate_from_json, reload_db_engine, remove_group_member, save_cluster,
@@ -18,7 +20,7 @@ from modules.db import (
 )
 from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
-from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, K8sError
+from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster
 from modules.pg_client import PGClient, PGError
 
 app = Flask(__name__)
@@ -493,8 +495,17 @@ def api_delete_class(cid):
         return jsonify({"error": "课程不存在"}), 404
     if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
         return jsonify({"error": "只能删除自己创建的课程"}), 403
+    cluster_names = list_cluster_names_by_class_id(cid)
+    detach_clusters_from_class(cid)
+    task_ids = []
+    for name in cluster_names:
+        tid = delete_cluster_async(name, created_by=g.user["id"])
+        task_ids.append(tid)
     delete_class(cid)
-    return jsonify({"message": "课程已删除"})
+    return jsonify({
+        "message": f"课程已删除，已提交 {len(cluster_names)} 个集群释放任务",
+        "task_ids": task_ids,
+    })
 
 
 @app.route("/api/classes/template", methods=["GET"])
@@ -660,8 +671,17 @@ def api_delete_group(gid):
         return jsonify({"error": "组不存在"}), 404
     if g.user["role"] == "teacher" and grp.get("created_by") != g.user["id"]:
         return jsonify({"error": "只能删除自己创建的组"}), 403
+    cluster_names = list_cluster_names_by_group_id(gid)
+    detach_clusters_from_group(gid)
+    task_ids = []
+    for name in cluster_names:
+        tid = delete_cluster_async(name, created_by=g.user["id"])
+        task_ids.append(tid)
     delete_group(gid)
-    return jsonify({"message": "组已删除"})
+    return jsonify({
+        "message": f"组已删除，已提交 {len(cluster_names)} 个集群释放任务",
+        "task_ids": task_ids,
+    })
 
 
 # ── Group Member API ──
@@ -755,7 +775,7 @@ def api_error_handler(f):
 @login_required
 def index():
     if g.user["role"] == "student":
-        return redirect("/k8s")
+        return render_template("student.html")
     return render_template("index.html")
 
 
@@ -1515,7 +1535,6 @@ def k8s_create_cluster():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    template_vmid = int(data.get("template_vmid", 9000))
     password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
 
@@ -1525,14 +1544,12 @@ def k8s_create_cluster():
         return jsonify({"error": "子节点数量至少为 1"}), 400
     if not pve_node:
         return jsonify({"error": "请选择 PVE 节点"}), 400
-    if not template_vmid:
-        return jsonify({"error": "请选择模板 VMID"}), 400
 
     name, cluster = create_cluster(
         master_count, node_count,
         master_cores, master_memory,
         node_cores, node_memory,
-        pve_node, template_vmid,
+        pve_node,
         password=password,
         pve_server_id=pve_server_id,
     )
@@ -1547,8 +1564,16 @@ def k8s_create_cluster():
 def k8s_delete_cluster(name):
     if not _check_cluster_access(name):
         return jsonify({"error": "无权操作该集群"}), 403
-    task_id = delete_cluster_async(name)
+    task_id = delete_cluster_async(name, created_by=g.user["id"])
     return jsonify({"task_id": task_id}), 202
+
+
+@app.route("/api/k8s/clusters/<name>/force", methods=["DELETE"])
+@login_required
+@admin_required
+def k8s_force_delete_cluster(name):
+    force_delete_cluster(name)
+    return jsonify({"message": "集群已强制删除"})
 
 
 @app.route("/api/k8s/create", methods=["POST"])
@@ -1564,7 +1589,6 @@ def k8s_create_cluster_async_route():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    template_vmid = int(data.get("template_vmid", 9000))
     password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
     group_id = data.get("group_id")
@@ -1576,14 +1600,12 @@ def k8s_create_cluster_async_route():
         return jsonify({"error": "子节点数量至少为 1"}), 400
     if not pve_node:
         return jsonify({"error": "请选择 PVE 节点"}), 400
-    if not template_vmid:
-        return jsonify({"error": "请选择模板 VMID"}), 400
 
     task_id = create_cluster_async(
         master_count, node_count,
         master_cores, master_memory,
         node_cores, node_memory,
-        pve_node, template_vmid,
+        pve_node,
         password=password,
         pve_server_id=pve_server_id,
         group_id=group_id,
@@ -1609,20 +1631,29 @@ def k8s_batch_create_clusters():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    template_vmid = int(data.get("template_vmid", 9000))
     password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
+    class_id = data.get("class_id")
 
-    task_id = batch_create_clusters_async(
+    task_ids = batch_create_clusters_async(
         group_ids, master_count, node_count,
         master_cores, master_memory,
         node_cores, node_memory,
-        pve_node, template_vmid,
+        pve_node,
         password=password,
         pve_server_id=pve_server_id,
         created_by=g.user["id"],
+        class_id=class_id,
     )
-    return jsonify({"task_id": task_id}), 202
+    return jsonify({"task_ids": task_ids, "count": len(task_ids)}), 202
+
+
+@app.route("/api/k8s/tasks", methods=["GET"])
+@login_required
+@k8s_api_error_handler
+def k8s_list_tasks():
+    created_by = None if g.user["role"] == "admin" else g.user["id"]
+    return jsonify({"tasks": list_tasks(created_by=created_by)})
 
 
 @app.route("/api/k8s/tasks/<task_id>", methods=["GET"])
@@ -1633,6 +1664,16 @@ def k8s_get_task(task_id):
     if not status:
         return jsonify({"error": "任务不存在"}), 404
     return jsonify(status)
+
+
+@app.route("/api/k8s/tasks/<task_id>/cancel", methods=["POST"])
+@login_required
+@k8s_api_error_handler
+def k8s_cancel_task(task_id):
+    ok = cancel_task(task_id)
+    if not ok:
+        return jsonify({"error": "任务不存在"}), 404
+    return jsonify({"message": "取消请求已发送"})
 
 
 @app.route("/api/k8s/clusters/<name>/ssh-key", methods=["GET"])
@@ -1661,7 +1702,7 @@ def k8s_deploy_cluster(name):
         return jsonify({"error": "集群不存在"}), 404
     if cluster.get("status") != "running":
         return jsonify({"error": "集群状态异常，无法部署 K8s"}), 400
-    task_id = deploy_k8s_async(name)
+    task_id = deploy_k8s_async(name, created_by=g.user["id"])
     return jsonify({"task_id": task_id}), 202
 
 
@@ -1691,6 +1732,49 @@ def k8s_cluster_vm_action_all(name):
             results.append({"vm": vm_name, "status": "ok"})
         except Exception as e:
             results.append({"vm": vm_name, "status": "failed", "error": str(e)})
+    ok = sum(1 for r in results if r["status"] == "ok")
+    return jsonify({"results": results, "message": f"{ok}/{len(results)}"})
+
+
+@app.route("/api/classes/<int:cid>/vm-action-all", methods=["POST"])
+@login_required
+def api_class_vm_action_all(cid):
+    cls = get_class(cid)
+    if not cls:
+        return jsonify({"error": "课程不存在"}), 404
+    if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
+        return jsonify({"error": "只能操作自己创建的课程"}), 403
+    if g.user["role"] == "student":
+        return jsonify({"error": "无权操作"}), 403
+    data = request.get_json() or {}
+    action = data.get("action", "")
+    if action not in ("start", "stop"):
+        return jsonify({"error": "无效操作"}), 400
+
+    cluster_names = list_cluster_names_by_class_id(cid)
+    if not cluster_names:
+        return jsonify({"error": "该课程下没有集群"}), 400
+
+    results = []
+    client_cache = {}
+    for name in cluster_names:
+        cluster = get_cluster(name)
+        if not cluster or not cluster.get("vms"):
+            continue
+        server_id = cluster.get("pve_server_id")
+        if server_id not in client_cache:
+            client_cache[server_id] = get_pve_client(server_id=server_id)
+        client = client_cache[server_id]
+        for vm_name, vm_info in cluster["vms"].items():
+            try:
+                if action == "start":
+                    client.start_vm(vm_info["node"], vm_info["vmid"])
+                else:
+                    client.stop_vm(vm_info["node"], vm_info["vmid"])
+                results.append({"cluster": name, "vm": vm_name, "status": "ok"})
+            except Exception as e:
+                results.append({"cluster": name, "vm": vm_name, "status": "failed", "error": str(e)})
+
     ok = sum(1 for r in results if r["status"] == "ok")
     return jsonify({"results": results, "message": f"{ok}/{len(results)}"})
 

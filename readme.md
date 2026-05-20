@@ -35,6 +35,22 @@
 
 1. **Proxmox VE** 7.x+
    - 已配置 API Token（无需 root 密码）
+   - API Token 用户需要以下最小权限（可在 Datacenter → Permissions 中为用户或 API Token 分配自定义角色）：
+
+     | Privilege | 用途 |
+     |---|---|
+     | `VM.Audit` | 查看虚拟机、模板列表与状态 |
+     | `VM.Clone` | 克隆模板创建新虚拟机 |
+     | `VM.Config.Network` | 配置虚拟机网络 (net0) |
+     | `VM.Config.Cloudinit` | 注入 cloud-init 配置 |
+     | `VM.Config.Options` | 修改虚拟机其他配置选项 |
+     | `VM.PowerMgmt` | 启动 / 停止 / 重启虚拟机 |
+     | `VM.Allocate` | 创建和删除虚拟机 |
+     | `VM.Monitor` | 通过 QEMU Guest Agent 执行命令 |
+     | `Sys.Audit` | 查看节点列表、集群信息 |
+     | `Datastore.AllocateSpace` | 分配磁盘空间（克隆时需要） |
+
+     也可以直接使用内置角色 `PVEAdmin`（包含全部权限）或 `PVEVMAdmin`（需额外补 `Datastore.AllocateSpace`）。
    - VM 模板需预装 `cloud-init` + `qemu-guest-agent`
    - 模板需有 `k8s` 用户（cloud-init 配置 `ciuser: k8s`）
    - 模板需预装必要系统包：`python3-venv`、`curl` 等

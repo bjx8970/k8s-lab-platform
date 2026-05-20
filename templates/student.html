@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block page_heading %}我的集群{% endblock %}
+{% block content %}
+
+<div id="student-clusters-section"></div>
+
+<style>
+.mycluster-item{border:1px solid #f0f0f0;border-radius:8px;padding:14px 16px;margin-bottom:8px}
+.mycluster-item .mycluster-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+.mycluster-item .mycluster-name{font-size:15px;font-weight:600}
+.mycluster-item .mycluster-ssh{background:#f6f8fa;border:1px solid #e8eaed;border-radius:6px;padding:10px 14px;margin-top:8px;font-size:13px;line-height:1.8}
+.mycluster-item .mycluster-ssh .ssh-label{color:#666;display:inline-block;min-width:56px}
+.mycluster-item .mycluster-ssh code{background:#e8eaed;padding:2px 8px;border-radius:4px;font-family:SFMono-Regular,Consolas,monospace;font-size:13px;color:#d63384}
+.mycluster-item .mycluster-vms{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.vm-tag{background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff;border-radius:5px;font-size:12px;padding:3px 8px;display:inline-flex;align-items:center;gap:4px}
+.vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
+.vm-btn:hover{background:#1890ff;color:#fff}
+</style>
+
+<script>
+function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+var _badgeStyles = {
+    'pending': 'background:#fff7e6;border:1px solid #ffd591;color:#d46b08',
+    'installing': 'background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff',
+    'installed': 'background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a',
+    'failed': 'background:#fff2f0;border:1px solid #ffccc7;color:#ff4d4f',
+};
+var _labelMap = {'pending':'未部署','installing':'部署中','installed':'已部署','failed':'部署失败'};
+
+async function vmAction(node, vmid, action) {
+    try {
+        var r = await fetch('/api/pve/vms/' + encodeURIComponent(node) + '/' + vmid + '/' + action, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}',
+        });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '操作失败');
+        alert(action === 'start' ? '已启动' : '已停止');
+    } catch (e) {
+        alert('操作失败: ' + e.message);
+    }
+}
+
+async function loadMyClusters() {
+    try {
+        var r = await fetch('/api/k8s/clusters');
+        var clusters = await r.json();
+        renderCards(clusters);
+    } catch (e) {
+        document.getElementById('student-clusters-section').innerHTML = '<div class="card"><p style="color:#ff4d4f">加载失败: ' + esc(e.message) + '</p></div>';
+    }
+}
+
+function renderCards(clusters) {
+    var keys = Object.keys(clusters);
+    if (keys.length === 0) {
+        document.getElementById('student-clusters-section').innerHTML = '<div class="card"><p style="text-align:center;color:#999;padding:40px 0">暂无集群</p></div>';
+        return;
+    }
+
+    var grouped = {};
+    var classOrder = [];
+    for (var ni = 0; ni < keys.length; ni++) {
+        var name = keys[ni];
+        var c = clusters[name];
+        var key = c.class_name || '其他课程';
+        if (!grouped[key]) { grouped[key] = []; classOrder.push(key); }
+        grouped[key].push({name: name, data: c});
+    }
+
+    var html = '';
+    for (var ci = 0; ci < classOrder.length; ci++) {
+        var clsName = classOrder[ci];
+        var items = grouped[clsName];
+        html += '<div class="card" style="margin-bottom:16px">' +
+            '<h3 style="margin-bottom:12px;font-size:16px">📚 ' + esc(clsName) + ' (' + items.length + ' 个集群)</h3>';
+
+        for (var ii = 0; ii < items.length; ii++) {
+            var c = items[ii].data;
+            var label = c.group_name || '集群';
+            var k8sStatus = c.k8s_status || 'pending';
+            var k8sLabel = _labelMap[k8sStatus] || k8sStatus;
+            var badgeStyle = _badgeStyles[k8sStatus] || _badgeStyles['pending'];
+            var host = esc('{{ (get_config("openwrt") or {}).get("host", "") }}') + ':' + (c.ssh_port || '');
+            var pw = esc(c.password || 'k8s.1234');
+            var sshInfo = '<div class="mycluster-ssh">' +
+                '<span class="ssh-label">地址</span> <code>' + host + '</code><br>' +
+                '<span class="ssh-label">用户</span> <code>k8s</code><br>' +
+                '<span class="ssh-label">密码</span> <code>' + pw + '</code>' +
+                '</div>';
+
+            var vmsHtml = '';
+            if (c.vms) {
+                for (var vn in c.vms) {
+                    var v = c.vms[vn];
+                    vmsHtml += '<span class="vm-tag">' +
+                        esc(vn) + ' (' + v.role + ')' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'start\')">▶</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'stop\')">⏹</button>' +
+                        '</span>';
+                }
+            }
+
+            html += '<div class="mycluster-item">' +
+                '<div class="mycluster-header">' +
+                    '<span class="mycluster-name">' + esc(label) + '</span>' +
+                    '<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500;' + badgeStyle + '">' + k8sLabel + '</span>' +
+                '</div>' +
+                sshInfo +
+                (vmsHtml ? '<div class="mycluster-vms">' + vmsHtml + '</div>' : '') +
+            '</div>';
+        }
+        html += '</div>';
+    }
+    document.getElementById('student-clusters-section').innerHTML = html;
+}
+
+document.addEventListener('DOMContentLoaded', loadMyClusters);
+</script>
+{% endblock %}

@@ -40,6 +40,10 @@
                 <label>节点名 *</label>
                 <input id="f-node" class="form-control" placeholder="pve1">
             </div>
+            <div class="form-group">
+                <label>模板 VMID</label>
+                <input id="f-template-vmid" class="form-control" type="number" value="9000">
+            </div>
         </div>
         <div id="form-error" style="color:#ff4d4f;font-size:13px;margin-top:8px;display:none"></div>
         <div style="margin-top:16px;display:flex;gap:8px">
@@ -181,6 +185,7 @@ function openAddModal() {
     $('f-token-name').value = '';
     $('f-token-value').value = '';
     $('f-node').value = '';
+    $('f-template-vmid').value = '9000';
     $('form-error').style.display = 'none';
     $('btn-save').textContent = '保存';
     show('modal-overlay');
@@ -199,6 +204,7 @@ async function openEditModal(id) {
     $('f-token-name').value = '';
     $('f-token-value').value = '';
     $('f-node').value = '';
+    $('f-template-vmid').value = '9000';
     try {
         const servers = await api('GET', '/servers');
         const s = servers.find(x => x.id === id);
@@ -210,6 +216,7 @@ async function openEditModal(id) {
         $('f-token-name').value = s.token_name;
         $('f-token-value').value = '****';
         $('f-node').value = s.node;
+        $('f-template-vmid').value = s.template_vmid || 9000;
     } catch (e) {
         $('form-error').textContent = '加载失败: ' + e.message;
         $('form-error').style.display = 'block';
@@ -227,6 +234,7 @@ function getFormData() {
         token_name: $('f-token-name').value.trim(),
         token_value: $('f-token-value').value,
         node: $('f-node').value.trim(),
+        template_vmid: parseInt($('f-template-vmid').value) || 9000,
     };
 }
 

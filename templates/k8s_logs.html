@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <div style="max-width:900px;margin:0 auto;padding:20px">
-    <h2 style="margin-bottom:8px">集群创建日志</h2>
+    <h2 style="margin-bottom:8px"><span id="task-type-label">任务</span>日志</h2>
     <div style="font-size:13px;color:#666;margin-bottom:16px">Task ID: <code id="task-id">{{ task_id }}</code></div>
 
     <div id="status-badge" style="display:inline-block;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:500;margin-bottom:12px">等待中</div>
@@ -57,6 +57,11 @@ function appendLogs(logs) {
 }
 
 function updateStatus(task) {
+    const queueLabels = {'create': '创建集群', 'deploy': '部署 K8s', 'delete': '删除集群'};
+    const label = document.getElementById('task-type-label');
+    if (task.queue && queueLabels[task.queue]) {
+        label.textContent = queueLabels[task.queue];
+    }
     const pct = task.progress || 0;
     progressFill.style.width = pct + '%';
     progressFill.className = 'progress-fill';

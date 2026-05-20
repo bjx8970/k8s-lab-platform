@@ -179,6 +179,7 @@ class OpenWrtClient:
         if ipaddr and proto != "dhcp":
             self._uci_set("network", name, "ipaddr", ipaddr)
             self._uci_set("network", name, "netmask", netmask)
+        self._uci_set("network", name, "multipath", "off")
         self._uci_commit("network")
         return name
 
@@ -211,6 +212,7 @@ class OpenWrtClient:
         self._uci_set("dhcp", name, "limit", limit)
         self._uci_set("dhcp", name, "leasetime", leasetime)
         self._uci_set("dhcp", name, "dhcpv4", dhcpv4)
+        self._uci_set("dhcp", name, "dynamicdhcp", "0")
         self._uci_commit("dhcp")
         return name
 
@@ -303,25 +305,22 @@ class OpenWrtClient:
         raw = self.exec("uci show dhcp")
         return _parse_uci_show(raw, section_type="host")
 
-    def create_dhcp_host(self, name, ip, mac):
+    def create_dhcp_host(self, ip, mac):
         self.exec("uci add dhcp host")
-        self._uci_set("dhcp", "@host[-1]", "name", name)
-        self._uci_set("dhcp", "@host[-1]", "ip", ip)
         self._uci_add_list("dhcp", "@host[-1]", "mac", mac)
+        self._uci_set("dhcp", "@host[-1]", "ip", ip)
         self._uci_commit("dhcp")
-        self.exec("/etc/init.d/dnsmasq restart", tolerant=True)
-        return name
 
-    def delete_dhcp_host(self, name, skip_restart=False):
+    def delete_dhcp_host(self, ip, skip_restart=False):
         hosts = self.get_dhcp_hosts()
         for sec_name, sec in hosts.items():
-            if sec.get("name") == name:
+            if sec.get("ip") == ip:
                 self._uci_delete("dhcp", sec_name)
                 self._uci_commit("dhcp")
                 if not skip_restart:
                     self.exec("/etc/init.d/dnsmasq restart", tolerant=True)
                 return
-        raise OpenWrtError(f"DHCP host '{name}' not found")
+        raise OpenWrtError(f"DHCP host with IP '{ip}' not found")
 
     # ── Service control ──
 

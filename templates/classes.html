@@ -96,10 +96,12 @@ async function loadClasses() {
       html += '<div class="class-card" data-id="' + c.id + '">' +
         '<div class="class-header" onclick="toggleClass(this)">' +
           '<div><span class="name">' + esc(c.name) + '</span> <span class="meta">' + (c.description || '') + '</span></div>' +
-          '<div style="display:flex;align-items:center;gap:8px">' +
+          '<div style="display:flex;align-items:center;gap:6px">' +
+            '<button class="btn btn-sm" style="color:#1890ff" onclick="event.stopPropagation();classVmAction(' + c.id + ',\'start\')">▶ 启动全部</button>' +
+            '<button class="btn btn-sm" style="color:#ff4d4f" onclick="event.stopPropagation();classVmAction(' + c.id + ',\'stop\')">⏹ 停止全部</button>' +
             '<span class="badge">' + (groups ? groups.length : 0) + ' 组</span>' +
             '<button class="btn btn-sm" onclick="event.stopPropagation();openGroupModal(' + c.id + ')">+ 添加组</button>' +
-            '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteClass(' + c.id + ')">删除</button>' +
+            '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteClass(event, ' + c.id + ')">删除</button>' +
           '</div>' +
         '</div>' +
         '<div class="class-body" style="display:none">' +
@@ -119,7 +121,7 @@ function renderGroups(groups) {
       '<div><span class="group-name">' + esc(g.name) + '</span> <span class="badge">' + (g.member_count || 0) + ' 人</span></div>' +
       '<div class="group-actions">' +
         '<button class="btn btn-sm" onclick="openMemberModal(' + g.id + ')">成员</button>' +
-        '<button class="btn btn-sm btn-danger" onclick="deleteGroup(' + g.id + ')">删除</button>' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteGroup(event, ' + g.id + ')">删除</button>' +
       '</div>' +
     '</div>'
   ).join('');
@@ -162,13 +164,18 @@ async function saveClass() {
   }
 }
 
-async function deleteClass(id) {
-  if (!confirm('确定删除此课程及其所有组？')) return;
+async function classVmAction(cid, action) {
+  var msg = action === 'start' ? '启动' : '停止';
+  if (!confirm('确定' + msg + '该课程下所有集群的虚拟机？')) return;
+  var btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = msg + '中...'; }
   try {
-    await api('DELETE', 'classes/' + id);
-    loadClasses();
+    var r = await api('POST', 'classes/' + cid + '/vm-action-all', { action: action });
+    alert(msg + '完成: ' + r.message);
   } catch (e) {
-    alert('删除失败: ' + e.message);
+    alert(msg + '失败: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = action === 'start' ? '▶ 启动全部' : '⏹ 停止全部'; }
   }
 }
 
@@ -197,10 +204,26 @@ async function saveGroup() {
   }
 }
 
-async function deleteGroup(id) {
+async function deleteGroup(event, id) {
   if (!confirm('确定删除此组？')) return;
+  var btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = '删除中...'; }
   try {
-    await api('DELETE', 'groups/' + id);
+    var r = await api('DELETE', 'groups/' + id);
+    alert(r.message || '删除成功');
+    loadClasses();
+  } catch (e) {
+    alert('删除失败: ' + e.message);
+  }
+}
+
+async function deleteClass(event, id) {
+  if (!confirm('确定删除此课程及其所有组？')) return;
+  var btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = '删除中...'; }
+  try {
+    var r = await api('DELETE', 'classes/' + id);
+    alert(r.message || '删除成功');
     loadClasses();
   } catch (e) {
     alert('删除失败: ' + e.message);
@@ -227,7 +250,7 @@ async function loadMembers(groupId) {
     if (!members.length) { el.innerHTML = '<p style="color:#999">暂无成员</p>'; return; }
     el.innerHTML = members.map(m =>
       '<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid #f5f5f5">' +
-        '<span>' + esc(m.username) + ' <span class="badge">' + (m.role || '') + '</span></span>' +
+        '<span>' + esc(m.name || m.username) + '（' + esc(m.username) + '）<span class="badge">' + (m.role || '') + '</span></span>' +
         '<button class="btn btn-sm btn-danger" onclick="removeMember(' + m.id + ')">移除</button>' +
       '</div>'
     ).join('');

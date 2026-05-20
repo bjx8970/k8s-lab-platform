@@ -115,6 +115,7 @@ class PVEServer(Base):
     token_name = Column(String(64), nullable=False)
     token_value = Column(String(256), nullable=False)
     node = Column(String(64), default="")
+    template_vmid = Column(Integer, default=9000)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -225,8 +226,8 @@ def list_pve_servers():
             "token_name": s.token_name,
             "token_value": "****",
             "node": s.node,
+            "template_vmid": s.template_vmid,
         } for s in servers]
-
 
 def get_pve_server(server_id):
     with session_scope() as session:
@@ -242,6 +243,7 @@ def get_pve_server(server_id):
             "token_name": s.token_name,
             "token_value": s.token_value,
             "node": s.node,
+            "template_vmid": s.template_vmid,
         }
 
 
@@ -255,6 +257,7 @@ def create_pve_server(data):
             token_name=data["token_name"],
             token_value=data["token_value"],
             node=data.get("node", ""),
+            template_vmid=int(data.get("template_vmid", 9000)),
         )
         session.add(s)
         return s.id
@@ -273,6 +276,7 @@ def update_pve_server(server_id, data):
         if "token_value" in data and data["token_value"] and data["token_value"] != "****":
             s.token_value = data["token_value"]
         if "node" in data: s.node = data["node"]
+        if "template_vmid" in data: s.template_vmid = int(data["template_vmid"])
         return s.id
 
 
@@ -290,6 +294,7 @@ def init_db():
     Base.metadata.create_all(engine)
     _ensure_db_indexes()
     _migrate_user_name()
+    _migrate_pve_template_vmid()
     migrate_pve_config()
 
 
@@ -373,18 +378,35 @@ def _migrate_user_name():
         pass
 
 
+def _migrate_pve_template_vmid():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE pve_servers ADD COLUMN template_vmid INTEGER DEFAULT 9000"))
+            conn.commit()
+    except Exception:
+        pass
+
+
 def load_clusters():
     with session_scope() as session:
         clusters = session.query(Cluster).options(selectinload(Cluster.vms)).all()
         class_ids = list(set(c.class_id for c in clusters if c.class_id))
+        group_ids = list(set(c.group_id for c in clusters if c.group_id))
         class_map = {}
         if class_ids:
             for cls in session.query(SchoolClass).filter(SchoolClass.id.in_(class_ids)).all():
                 class_map[cls.id] = cls.name
+        group_map = {}
+        if group_ids:
+            for g in session.query(Group).filter(Group.id.in_(group_ids)).all():
+                group_map[g.id] = g.name
         result = {}
         for c in clusters:
             d = _cluster_to_dict(c)
             d["class_name"] = class_map.get(c.class_id, "")
+            d["group_name"] = group_map.get(c.group_id, "")
             result[c.name] = d
         return result
 
@@ -947,7 +969,7 @@ def list_group_members(group_id):
         if not user_ids:
             return []
         users = session.query(User).filter(User.id.in_(user_ids)).all()
-        return [{"id": u.id, "username": u.username, "role": u.role} for u in users]
+        return [{"id": u.id, "username": u.username, "name": u.name, "role": u.role} for u in users]
     finally:
         session.close()
 
@@ -960,7 +982,7 @@ def list_group_members_batch(group_ids):
             return {}
         user_ids = list(set(m.user_id for m in members))
         users = session.query(User).filter(User.id.in_(user_ids)).all()
-        user_map = {u.id: {"id": u.id, "username": u.username, "role": u.role} for u in users}
+        user_map = {u.id: {"id": u.id, "username": u.username, "name": u.name, "role": u.role} for u in users}
         from collections import defaultdict
         result = defaultdict(list)
         for m in members:
@@ -1042,3 +1064,25 @@ def get_student_group_ids(user_id):
         return [m.group_id for m in memberships]
     finally:
         session.close()
+
+
+def detach_clusters_from_group(group_id):
+    with session_scope(commit=True) as session:
+        session.query(Cluster).filter_by(group_id=group_id).update({"group_id": None})
+
+
+def detach_clusters_from_class(class_id):
+    with session_scope(commit=True) as session:
+        session.query(Cluster).filter_by(class_id=class_id).update({"class_id": None, "group_id": None})
+
+
+def list_cluster_names_by_class_id(class_id):
+    with session_scope() as session:
+        clusters = session.query(Cluster).filter_by(class_id=class_id).all()
+        return [c.name for c in clusters]
+
+
+def list_cluster_names_by_group_id(group_id):
+    with session_scope() as session:
+        clusters = session.query(Cluster).filter_by(group_id=group_id).all()
+        return [c.name for c in clusters]
