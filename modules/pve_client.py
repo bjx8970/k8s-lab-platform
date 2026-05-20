@@ -1,5 +1,4 @@
 from proxmoxer import ProxmoxAPI
-from proxmoxer.core import ResourceException
 
 
 class PVEError(Exception):
@@ -166,53 +165,6 @@ class PVEClient:
             return {"message": f"VM {vmid} stopped"}
         except Exception as e:
             raise PVEError(f"Failed to stop VM {vmid}: {e}") from e
-
-    def guest_exec(self, node, vmid, command, input_data=None):
-        try:
-            params = {"command": command}
-            if input_data is not None:
-                params["input-data"] = input_data
-            return self.api.nodes(node).qemu(vmid).agent.exec.post(**params)
-        except Exception as e:
-            raise PVEError(f"Failed to exec command in VM {vmid}: {e}") from e
-
-    def guest_exec_status(self, node, vmid, pid):
-        try:
-            agent = self.api.nodes(node).qemu(vmid).agent
-            return agent("exec-status").get(pid=pid)
-        except Exception as e:
-            raise PVEError(f"Failed to get exec status for VM {vmid}: {e}") from e
-
-    def wait_for_guest_agent(self, node, vmid, timeout=90):
-        import time
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                self.api.nodes(node).qemu(vmid).agent.ping.get()
-                return True
-            except Exception:
-                pass
-            try:
-                agent = self.api.nodes(node).qemu(vmid).agent
-                getattr(agent, "network-get-interfaces").get()
-                return True
-            except Exception:
-                pass
-            time.sleep(1)
-        raise PVEError(f"Guest agent did not become ready on VM {vmid} within {timeout}s")
-
-    def get_vm_ip(self, node, vmid):
-        try:
-            agent = self.api.nodes(node).qemu(vmid).agent
-            result = getattr(agent, "network-get-interfaces").get()
-            for iface in result.get("result", []):
-                for addr in iface.get("ip-addresses", []):
-                    ip = addr.get("ip-address", "")
-                    if addr.get("ip-address-type") == "ipv4" and not ip.startswith("127."):
-                        return ip
-            return None
-        except Exception as e:
-            raise PVEError(f"Failed to get VM IP for {vmid}: {e}") from e
 
     def release_vm(self, node, vmid, purge=True):
         try:

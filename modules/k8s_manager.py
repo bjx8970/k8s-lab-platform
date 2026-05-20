@@ -1,9 +1,11 @@
+import io
 import secrets
 import threading
 import time as _time
 import uuid
 from urllib.parse import quote
 
+import paramiko
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
@@ -161,28 +163,130 @@ def _random_mac():
     return f"{prefix}:{suffix}"
 
 
-def _guest_exec_wait(pve, node, vmid, pid_info, timeout=60):
-    info = pid_info or {}
-    pid = (info.get("return", {}) or info.get("data", {}) or info).get("pid", 0)
-    if not pid:
-        return
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
-        _time.sleep(1)
+class _SSHClient:
+    def __init__(self, host, port, username, private_key):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.private_key = private_key
+        self._ssh = None
+
+    def _get_pkey(self):
+        return paramiko.Ed25519Key.from_private_key(io.StringIO(self.private_key))
+
+    def connect(self, timeout=30):
+        self._ssh = paramiko.SSHClient()
+        self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self._ssh.connect(
+            self.host, port=self.port, username=self.username,
+            pkey=self._get_pkey(), timeout=timeout,
+            banner_timeout=timeout,
+        )
+
+    def close(self):
+        if self._ssh:
+            self._ssh.close()
+            self._ssh = None
+
+    def exec(self, command, timeout=60):
+        if not self._ssh:
+            raise K8sError("SSH 未连接")
+        stdin, stdout, stderr = self._ssh.exec_command(command, timeout=timeout)
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            err = stderr.read().decode().strip()
+            raise K8sError(f"SSH 命令失败 (exit={exit_code}): {err[:200]}")
+
+    def exec_with_output(self, command, timeout=30):
+        if not self._ssh:
+            raise K8sError("SSH 未连接")
+        stdin, stdout, stderr = self._ssh.exec_command(command, timeout=timeout)
+        exit_code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode().strip()
+        if exit_code != 0:
+            err = stderr.read().decode().strip()
+            raise K8sError(f"SSH 命令失败 (exit={exit_code}): {err[:200]}")
+        return out
+
+    def exec_streaming(self, command, log_callback=None, timeout=3600):
+        if not self._ssh:
+            raise K8sError("SSH 未连接")
+        transport = self._ssh.get_transport()
+        channel = transport.open_session()
+        channel.exec_command(command)
+
+        prev_data = ""
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if channel.recv_ready():
+                data = channel.recv(4096).decode(errors="replace")
+                if data:
+                    prev_data += data
+                    if "\n" in prev_data:
+                        lines = prev_data.split("\n")
+                        for line in lines[:-1]:
+                            if log_callback and line.rstrip():
+                                log_callback(f"  {line.rstrip()}")
+                        prev_data = lines[-1]
+
+            if channel.exit_status_ready():
+                break
+            _time.sleep(3)
+
+        while channel.recv_ready():
+            data = channel.recv(4096).decode(errors="replace")
+            prev_data += data
+        if prev_data.strip() and log_callback:
+            for line in prev_data.rstrip("\n").split("\n"):
+                if line.rstrip():
+                    log_callback(f"  {line.rstrip()}")
+
+        exit_code = channel.recv_exit_status()
+        channel.close()
+        if exit_code != 0:
+            raise K8sError(f"命令失败 (exit={exit_code})")
+
+    def write_file(self, path, content, sudo=False):
+        prefix = "sudo " if sudo else ""
+        cmd = f"{prefix}tee {path} > /dev/null"
+        if not self._ssh:
+            raise K8sError("SSH 未连接")
+        stdin, stdout, stderr = self._ssh.exec_command(cmd, timeout=30)
+        stdin.write(content)
+        stdin.close()
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            err = stderr.read().decode().strip()
+            raise K8sError(f"SSH 写入文件失败 (exit={exit_code}): {err[:200]}")
+
+    def file_exists(self, path):
         try:
-            s = pve.guest_exec_status(node, vmid, pid)
-            ret = (s.get("return", {}) or s.get("data", {}) or s)
-            if ret.get("exited"):
-                exitcode = ret.get("exitcode", 0)
-                if exitcode != 0:
-                    err = (ret.get("err-data") or "").strip()
-                    raise K8sError(f"guest exec failed (exit={exitcode}): {err}")
-                return
+            self.exec(f"test -f {path}")
+            return True
         except K8sError:
-            raise
-        except Exception:
-            pass
-    raise K8sError(f"guest exec timed out after {timeout}s")
+            return False
+
+    def dir_exists(self, path):
+        try:
+            self.exec(f"test -d {path}")
+            return True
+        except K8sError:
+            return False
+
+
+def _wait_for_ssh(host, port, username, private_key, timeout=120):
+    deadline = _time.time() + timeout
+    last_error = ""
+    while _time.time() < deadline:
+        try:
+            ssh = _SSHClient(host, port, username, private_key)
+            ssh.connect(timeout=10)
+            ssh.close()
+            return True
+        except Exception as e:
+            last_error = str(e)
+            _time.sleep(2)
+    raise K8sError(f"SSH 连接失败 ({host}:{port}): {last_error}")
 
 
 def _openwrt_client():
@@ -628,69 +732,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             except Exception as e:
                 _log(f"VM {vm_name}: 启动跳过 ({e})")
 
-        _exec_timeout = 60
-
-        def _wait_pid(node, vmid, pid_info):
-            info = pid_info or {}
-            pid = (info.get("return", {}) or info.get("data", {}) or info).get("pid", 0)
-            if not pid:
-                return
-            for _ in range(_exec_timeout):
-                _time.sleep(1)
-                try:
-                    s = pve.guest_exec_status(node, vmid, pid)
-                    ret = (s.get("return", {}) or s.get("data", {}) or s)
-                    if ret.get("exited"):
-                        exitcode = ret.get("exitcode", 0)
-                        if exitcode != 0:
-                            err = (ret.get("err-data") or "").strip()
-                            raise K8sError(f"guest exec failed (exit={exitcode}): {err}")
-                        return
-                except K8sError:
-                    raise
-                except Exception:
-                    pass
-
-        report(94, "正在等待 client VM 就绪...")
-        client_vm = next((item for item in created_vms if item[0].startswith("client-")), None)
-        if client_vm:
-            _log(f"Client VM {client_vm[0]}: 等待 QEMU Guest Agent 就绪 (120s 超时)")
-            try:
-                pve.wait_for_guest_agent(client_vm[1], client_vm[2], timeout=120)
-                _log(f"Client VM {client_vm[0]}: Guest Agent 已就绪")
-            except Exception as e:
-                _log(f"Client VM {client_vm[0]}: Guest Agent 未响应 ({e})")
-
-            report(95, "正在配置 client 免密登录...")
-            _log(f"Client VM {client_vm[0]}: 通过 Guest Agent 上传 SSH 私钥")
-            try:
-                _log(f"Guest Exec: mkdir -p /home/k8s/.ssh && chmod 700 /home/k8s/.ssh")
-                r = pve.guest_exec(client_vm[1], client_vm[2],
-                    ["sh", "-c", "mkdir -p /home/k8s/.ssh && chmod 700 /home/k8s/.ssh"])
-                _wait_pid(client_vm[1], client_vm[2], r)
-                _log(f"Guest Exec: 目录创建完成")
-
-                _log(f"Guest Exec: tee /home/k8s/.ssh/id_rsa ({len(priv_key)} bytes)")
-                r = pve.guest_exec(client_vm[1], client_vm[2],
-                    ["tee", "/home/k8s/.ssh/id_rsa"], input_data=priv_key)
-                _wait_pid(client_vm[1], client_vm[2], r)
-                _log(f"Guest Exec: 私钥写入完成")
-
-                _log(f"Guest Exec: chmod 600 /home/k8s/.ssh/id_rsa")
-                r = pve.guest_exec(client_vm[1], client_vm[2],
-                    ["chmod", "600", "/home/k8s/.ssh/id_rsa"])
-                _wait_pid(client_vm[1], client_vm[2], r)
-                _log(f"Guest Exec: 权限设置完成")
-
-                _log(f"Guest Exec: chown -R k8s:k8s /home/k8s/.ssh")
-                r = pve.guest_exec(client_vm[1], client_vm[2],
-                    ["chown", "-R", "k8s:k8s", "/home/k8s/.ssh"])
-                _wait_pid(client_vm[1], client_vm[2], r)
-                _log(f"Guest Exec: 所有者设置完成")
-            except Exception as e:
-                _log(f"Client VM {client_vm[0]}: SSH 密钥上传异常 ({e})")
-
-        report(96, "正在重启虚拟机以刷新主机名...")
+        report(94, "正在重启虚拟机以刷新主机名...")
         for vm_name, node, vmid in created_vms:
             _log(f"VM {vm_name}: 发送重启命令")
             try:
@@ -698,6 +740,44 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 _log(f"VM {vm_name}: 重启完成")
             except Exception as e:
                 _log(f"VM {vm_name}: 重启跳过 ({e})")
+
+        report(96, "正在等待 client VM 就绪并配置 SSH...")
+        client_vm = next((item for item in created_vms if item[0].startswith("client-")), None)
+        if client_vm:
+            _ow_cfg = get_config("openwrt")
+            _ssh_host = _ow_cfg["host"]
+            _ssh_port = 50000 + num
+            _log(f"Client VM {client_vm[0]}: 等待 SSH 就绪 ({_ssh_host}:{_ssh_port}, 120s 超时)")
+            try:
+                _wait_for_ssh(_ssh_host, _ssh_port, "k8s", priv_key, timeout=120)
+                _log(f"Client VM {client_vm[0]}: SSH 已就绪")
+            except Exception as e:
+                _log(f"Client VM {client_vm[0]}: SSH 未响应 ({e})")
+
+            report(98, "正在通过 SSH 配置 client 免密登录...")
+            _log(f"Client VM {client_vm[0]}: SSH 上传私钥")
+            try:
+                ssh = _SSHClient(_ssh_host, _ssh_port, "k8s", priv_key)
+                ssh.connect(timeout=30)
+                _log(f"SSH: mkdir -p /home/k8s/.ssh && chmod 700")
+                ssh.exec("mkdir -p /home/k8s/.ssh && chmod 700 /home/k8s/.ssh")
+                _log(f"SSH: 写入 /home/k8s/.ssh/id_rsa ({len(priv_key)} bytes)")
+                ssh.write_file("/home/k8s/.ssh/id_rsa", priv_key)
+                _log(f"SSH: chmod 600 && chown")
+                ssh.exec("chmod 600 /home/k8s/.ssh/id_rsa && chown -R k8s:k8s /home/k8s/.ssh")
+                _log(f"SSH: 私钥上传完成")
+
+                _log(f"SSH: sudo mkdir -p /root/.ssh && chmod 700")
+                ssh.exec("sudo mkdir -p /root/.ssh && sudo chmod 700 /root/.ssh")
+                _log(f"SSH: 写入 /root/.ssh/authorized_keys")
+                ssh.write_file("/root/.ssh/authorized_keys", pub_key, sudo=True)
+                _log(f"SSH: sudo chmod 600 && chown root")
+                ssh.exec("sudo chmod 600 /root/.ssh/authorized_keys && sudo chown root:root /root/.ssh/authorized_keys")
+                _log(f"SSH: 公钥上传完成")
+                ssh.close()
+            except Exception as e:
+                _log(f"Client VM {client_vm[0]}: SSH 配置异常, 终止创建 ({e})")
+                raise K8sError(f"Client VM SSH 配置失败: {e}") from e
 
     except Exception as e:
         _log(f"错误: {e}")
@@ -844,100 +924,28 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     _log(f"开始部署 K8s: 集群 {name}")
 
-    pve = _pve_client(server_id=cluster.get("pve_server_id"))
-    pve.connect()
-    _log("PVE 连接成功")
+    _ow_cfg = get_config("openwrt")
+    _ssh_host = _ow_cfg["host"]
+    _ssh_port = cluster.get("ssh_port") or 50000 + int(name.split("_")[1])
+    _priv_key = cluster.get("ssh_private_key", "")
+    _pub_key = cluster.get("ssh_public_key", "")
 
-    client_vm = None
-    for vm_name, vm_info in cluster.get("vms", {}).items():
-        if vm_name.startswith("client-"):
-            client_vm = vm_info
-            break
-    if not client_vm:
-        raise K8sError("集群中没有 client VM")
-    node = client_vm["node"]
-    vmid = client_vm["vmid"]
+    report(10, "正在通过 SSH 连接 client VM...")
+    _log(f"通过端口转发连接 client VM ({_ssh_host}:{_ssh_port})")
+    try:
+        _wait_for_ssh(_ssh_host, _ssh_port, "k8s", _priv_key, timeout=120)
+    except Exception as e:
+        raise K8sError(f"client VM SSH 连接失败: {e}")
+    _log("client VM SSH 连接就绪")
 
-    report(10, "正在等待 client VM Guest Agent...")
-    _log(f"Client VM {vmid}: 等待 Guest Agent 就绪")
-    pve.wait_for_guest_agent(node, vmid, timeout=120)
-    _log("Guest Agent 已就绪")
-
-    def _file_exists(path):
-        try:
-            r = pve.guest_exec(node, vmid, ["test", "-f", path])
-            _guest_exec_wait(pve, node, vmid, r)
-            return True
-        except K8sError:
-            return False
-
-    def _dir_exists(path):
-        try:
-            r = pve.guest_exec(node, vmid, ["test", "-d", path])
-            _guest_exec_wait(pve, node, vmid, r)
-            return True
-        except K8sError:
-            return False
-
-    def _sh(cmd, timeout=60):
-        r = pve.guest_exec(node, vmid, ["sh", "-c", cmd])
-        _guest_exec_wait(pve, node, vmid, r, timeout=timeout)
-
-    def _sh_out(cmd, timeout=30):
-        r = pve.guest_exec(node, vmid, ["sh", "-c", cmd])
-        info = r or {}
-        pid = (info.get("return", {}) or info.get("data", {}) or info).get("pid", 0)
-        if not pid:
-            return ""
-        deadline = _time.time() + timeout
-        while _time.time() < deadline:
-            _time.sleep(1)
-            s = pve.guest_exec_status(node, vmid, pid)
-            ret = (s.get("return", {}) or s.get("data", {}) or s)
-            if ret.get("exited"):
-                exitcode = ret.get("exitcode", 0)
-                if exitcode != 0:
-                    err = (ret.get("err-data") or "").strip()
-                    raise K8sError(f"guest exec failed (exit={exitcode}): {err}")
-                return (ret.get("out-data") or "").strip()
-        raise K8sError(f"guest exec timed out after {timeout}s")
-
-    def _sh_with_output(cmd, timeout=3600):
-        r = pve.guest_exec(node, vmid, ["sh", "-c", cmd])
-        info = r or {}
-        pid = (info.get("return", {}) or info.get("data", {}) or info).get("pid", 0)
-        if not pid:
-            return
-        prev_out = ""
-        deadline = _time.time() + timeout
-        while _time.time() < deadline:
-            _time.sleep(3)
-            try:
-                s = pve.guest_exec_status(node, vmid, pid)
-                ret = (s.get("return", {}) or s.get("data", {}) or s)
-                out = ret.get("out-data") or ""
-                if out != prev_out:
-                    for line in out[len(prev_out):].rstrip("\n").split("\n"):
-                        _log(f"  {line}")
-                    prev_out = out
-                if ret.get("exited"):
-                    exitcode = ret.get("exitcode", 0)
-                    if exitcode != 0:
-                        raise K8sError(f"命令失败 (exit={exitcode})")
-                    return
-            except K8sError:
-                raise
-            except Exception:
-                pass
-        raise K8sError(f"命令超时 ({timeout}s)")
+    ssh = _SSHClient(_ssh_host, _ssh_port, "k8s", _priv_key)
+    ssh.connect(timeout=30)
+    _log("SSH 连接已建立")
 
     def _download_with_retry(url, tmp_path, log_name, timeout=120, retries=3, delay=5):
         for attempt in range(1, retries + 1):
             try:
-                r = pve.guest_exec(node, vmid,
-                    ["/usr/bin/python3", "-c",
-                     f"import urllib.request; urllib.request.urlretrieve('{url}', '{tmp_path}')"])
-                _guest_exec_wait(pve, node, vmid, r, timeout=timeout)
+                ssh.exec(f"wget -q -O {tmp_path} {url} --timeout=30", timeout=timeout)
                 return
             except K8sError as e:
                 if attempt < retries:
@@ -947,14 +955,13 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
                 raise
 
     report(15, "正在复制 SSH 密钥到 /root/.ssh/...")
-    _priv_key = cluster.get("ssh_private_key", "")
-    _existing_key = _sh_out("cat /root/.ssh/id_rsa || true")
+    _existing_key = ssh.exec_with_output("sudo cat /root/.ssh/id_rsa 2>/dev/null || true")
     if _existing_key != _priv_key:
         _log("复制 SSH 私钥 → /root/.ssh/id_rsa")
         try:
-            _sh("cp /home/k8s/.ssh/id_rsa /root/.ssh/id_rsa && "
-                "chmod 600 /root/.ssh/id_rsa && "
-                "chown root:root /root/.ssh/id_rsa")
+            ssh.exec("sudo cp /home/k8s/.ssh/id_rsa /root/.ssh/id_rsa && "
+                     "sudo chmod 600 /root/.ssh/id_rsa && "
+                     "sudo chown root:root /root/.ssh/id_rsa")
             _log("SSH 密钥复制完成")
         except K8sError as e:
             _log(f"SSH 密钥复制失败: {e}")
@@ -965,48 +972,35 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
         _log("/root/.ssh/id_rsa 内容正确，跳过")
 
     report(18, "正在上传 SSH 公钥到所有节点...")
-    _log("开始上传 SSH 公钥 → /root/.ssh/authorized_keys")
-    pub_key = cluster.get("ssh_public_key", "")
-    if not pub_key:
+    _log("通过 client VM 分发 SSH 公钥到各节点")
+    if not _pub_key:
         _log("SSH 公钥缺失")
         cluster["k8s_status"] = "failed"
         save_cluster(name, cluster)
         raise K8sError("集群 SSH 公钥缺失")
+
+    ssh.exec("mkdir -p /tmp/k8s-setup")
+    ssh.write_file("/tmp/k8s-setup/cluster.pub", _pub_key)
     for vm_name, vm_info in cluster.get("vms", {}).items():
-        _log(f"VM {vm_name}: 等待 Guest Agent 就绪")
-        try:
-            pve.wait_for_guest_agent(vm_info["node"], vm_info["vmid"], timeout=120)
-        except Exception as e:
-            _log(f"VM {vm_name}: Guest Agent 未响应 ({e}), 跳过")
+        if vm_info.get("role") == "client":
             continue
-        _log(f"VM {vm_name}: 创建 /root/.ssh/ 目录")
+        _ip = vm_info.get("ip")
+        if not _ip:
+            _log(f"{vm_name}: 无 IP 信息，跳过")
+            continue
+        _log(f"{vm_name}: 配置 root SSH ({_ip})")
         try:
-            r = pve.guest_exec(vm_info["node"], vm_info["vmid"],
-                ["sh", "-c", "mkdir -p /root/.ssh && chmod 700 /root/.ssh"])
-            _guest_exec_wait(pve, vm_info["node"], vm_info["vmid"], r)
+            ssh.exec(
+                f"cat /tmp/k8s-setup/cluster.pub | "
+                f"ssh -o StrictHostKeyChecking=no k8s@{_ip} "
+                f"'sudo mkdir -p /root/.ssh && sudo chmod 700 /root/.ssh && "
+                f"sudo tee /root/.ssh/authorized_keys > /dev/null && "
+                f"sudo chmod 600 /root/.ssh/authorized_keys && "
+                f"sudo chown root:root /root/.ssh/authorized_keys'",
+                timeout=60)
+            _log(f"{vm_name}: 配置完成")
         except K8sError as e:
-            _log(f"VM {vm_name}: 目录创建失败 ({e})")
-            cluster["k8s_status"] = "failed"
-            save_cluster(name, cluster)
-            raise
-        _log(f"VM {vm_name}: 写入 authorized_keys")
-        try:
-            r = pve.guest_exec(vm_info["node"], vm_info["vmid"],
-                ["tee", "/root/.ssh/authorized_keys"], input_data=pub_key)
-            _guest_exec_wait(pve, vm_info["node"], vm_info["vmid"], r)
-        except K8sError as e:
-            _log(f"VM {vm_name}: authorized_keys 写入失败 ({e})")
-            cluster["k8s_status"] = "failed"
-            save_cluster(name, cluster)
-            raise
-        _log(f"VM {vm_name}: 设置权限")
-        try:
-            r = pve.guest_exec(vm_info["node"], vm_info["vmid"],
-                ["sh", "-c", "chmod 600 /root/.ssh/authorized_keys && chown root:root /root/.ssh/authorized_keys"])
-            _guest_exec_wait(pve, vm_info["node"], vm_info["vmid"], r)
-            _log(f"VM {vm_name}: SSH 公钥上传完成")
-        except K8sError as e:
-            _log(f"VM {vm_name}: 权限设置失败 ({e})")
+            _log(f"{vm_name}: 配置失败 ({e})")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1016,62 +1010,15 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     save_cluster(name, cluster)
     _log("集群 K8s 状态已更新为 installing")
 
-    # ── 加固 qemu-guest-agent (Restart=always + crontab 保活) ──
-    report(28, "正在加固 qemu-guest-agent...")
-    _log("client VM: 写入守护配置")
-    try:
-        _sh("""mkdir -p /etc/systemd/system/qemu-guest-agent.service.d
-cat > /etc/systemd/system/qemu-guest-agent.service.d/override.conf << 'ENDCFG'
-[Service]
-Restart=always
-RestartSec=10
-OOMScoreAdjust=-500
-ENDCFG
-systemctl daemon-reload
-(crontab -l 2>/dev/null | grep -v 'qemu-guest-agent'; echo '* * * * * systemctl is-active qemu-guest-agent || systemctl restart qemu-guest-agent') | crontab -""")
-        _log("client VM: 配置完成，重启 qemu-guest-agent...")
-        try:
-            _sh("systemctl restart qemu-guest-agent", timeout=10)
-        except Exception:
-            _log("client VM: qemu-guest-agent 重启超时（agent 已断开，配置已生效）")
-    except Exception as e:
-        _log(f"client VM: 加固失败 ({e})")
-        cluster["k8s_status"] = "failed"
-        save_cluster(name, cluster)
-        raise
-    _log("client VM: 写入远程加固脚本 → /tmp/harden-agent.sh")
-    _sh("""cat > /tmp/harden-agent.sh << 'SCRIPT'
-set -e
-mkdir -p /etc/systemd/system/qemu-guest-agent.service.d
-cat > /etc/systemd/system/qemu-guest-agent.service.d/override.conf << 'ENDCFG'
-[Service]
-Restart=always
-RestartSec=10
-OOMScoreAdjust=-500
-ENDCFG
-systemctl daemon-reload
-systemctl restart qemu-guest-agent
-(crontab -l 2>/dev/null | grep -v 'qemu-guest-agent'; echo '* * * * * systemctl is-active qemu-guest-agent || systemctl restart qemu-guest-agent') | crontab -
-SCRIPT""")
-    for _vm_name, _vm_info in cluster.get("vms", {}).items():
-        if _vm_info.get("role") == "client":
-            continue
-        _log(f"{_vm_name}: SSH 远程执行加固脚本 ({_vm_info['ip']})")
-        try:
-            _sh(f"ssh -o StrictHostKeyChecking=no root@{_vm_info['ip']} 'bash -s' < /tmp/harden-agent.sh", timeout=120)
-        except Exception as _e:
-            _log(f"{_vm_name}: 加固失败 ({_e})")
-    _log("所有节点 qemu-guest-agent 加固完成")
-
     # ── ezdown ──
     report(30, "正在下载 ezdown...")
-    if not _file_exists("/home/k8s/ezdown"):
+    if not ssh.file_exists("/home/k8s/ezdown"):
         _log("下载 ezdown → /home/k8s/ezdown")
         try:
             _download_with_retry(
                 "http://10.11.43.82/download/ezdown",
                 "/tmp/ezdown", "ezdown", timeout=120)
-            _sh("mv /tmp/ezdown /home/k8s/ezdown && chmod 755 /home/k8s/ezdown && chown k8s:k8s /home/k8s/ezdown")
+            ssh.exec("mv /tmp/ezdown /home/k8s/ezdown && chmod 755 /home/k8s/ezdown && chown k8s:k8s /home/k8s/ezdown")
             _log("ezdown 下载完成")
         except K8sError as e:
             _log(f"ezdown 下载失败: {e}")
@@ -1083,13 +1030,13 @@ SCRIPT""")
 
     # ── kubeasz_offline.tgz ──
     report(40, "正在下载 kubeasz 离线包...")
-    if not _file_exists("/home/k8s/kubeasz_offline.tgz"):
+    if not ssh.file_exists("/home/k8s/kubeasz_offline.tgz"):
         _log("下载 kubeasz_offline.tgz → /home/k8s/kubeasz_offline.tgz")
         try:
             _download_with_retry(
                 "http://10.11.43.82/download/kubeasz_offline.tgz",
                 "/tmp/kubeasz_offline.tgz", "kubeasz 离线包", timeout=600)
-            _sh("mv /tmp/kubeasz_offline.tgz /home/k8s/kubeasz_offline.tgz && chown k8s:k8s /home/k8s/kubeasz_offline.tgz")
+            ssh.exec("mv /tmp/kubeasz_offline.tgz /home/k8s/kubeasz_offline.tgz && chown k8s:k8s /home/k8s/kubeasz_offline.tgz")
             _log("kubeasz_offline.tgz 下载完成")
         except K8sError as e:
             _log(f"kubeasz_offline.tgz 下载失败: {e}")
@@ -1101,10 +1048,10 @@ SCRIPT""")
 
     # ── extract kubeasz_offline.tgz ──
     report(55, "正在解压 kubeasz 离线包...")
-    if not _dir_exists("/etc/kubeasz/roles"):
+    if not ssh.dir_exists("/etc/kubeasz/roles"):
         _log("解压 kubeasz_offline.tgz → /etc")
         try:
-            _sh("tar xzf /home/k8s/kubeasz_offline.tgz -C /etc", timeout=300)
+            ssh.exec("sudo tar xzf /home/k8s/kubeasz_offline.tgz -C /etc", timeout=300)
             _log("解压完成")
         except K8sError as e:
             _log(f"解压失败: {e}")
@@ -1116,10 +1063,10 @@ SCRIPT""")
 
     # ── ezdown: download dependencies ──
     report(65, "正在部署 ezdown 依赖...")
-    if not _sh_out("which docker || true"):
+    if not ssh.exec_with_output("which docker || true"):
         _log("执行: sudo /home/k8s/ezdown -D")
         try:
-            _sh("sudo /home/k8s/ezdown -D", timeout=600)
+            ssh.exec("sudo /home/k8s/ezdown -D", timeout=600)
             _log("ezdown -D 下载完成")
         except K8sError as e:
             _log(f"ezdown -D 失败: {e}")
@@ -1131,11 +1078,11 @@ SCRIPT""")
 
     # ── ezdown: create kubeasz container ──
     report(75, "正在创建 kubeasz 容器...")
-    _container_name = _sh_out("docker ps -a --format '{{.Names}}' | grep -w kubeasz || true")
+    _container_name = ssh.exec_with_output("sudo docker ps -a --format '{{.Names}}' | grep -w kubeasz || true")
     if not _container_name:
         _log("执行: sudo /home/k8s/ezdown -S")
         try:
-            _sh("sudo /home/k8s/ezdown -S", timeout=120)
+            ssh.exec("sudo /home/k8s/ezdown -S", timeout=120)
             _log("kubeasz 容器创建完成")
         except K8sError as e:
             _log(f"ezdown -S 失败: {e}")
@@ -1148,10 +1095,10 @@ SCRIPT""")
     # ── ezctl new + config ──
     report(80, "正在检查集群配置文件...")
     cluster_dir = f"/etc/kubeasz/clusters/{name}"
-    if not _dir_exists(cluster_dir):
+    if not ssh.dir_exists(cluster_dir):
         _log(f"执行: docker exec kubeasz ezctl new {name}")
         try:
-            _sh(f"docker exec kubeasz ezctl new {name}", timeout=60)
+            ssh.exec(f"sudo docker exec kubeasz ezctl new {name}", timeout=60)
             _log("ezctl new 完成")
         except K8sError as e:
             _log(f"ezctl new 失败: {e}")
@@ -1168,24 +1115,18 @@ SCRIPT""")
     _log(f"master 节点: {masters}")
     _log(f"node 节点:   {nodes}")
 
-    # Resolve IPs: 优先使用预分配的 IP，fallback 到 Guest Agent
+    # Resolve IPs: 使用预分配的 IP
     report(82, "正在获取节点 IP 地址...")
-    _log("获取节点 IP（优先使用预分配 IP，fallback Guest Agent）")
+    _log("获取节点 IP（使用预分配 IP）")
     master_ips = {}
     node_ips = {}
     for vm_name in masters + nodes:
         vm_info = cluster["vms"][vm_name]
         ip = vm_info.get("ip")
         if ip:
-            _log(f"{vm_name}: 使用预分配 IP = {ip}")
+            _log(f"{vm_name}: IP = {ip}")
         else:
-            try:
-                ip = pve.get_vm_ip(vm_info["node"], vm_info["vmid"])
-                _log(f"{vm_name}: Guest Agent IP = {ip}")
-            except Exception:
-                pass
-        if not ip:
-            _log(f"{vm_name}: 无法获取 IP，使用主机名")
+            _log(f"{vm_name}: 无预分配 IP，使用主机名")
         role = vm_info.get("role")
         if role == "master":
             master_ips[vm_name] = ip or vm_name
@@ -1194,7 +1135,7 @@ SCRIPT""")
 
     # hosts: 读取已生成的文件，只替换三个占位符
     _log(f"读取已有 hosts 文件: {cluster_dir}/hosts")
-    _tmpl = _sh_out(f"cat {cluster_dir}/hosts")
+    _tmpl = ssh.exec_with_output(f"sudo cat {cluster_dir}/hosts")
 
     _tmpl = _tmpl.replace("{{etcd_server}}", "\n".join(
         master_ips[m] for m in masters
@@ -1208,9 +1149,7 @@ SCRIPT""")
 
     _log("写入 hosts 文件")
     try:
-        r = pve.guest_exec(node, vmid,
-            ["tee", f"{cluster_dir}/hosts"], input_data=_tmpl)
-        _guest_exec_wait(pve, node, vmid, r)
+        ssh.write_file(f"{cluster_dir}/hosts", _tmpl, sudo=True)
         _log("hosts 文件写入完成")
     except K8sError as e:
         _log(f"hosts 文件写入失败: {e}")
@@ -1220,7 +1159,7 @@ SCRIPT""")
 
     # config.yml: INSTALL_SOURCE
     _log("修改 config.yml: INSTALL_SOURCE=offline")
-    _sh(f"""sed -i 's/^INSTALL_SOURCE: "online"/INSTALL_SOURCE: "offline"/' {f_config}""")
+    ssh.exec(f"""sudo sed -i 's/^INSTALL_SOURCE: "online"/INSTALL_SOURCE: "offline"/' {f_config}""")
 
     # MASTER_CERT_HOSTS: 替换示例 IP 为第一个 master 的真实 IP (非致命)
     if masters:
@@ -1229,15 +1168,15 @@ SCRIPT""")
         _log(f"更新 MASTER_CERT_HOSTS: {_master0} → {_master0_ip}")
         _prefix = "'s/^  - \"10\\.1\\.1\\.1\"/  - \"'"
         _suffix = "'\"/'"
-        _sh(f"sed -i {_prefix}{_master0_ip}{_suffix} {f_config} && "
-            f"sed -i '/k8s\\.easzlab\\.io/s/^/#/' {f_config} || true")
+        ssh.exec(f"sudo sed -i {_prefix}{_master0_ip}{_suffix} {f_config} && "
+                 f"sudo sed -i '/k8s\\.easzlab\\.io/s/^/#/' {f_config} || true")
 
     # ── 实际安装 K8s ──
     report(92, "正在检查 K8s 集群安装状态...")
-    if not _file_exists(f"{cluster_dir}/kubeconfig"):
+    if not ssh.file_exists(f"{cluster_dir}/kubeconfig"):
         _log("开始安装 Kubernetes 集群（预计 15-30 分钟）...")
         try:
-            _sh_with_output(f"sudo docker exec kubeasz ezctl setup {name} all")
+            ssh.exec_streaming(f"sudo docker exec kubeasz ezctl setup {name} all", log_callback=_log)
             _log("Kubernetes 集群安装完成")
         except K8sError as e:
             _log(f"集群安装失败: {e}")
@@ -1251,15 +1190,15 @@ SCRIPT""")
     report(97, "正在下载 kubeconfig...")
     _kube_dir = "/home/k8s/.kube"
     _kubeconfig_path = f"{_kube_dir}/config"
-    if not _file_exists(_kubeconfig_path):
+    if not ssh.file_exists(_kubeconfig_path):
         _log(f"创建目录 {_kube_dir}")
-        _sh(f"mkdir -p {_kube_dir} && chown k8s:k8s {_kube_dir}")
+        ssh.exec(f"mkdir -p {_kube_dir} && chown k8s:k8s {_kube_dir}")
         _log(f"从第一个 master 节点下载 kubeconfig → {_kubeconfig_path}")
         try:
             first_master_ip = master_ips[masters[0]]
-            _sh(f"ssh -o StrictHostKeyChecking=no root@{first_master_ip} "
-                f"'cat /root/.kube/config' > {_kubeconfig_path} && "
-                f"chown k8s:k8s {_kubeconfig_path}")
+            ssh.exec(f"ssh -o StrictHostKeyChecking=no root@{first_master_ip} "
+                     f"'cat /root/.kube/config' > {_kubeconfig_path} && "
+                     f"chown k8s:k8s {_kubeconfig_path}")
             _log("kubeconfig 下载完成")
         except Exception as e:
             _log(f"kubeconfig 下载失败（可手动下载）: {e}")
@@ -1268,11 +1207,11 @@ SCRIPT""")
 
     # ── 安装 kubectl ──
     report(98, "正在安装 kubectl...")
-    if not _file_exists("/usr/local/bin/kubectl"):
+    if not ssh.file_exists("/usr/local/bin/kubectl"):
         _log("从 /etc/kubeasz/bin/kubectl 安装 kubectl")
         try:
-            _sh("cp /etc/kubeasz/bin/kubectl /usr/local/bin/kubectl && "
-                "chmod 755 /usr/local/bin/kubectl")
+            ssh.exec("sudo cp /etc/kubeasz/bin/kubectl /usr/local/bin/kubectl && "
+                     "sudo chmod 755 /usr/local/bin/kubectl")
             _log("kubectl 安装完成")
         except Exception as e:
             _log(f"kubectl 安装失败（可手动安装）: {e}")
@@ -1284,7 +1223,7 @@ SCRIPT""")
     _log("开始验证集群连通性")
     try:
         _log("验证 DNS 解析: nslookup kubernetes.default.svc.cluster.local")
-        _sh("nslookup kubernetes.default.svc.cluster.local || nslookup kubernetes.default || echo 'DNS 验证跳过'", timeout=30)
+        ssh.exec("nslookup kubernetes.default.svc.cluster.local || nslookup kubernetes.default || echo 'DNS 验证跳过'", timeout=30)
         _log("DNS 验证完成")
     except Exception as e:
         _log(f"DNS 验证警告: {e}")
@@ -1293,7 +1232,7 @@ SCRIPT""")
     if masters:
         first_master_ip = master_ips[masters[0]]
         try:
-            _sh(f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{first_master_ip} 'echo SSH_OK'", timeout=30)
+            ssh.exec(f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{first_master_ip} 'echo SSH_OK'", timeout=30)
             _log(f"SSH 连通性验证完成: root@{first_master_ip}")
         except Exception as e:
             _log(f"SSH 验证警告: {e}")
@@ -1302,6 +1241,8 @@ SCRIPT""")
     _log("更新集群 K8s 状态为 installed")
     cluster["k8s_status"] = "installed"
     save_cluster(name, cluster)
+
+    ssh.close()
 
     _log("K8s 部署完成")
     report(100, "K8s 部署完成")
