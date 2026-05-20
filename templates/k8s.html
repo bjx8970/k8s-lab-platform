@@ -2,7 +2,7 @@
 {% block page_heading %}K8s集群管理{% endblock %}
 {% block content %}
 
-{% if g.user.role in ('admin', 'teacher') %}
+{% if current_user.role in ('admin', 'teacher') %}
 <div style="margin-bottom:16px">
     <button class="btn btn-primary" onclick="openCreateForm()">+ 新建集群</button>
 </div>
@@ -41,14 +41,14 @@
             <div class="form-group"><label>子节点 CPU 核心</label><input id="form-node-cores" class="form-control" type="number" value="4"></div>
             <div class="form-group"><label>子节点内存 (MB)</label><input id="form-node-mem" class="form-control" type="number" value="4096"></div>
             <div class="form-group" style="grid-column:1/-1"><label>client 密码</label><input id="form-password" class="form-control" type="text" value="k8s.1234"></div>
-            {% if g.user.role == 'teacher' %}
+            {% if current_user.role == 'teacher' %}
             <div class="form-group"><label>课程</label><select id="form-class" class="form-control"><option value="">-- 请选择 --</option></select></div>
             <div class="form-group" style="grid-column:1/-1"><label>组（不选 = 演示集群，勾选多个用于批量创建）</label><div id="form-group-container" class="checkbox-group"></div></div>
             {% endif %}
         </div>
         <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn btn-primary" id="btn-create" onclick="createCluster()">创建集群</button>
-            {% if g.user.role == 'teacher' %}
+            {% if current_user.role == 'teacher' %}
             <button class="btn" id="btn-batch" onclick="batchCreate()">批量创建</button>
             {% endif %}
             <button class="btn" onclick="closeCreateForm()" style="margin-left:auto">取消</button>
@@ -79,7 +79,7 @@
 
 <script>
 const API = '/api/k8s';
-const USER_ROLE = '{{ g.user.role }}';
+const USER_ROLE = '{{ current_user.role }}';
 const OPENWRT_HOST = '{{ (get_config("openwrt") or {}).get("host", "") }}';
 
 let _forceDeleteName = '';
@@ -209,7 +209,7 @@ async function createCluster() {
             node_cores: parseInt($('form-node-cores').value) || 4,
             node_memory: parseInt($('form-node-mem').value) || 4096,
             password: $('form-password').value.trim() || 'k8s.1234',
-            {% if g.user.role == 'teacher' %}
+            {% if current_user.role == 'teacher' %}
             group_id: (function(){
                 const c = document.querySelectorAll('#form-group-container input[type=checkbox]:checked');
                 return c.length ? parseInt(c[0].value) : null;
@@ -380,7 +380,7 @@ async function loadPVEServers() {
     }
 }
 
-{% if g.user.role == 'teacher' %}
+{% if current_user.role == 'teacher' %}
 async function loadClasses() {
     try {
         const res = await fetch('/api/classes');
@@ -418,7 +418,7 @@ async function loadGroups() {
 
 document.addEventListener('DOMContentLoaded', async function() {
     const tasks = [loadPVEServers(), loadClusters()];
-    {% if g.user.role == 'teacher' %}
+    {% if current_user.role == 'teacher' %}
     tasks.push(loadClasses());
     if ($('form-class')) $('form-class').addEventListener('change', loadGroups);
     {% endif %}

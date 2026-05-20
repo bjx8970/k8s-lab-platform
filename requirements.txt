@@ -22,3 +22,5 @@ sqlalchemy==2.0.49
 urllib3==2.7.0
 Werkzeug==3.1.8
 gunicorn
+flask-login==0.6.3
+flask-wtf==1.2.2

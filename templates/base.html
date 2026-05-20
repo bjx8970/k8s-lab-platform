@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>K8s Lab Platform - 管理后台</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -172,18 +173,18 @@
     <div class="sidebar">
         <div class="sidebar-header">K8s Lab <span>Platform</span></div>
         <ul class="nav">
-            {% if g.user.role in ('admin', 'teacher') %}
+            {% if current_user.role in ('admin', 'teacher') %}
             <li><a href="/" class="{% if request.path == '/' %}active{% endif %}"><span class="icon">&#9751;</span> 仪表盘</a></li>
             {% endif %}
-            {% if g.user.role in ('admin', 'teacher') %}
+            {% if current_user.role in ('admin', 'teacher') %}
             <li><a href="/users" class="{% if request.path == '/users' %}active{% endif %}"><span class="icon">&#128101;</span> 用户管理</a></li>
             <li><a href="/classes" class="{% if request.path == '/classes' %}active{% endif %}"><span class="icon">&#128218;</span> 课程管理</a></li>
             <li><a href="/k8s" class="{% if request.path == '/k8s' %}active{% endif %}"><span class="icon">&#9729;</span> K8s集群管理</a></li>
             {% endif %}
-            {% if g.user.role == 'student' %}
+            {% if current_user.role == 'student' %}
             <li><a href="/" class="{% if request.path == '/' %}active{% endif %}"><span class="icon">&#9729;</span> 我的集群</a></li>
             {% endif %}
-            {% if g.user.role == 'admin' %}
+            {% if current_user.role == 'admin' %}
             <li><a href="/pve" class="{% if request.path == '/pve' %}active{% endif %}"><span class="icon">&#9881;</span> PVE连接管理</a></li>
             <li><a href="/openwrt" class="{% if request.path == '/openwrt' %}active{% endif %}"><span class="icon">&#9729;</span> OpenWrt管理</a></li>
             <li><a href="/db" class="{% if request.path == '/db' %}active{% endif %}"><span class="icon">&#128451;</span> 数据库管理</a></li>
@@ -194,7 +195,7 @@
         <div class="header">
             <h2>{% block page_heading %}仪表盘{% endblock %}</h2>
             <div style="display:flex;align-items:center;gap:12px">
-                {% if g.user.role in ('admin', 'teacher') %}
+                {% if current_user.role in ('admin', 'teacher') %}
                 <div id="task-list-widget" style="position:relative">
                     <button id="task-list-btn" onclick="toggleTaskPanel()" style="padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">
                         任务列表 <span id="task-badge" style="display:none;background:#ff4d4f;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px">0</span>
@@ -209,7 +210,7 @@
                 </div>
                 {% endif %}
                 <div class="user-info" style="display:flex;align-items:center;gap:12px">
-                    <span>{{ g.user.username if g.user.role == 'admin' else (g.user.name or g.user.username) }}@k8s-lab ({{ {'admin':'管理员','teacher':'教师','student':'学生'}.get(g.user.role, g.user.role) }})</span>
+                    <span>{{ current_user.username if current_user.role == 'admin' else (current_user.name or current_user.username) }}@k8s-lab ({{ {'admin':'管理员','teacher':'教师','student':'学生'}.get(current_user.role, current_user.role) }})</span>
                     <button onclick="logout()" style="padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">退出</button>
                 </div>
             </div>
@@ -229,13 +230,28 @@
         </div>
     </div>
     <script>
+    (function() {
+        var token = document.querySelector('meta[name="csrf-token"]');
+        var csrfToken = token ? token.content : '';
+        var _origFetch = window.fetch;
+        window.fetch = function(url, opts) {
+            opts = opts || {};
+            if (['POST', 'PUT', 'DELETE', 'PATCH'].indexOf((opts.method||'GET').toUpperCase()) >= 0) {
+                opts.headers = opts.headers || {};
+                if (!opts.headers['X-CSRFToken']) {
+                    opts.headers['X-CSRFToken'] = csrfToken;
+                }
+            }
+            return _origFetch.call(window, url, opts);
+        };
+    })();
     async function logout() {
         await fetch('/api/logout', { method: 'POST' });
         window.location.href = '/login';
     }
     </script>
 
-{% if g.user.role in ('admin', 'teacher') %}
+{% if current_user.role in ('admin', 'teacher') %}
 <script>
 var _taskPanelOpen = false;
 

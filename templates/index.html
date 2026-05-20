@@ -14,7 +14,7 @@
         <div class="label">K8s集群数</div>
         <div class="value" id="stat-clusters">-</div>
     </div>
-    {% if g.user.role == 'admin' %}
+    {% if current_user.role == 'admin' %}
     <div class="stat-card">
         <div class="label">PVE连接数</div>
         <div class="value" id="stat-pve">-</div>
@@ -22,10 +22,10 @@
     {% endif %}
 </div>
 <div class="card">
-    <p>欢迎使用 K8s Lab Platform 管理后台，{{ g.user.username }}（{{ {'admin':'管理员','teacher':'教师','student':'学生'}.get(g.user.role, g.user.role) }}）。</p>
+    <p>欢迎使用 K8s Lab Platform 管理后台，{{ current_user.username }}（{{ {'admin':'管理员','teacher':'教师','student':'学生'}.get(current_user.role, current_user.role) }}）。</p>
 </div>
 
-{% if g.user.role == 'teacher' %}
+{% if current_user.role == 'teacher' %}
 <div id="class-clusters-section" style="margin-top:24px"></div>
 {% endif %}
 
@@ -38,7 +38,7 @@
 </style>
 
 <script>
-const USER_ROLE = '{{ g.user.role }}';
+const USER_ROLE = '{{ current_user.role }}';
 var vmStatusCache = {};
 
 function escStats(s) {
