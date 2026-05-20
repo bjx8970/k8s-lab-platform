@@ -1,4 +1,5 @@
 import os
+import time
 from functools import wraps
 
 from flask import Flask, render_template, request, jsonify, redirect, g, make_response, session
@@ -26,6 +27,9 @@ from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s
 from modules.pg_client import PGClient, PGError
 from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor, update_vm_status
 
+from flask_socketio import SocketIO, emit
+from modules.ssh_terminal import SSHManager, SSHConnectionError, TooManyConnectionsError
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
 app.config["PERMANENT_SESSION_LIFETIME"] = 3600 * 8  # 8 小时
@@ -37,6 +41,10 @@ login_manager.login_view = "login_page"
 login_manager.login_message = None
 
 csrf = CSRFProtect(app)
+
+socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*", manage_session=False)
+ssh_manager = SSHManager(max_connections=64, idle_timeout=900)
+ssh_manager.init_app(socketio)
 
 
 @login_manager.user_loader
@@ -1882,5 +1890,117 @@ def db_test():
         client.close()
 
 
+# ── WebSSH ──
+
+_webssh_connect_times = {}
+
+@socketio.on("connect", namespace="/webssh")
+def webssh_connect():
+    if not current_user.is_authenticated:
+        return False
+
+@socketio.on("ssh_connect", namespace="/webssh")
+def webssh_ssh_connect(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
+
+    cluster_name = data.get("cluster", "")
+    if not cluster_name:
+        emit("ssh_error", {"message": "缺少集群名称"})
+        return
+
+    if not _check_cluster_access(cluster_name):
+        emit("ssh_error", {"message": "无权访问该集群"})
+        return
+
+    cluster = get_cluster(cluster_name)
+    if not cluster:
+        emit("ssh_error", {"message": "集群不存在"})
+        return
+
+    if cluster.get("status") != "running":
+        emit("ssh_error", {"message": "集群未运行，请先启动虚拟机"})
+        return
+
+    client_vm = None
+    for vm_name, vm_info in cluster.get("vms", {}).items():
+        if vm_info.get("role") == "client":
+            client_vm = vm_info
+            break
+
+    if not client_vm:
+        emit("ssh_error", {"message": "未找到客户端虚拟机"})
+        return
+
+    now = time.time()
+    sid = request.sid
+    prev = _webssh_connect_times.get(sid, 0)
+    if now - prev < 30:
+        emit("ssh_error", {"message": "操作过于频繁，请稍后再试"})
+        return
+    _webssh_connect_times[sid] = now
+
+    openwrt_cfg = get_config("openwrt") or {}
+    host = openwrt_cfg.get("host", "")
+    port = cluster.get("ssh_port", 22)
+    username = "k8s"
+    password = cluster.get("password", "k8s.1234")
+
+    try:
+        ssh_manager.create(
+            sid, host, port, username, password, cluster_name, timeout=10,
+            user_info={"id": current_user.id, "username": current_user.username, "role": current_user.role},
+        )
+        emit("ssh_connected", {"message": "已连接到 " + cluster_name})
+    except TooManyConnectionsError as e:
+        emit("ssh_error", {"message": str(e)})
+    except SSHConnectionError as e:
+        emit("ssh_error", {"message": str(e)})
+    except Exception as e:
+        emit("ssh_error", {"message": f"连接失败: {e}"})
+
+@socketio.on("ssh_data", namespace="/webssh")
+def webssh_ssh_data(data):
+    raw = data.get("data", "")
+    if raw and len(raw) <= 4096:
+        ssh_manager.write(request.sid, raw)
+
+@socketio.on("ssh_resize", namespace="/webssh")
+def webssh_ssh_resize(data):
+    cols = data.get("cols", 80)
+    rows = data.get("rows", 24)
+    ssh_manager.resize(request.sid, cols, rows)
+
+@socketio.on("disconnect", namespace="/webssh")
+def webssh_disconnect():
+    ssh_manager.remove(request.sid)
+    _webssh_connect_times.pop(request.sid, None)
+
+
+# ── Admin WebSSH Management ──
+
+@app.route("/admin/webssh")
+@login_required
+@admin_required
+def admin_webssh():
+    return render_template("admin_webssh.html")
+
+@app.route("/api/admin/webssh/connections", methods=["GET"])
+@login_required
+@admin_required
+def api_admin_webssh_list():
+    return jsonify({"connections": ssh_manager.list_connections()})
+
+@app.route("/api/admin/webssh/connections/<sid>", methods=["DELETE"])
+@login_required
+@admin_required
+def api_admin_webssh_disconnect(sid):
+    ok = ssh_manager.disconnect_by_sid(sid)
+    if ok:
+        return jsonify({"message": "已断开连接"})
+    return jsonify({"error": "连接不存在"}), 404
+
+
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    socketio.run(app, debug=True, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)

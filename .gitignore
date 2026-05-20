@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.db
 .db_config.json
+.secret_key

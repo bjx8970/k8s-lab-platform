@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block page_heading %}WebSSH 连接管理{% endblock %}
+{% block content %}
+
+<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div>
+            <span style="font-size:14px;color:#666">当前活跃连接：</span>
+            <span id="conn-count" style="font-size:20px;font-weight:700;color:#1890ff">0</span>
+            <span style="font-size:13px;color:#999;margin-left:8px">/ 64</span>
+        </div>
+        <button onclick="refreshConnections()" class="btn" id="refresh-btn">刷新</button>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>用户</th>
+                <th>角色</th>
+                <th>集群</th>
+                <th>目标地址</th>
+                <th>连接时长</th>
+                <th>闲置时间</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody id="conn-table">
+            <tr><td colspan="7" style="text-align:center;color:#999;padding:40px 0">加载中...</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<style>
+.idle-warning { color: #faad14; }
+.idle-danger { color: #ff4d4f; }
+</style>
+
+<script>
+var _refreshTimer = null;
+
+function formatDuration(seconds) {
+    if (seconds < 60) return seconds + 's';
+    var m = Math.floor(seconds / 60);
+    var s = seconds % 60;
+    if (m < 60) return m + 'm ' + s + 's';
+    var h = Math.floor(m / 60);
+    var rm = m % 60;
+    return h + 'h ' + rm + 'm';
+}
+
+function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function refreshConnections() {
+    var btn = document.getElementById('refresh-btn');
+    btn.disabled = true;
+    btn.textContent = '刷新中...';
+    try {
+        var r = await fetch('/api/admin/webssh/connections');
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '加载失败');
+        renderConnections(d.connections || []);
+    } catch (e) {
+        document.getElementById('conn-table').innerHTML = '<tr><td colspan="7" style="text-align:center;color:#ff4d4f;padding:20px">' + esc(e.message) + '</td></tr>';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '刷新';
+    }
+}
+
+function renderConnections(conns) {
+    document.getElementById('conn-count').textContent = conns.length;
+    if (conns.length === 0) {
+        document.getElementById('conn-table').innerHTML = '<tr><td colspan="7" style="text-align:center;color:#999;padding:40px 0">暂无活跃连接</td></tr>';
+        return;
+    }
+
+    var html = '';
+    for (var i = 0; i < conns.length; i++) {
+        var c = conns[i];
+        var idleClass = c.idle_seconds > 600 ? 'idle-danger' : (c.idle_seconds > 300 ? 'idle-warning' : '');
+        var roleBadge = c.user_role === 'student' ? 'badge-blue' : (c.user_role === 'teacher' ? 'badge-green' : 'badge-orange');
+        var roleLabel = c.user_role === 'student' ? '学生' : (c.user_role === 'teacher' ? '教师' : '管理员');
+
+        html += '<tr>' +
+            '<td>' + esc(c.user) + '</td>' +
+            '<td><span class="badge ' + roleBadge + '">' + roleLabel + '</span></td>' +
+            '<td>' + esc(c.cluster) + '</td>' +
+            '<td><code style="background:#f5f5f5;padding:2px 6px;border-radius:3px;font-size:12px">' + esc(c.host) + ':' + c.port + '</code></td>' +
+            '<td>' + formatDuration(c.idle_seconds) + '</td>' +
+            '<td class="' + idleClass + '">' + formatDuration(c.idle_seconds) + '</td>' +
+            '<td><button class="btn btn-sm btn-danger" onclick="disconnectConn(\'' + c.sid + '\')">断开</button></td>' +
+            '</tr>';
+    }
+    document.getElementById('conn-table').innerHTML = html;
+}
+
+async function disconnectConn(sid) {
+    if (!await showConfirm('确定断开该连接？')) return;
+    try {
+        var r = await fetch('/api/admin/webssh/connections/' + encodeURIComponent(sid), { method: 'DELETE' });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '断开失败');
+        showToast(d.message, 'success');
+        refreshConnections();
+    } catch (e) {
+        showToast('断开失败: ' + e.message, 'error');
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    refreshConnections();
+    _refreshTimer = setInterval(refreshConnections, 10000);
+});
+</script>
+{% endblock %}
