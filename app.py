@@ -22,6 +22,7 @@ from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster
 from modules.pg_client import PGClient, PGError
+from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
@@ -32,6 +33,8 @@ if is_db_configured():
     migrate_from_json(os.path.join(_base_dir, ".k8s_clusters.json"))
     migrate_config_from_json("pve", os.path.join(_base_dir, ".pve_config.json"))
     migrate_config_from_json("openwrt", os.path.join(_base_dir, ".openwrt_config.json"))
+
+start_status_monitor()
 
 
 @app.context_processor
@@ -973,8 +976,24 @@ def pve_get_vms():
 def pve_get_vm_status(node, vmid):
     if not _check_vm_access(node, vmid):
         return jsonify({"error": "无权访问该虚拟机"}), 403
-    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
-    return jsonify(client.get_vm_status(node, vmid))
+    return jsonify(get_cached_vm_status(node, vmid))
+
+
+@app.route("/api/pve/vms/status/batch", methods=["POST"])
+@login_required
+@api_error_handler
+def pve_get_vms_status_batch():
+    data = request.get_json() or {}
+    vms = data.get("vms", [])
+    results = {}
+    for vm in vms:
+        node = vm.get("node")
+        vmid = vm.get("vmid")
+        if not node or not vmid:
+            continue
+        key = f"{node}_{vmid}"
+        results[key] = get_cached_vm_status(node, vmid, no_fallback=True)
+    return jsonify({"statuses": results})
 
 
 @app.route("/api/pve/vms/<node>/<int:vmid>/config", methods=["GET"])

@@ -550,6 +550,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             cfg = {
                 "name": vm_name,
                 "full": 0,
+                "agent": 1,
                 "ciuser": "k8s",
                 "cipassword": password,
                 "sshkeys": quote(pub_key.strip(), safe=''),
@@ -1014,6 +1015,34 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     cluster["k8s_status"] = "installing"
     save_cluster(name, cluster)
     _log("集群 K8s 状态已更新为 installing")
+
+    # ── 加固 qemu-guest-agent (Restart=always + crontab 保活) ──
+    report(28, "正在加固 qemu-guest-agent...")
+    _log("写入加固脚本 → /tmp/harden-agent.sh")
+    _sh("""cat > /tmp/harden-agent.sh << 'SCRIPT'
+set -e
+mkdir -p /etc/systemd/system/qemu-guest-agent.service.d
+cat > /etc/systemd/system/qemu-guest-agent.service.d/override.conf << 'ENDCFG'
+[Service]
+Restart=always
+RestartSec=10
+OOMScoreAdjust=-500
+ENDCFG
+systemctl daemon-reload
+systemctl restart qemu-guest-agent
+(crontab -l 2>/dev/null | grep -v 'qemu-guest-agent'; echo '* * * * * systemctl is-active qemu-guest-agent || systemctl restart qemu-guest-agent') | crontab -
+SCRIPT""")
+    _log("client VM: 执行加固脚本")
+    _sh("bash /tmp/harden-agent.sh")
+    for _vm_name, _vm_info in cluster.get("vms", {}).items():
+        if _vm_info.get("role") == "client":
+            continue
+        _log(f"{_vm_name}: SSH 远程执行加固脚本 ({_vm_info['ip']})")
+        try:
+            _sh(f"ssh -o StrictHostKeyChecking=no root@{_vm_info['ip']} 'bash -s' < /tmp/harden-agent.sh", timeout=120)
+        except Exception as _e:
+            _log(f"{_vm_name}: 加固失败 ({_e})")
+    _log("所有节点 qemu-guest-agent 加固完成")
 
     # ── ezdown ──
     report(30, "正在下载 ezdown...")

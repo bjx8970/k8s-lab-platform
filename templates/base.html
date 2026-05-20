@@ -245,6 +245,7 @@ function shortId(id) {
 }
 
 async function pollTaskList() {
+    if (!_taskPanelOpen) return;
     try {
         var r = await fetch('/api/k8s/tasks');
         var d = await r.json();

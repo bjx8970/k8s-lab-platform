@@ -9,7 +9,10 @@
 {% endif %}
 
 <div class="card">
-    <h3 style="margin-bottom:16px">集群列表</h3>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 style="margin:0">集群列表</h3>
+        <button class="btn btn-sm" onclick="loadClusters()">🔄 刷新状态</button>
+    </div>
     <div id="cluster-list" style="font-size:14px">加载中...</div>
 </div>
 
@@ -161,28 +164,41 @@ async function loadClusters() {
             '</div>';
         }
         el.innerHTML = html;
-        if (isStudent) refreshVmStatuses(clusters);
+        refreshVmStatuses(clusters);
     } catch (e) {
         el.innerHTML = '<p style="color:#ff4d4f">加载失败: ' + e.message + '</p>';
     }
 }
 
 async function refreshVmStatuses(clusters) {
-    const tasks = [];
+    const vmList = [];
+    const vmMap = {};
     for (const [name, c] of Object.entries(clusters)) {
         if (!c.vms) continue;
         for (const [, vm] of Object.entries(c.vms)) {
             const el = document.getElementById('vm-' + name + '-' + vm.vmid);
             if (!el) continue;
-            tasks.push(
-                fetch('/api/pve/vms/' + encodeURIComponent(vm.node) + '/' + vm.vmid + '/status')
-                    .then(r => r.json())
-                    .then(d => { el.className = 'vm-tag' + (d.status === 'running' ? ' vm-running' : ' vm-stopped'); })
-                    .catch(() => { el.className = 'vm-tag vm-stopped'; })
-            );
+            const key = vm.node + '_' + vm.vmid;
+            vmList.push({node: vm.node, vmid: vm.vmid});
+            vmMap[key] = el;
         }
     }
-    await Promise.all(tasks);
+    if (!vmList.length) return;
+    try {
+        const res = await fetch('/api/pve/vms/status/batch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({vms: vmList}),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'batch failed');
+        for (const [key, st] of Object.entries(data.statuses || {})) {
+            const el = vmMap[key];
+            if (el) el.className = 'vm-tag' + (st.status === 'running' ? ' vm-running' : ' vm-stopped');
+        }
+    } catch {
+        for (const el of Object.values(vmMap)) el.className = 'vm-tag vm-stopped';
+    }
 }
 
 async function createCluster() {
