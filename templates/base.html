@@ -195,7 +195,7 @@
             <div style="display:flex;align-items:center;gap:12px">
                 {% if g.user.role in ('admin', 'teacher') %}
                 <div id="task-list-widget" style="position:relative">
-                    <button id="task-list-btn" onclick="toggleTaskPanel()" style="display:none;padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">
+                    <button id="task-list-btn" onclick="toggleTaskPanel()" style="padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">
                         任务列表 <span id="task-badge" style="display:none;background:#ff4d4f;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px">0</span>
                     </button>
                     <div id="task-panel" style="display:none;position:absolute;right:0;top:100%;width:400px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg);z-index:1001;max-height:480px;overflow-y:auto;margin-top:4px">
@@ -262,16 +262,11 @@ function renderTaskList(tasks) {
     var recent = tasks.filter(function(t) { return t.status !== 'running'; });
 
     var badge = document.getElementById('task-badge');
-    var btn = document.getElementById('task-list-btn');
     if (running.length > 0) {
         badge.style.display = '';
         badge.textContent = running.length;
-        btn.style.display = '';
-    } else if (recent.length > 0) {
-        badge.style.display = 'none';
-        btn.style.display = '';
     } else {
-        btn.style.display = 'none';
+        badge.style.display = 'none';
     }
 
     if (!_taskPanelOpen) return;
@@ -360,7 +355,6 @@ document.addEventListener('click', function(e) {
     }
 });
 
-setTimeout(pollTaskList, 1000);
 </script>
 {% endif %}
 </body>
