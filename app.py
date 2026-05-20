@@ -1,7 +1,9 @@
 import os
 from functools import wraps
 
-from flask import Flask, render_template, request, jsonify, session, redirect, g, make_response
+from flask import Flask, render_template, request, jsonify, redirect, g, make_response, session
+from flask_login import LoginManager, login_user, logout_user, login_required as flask_login_required, current_user
+from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from modules.db import (
@@ -26,6 +28,28 @@ from modules.status_cache import get_vm_status as get_cached_vm_status, start_mo
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
+app.config["PERMANENT_SESSION_LIFETIME"] = 3600 * 8  # 8 小时
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+login_manager = LoginManager(app)
+login_manager.login_view = "login_page"
+login_manager.login_message = None
+
+csrf = CSRFProtect(app)
+
+
+@login_manager.user_loader
+def _load_user(user_id):
+    from modules.db import load_user
+    return load_user(user_id)
+
+
+@login_manager.unauthorized_handler
+def _unauthorized():
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "未登录，请先登录"}), 401
+    return redirect("/login")
 
 _base_dir = os.path.dirname(os.path.abspath(__file__))
 if is_db_configured():
@@ -47,18 +71,12 @@ def inject_globals():
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
-        if "user_id" not in session:
+        if not current_user.is_authenticated:
             if request.path.startswith("/api/"):
                 return jsonify({"error": "未登录，请先登录"}), 401
             return redirect("/login")
-        g.user = get_user(session["user_id"])
-        if not g.user:
-            session.clear()
-            if request.path.startswith("/api/"):
-                return jsonify({"error": "用户不存在"}), 401
-            return redirect("/login")
-        if not g.user.get("is_active"):
-            session.clear()
+        if not current_user.is_active:
+            logout_user()
             if request.path.startswith("/api/"):
                 return jsonify({"error": "用户已被禁用"}), 403
             return redirect("/login")
@@ -70,7 +88,7 @@ def role_required(*roles):
     def decorator(f):
         @wraps(f)
         def wrapper(*args, **kwargs):
-            if g.user.get("role") not in roles:
+            if current_user.role not in roles:
                 if request.path.startswith("/api/"):
                     return jsonify({"error": "权限不足"}), 403
                 return render_template("403.html"), 403
@@ -128,16 +146,9 @@ def before_request():
         return
     if _needs_setup() and request.path not in ("/setup", "/api/setup"):
         return redirect("/setup")
-    if request.path in ("/login", "/api/login", "/setup", "/api/setup"):
-        return
-    if "user_id" not in session:
-        if request.path.startswith("/api/"):
-            return jsonify({"error": "未登录"}), 401
-        return redirect("/login")
-    g.user = get_user(session["user_id"])
-    if not g.user or not g.user.get("is_active"):
-        session.clear()
-        return redirect("/login")
+
+    if current_user.is_authenticated:
+        session.permanent = True
 
 
 @app.route("/setup")
@@ -148,6 +159,7 @@ def setup_page():
 
 
 @app.route("/api/setup", methods=["POST"])
+@csrf.exempt
 def api_setup():
     if not _needs_setup():
         return jsonify({"error": "已初始化"}), 400
@@ -166,18 +178,22 @@ def api_setup():
         "password_hash": generate_password_hash(password),
         "role": "admin",
     })
-    session["user_id"] = uid
+    user = get_user_by_username(username)
+    if user:
+        login_user(user)
+        session.permanent = True
     return jsonify({"message": "初始化完成", "user_id": uid})
 
 
 @app.route("/login")
 def login_page():
-    if "user_id" in session:
+    if current_user.is_authenticated:
         return redirect("/")
     return render_template("login.html")
 
 
 @app.route("/api/login", methods=["POST"])
+@csrf.exempt
 def api_login():
     data = request.get_json() or {}
     username = data.get("username", "").strip()
@@ -187,23 +203,25 @@ def api_login():
     user = get_user_by_username(username)
     if not user:
         return jsonify({"error": "用户名或密码错误"}), 401
-    if not user.get("is_active"):
+    if not user.is_active:
         return jsonify({"error": "账号已被禁用"}), 403
-    if not check_password_hash(user["password_hash"], password):
+    if not check_password_hash(user.password_hash, password):
         return jsonify({"error": "用户名或密码错误"}), 401
-    if user["role"] == "student":
-        groups = get_user_groups(user["id"])
+    if user.role == "student":
+        groups = get_user_groups(user.id)
         if not groups:
             return jsonify({"error": "您尚未被分配到课程组，请联系教师"}), 403
-    session["user_id"] = user["id"]
+    login_user(user)
+    session.permanent = True
     return jsonify({"message": "登录成功", "user": {
-        "id": user["id"], "username": user["username"], "role": user["role"],
+        "id": user.id, "username": user.username, "role": user.role,
     }})
 
 
 @app.route("/api/logout", methods=["POST"])
+@csrf.exempt
 def api_logout():
-    session.clear()
+    logout_user()
     return jsonify({"message": "已退出登录"})
 
 
@@ -217,6 +235,7 @@ def db_config_wizard():
 
 
 @app.route("/api/db-config", methods=["POST"])
+@csrf.exempt
 def api_db_config():
     if is_db_configured():
         return jsonify({"error": "数据库已配置"}), 400
@@ -258,12 +277,11 @@ def api_db_config():
 @app.route("/api/users/me", methods=["GET"])
 @login_required
 def api_users_me():
-    u = g.user
-    result = {"id": u["id"], "username": u["username"], "name": u.get("name", ""), "role": u["role"]}
-    if u["role"] == "student":
-        result["classes"] = get_classes_for_student(u["id"])
-    elif u["role"] == "teacher":
-        result["classes"] = list_classes(created_by=u["id"])
+    result = {"id": current_user.id, "username": current_user.username, "name": current_user.name or "", "role": current_user.role}
+    if current_user.role == "student":
+        result["classes"] = get_classes_for_student(current_user.id)
+    elif current_user.role == "teacher":
+        result["classes"] = list_classes(created_by=current_user.id)
     return jsonify(result)
 
 
@@ -271,9 +289,9 @@ def api_users_me():
 @login_required
 def api_list_users():
     role_filter = request.args.get("role")
-    if g.user["role"] == "admin":
+    if current_user.role == "admin":
         users = list_users(role=role_filter)
-    elif g.user["role"] == "teacher":
+    elif current_user.role == "teacher":
         users = list_users(role="student")
     else:
         return jsonify({"error": "权限不足"}), 403
@@ -294,9 +312,9 @@ def api_create_user():
         return jsonify({"error": "无效的角色"}), 400
     if role == "admin":
         return jsonify({"error": "无法创建管理员"}), 403
-    if g.user["role"] == "teacher" and role != "student":
+    if current_user.role == "teacher" and role != "student":
         return jsonify({"error": "教师只能创建学生用户"}), 403
-    if g.user["role"] != "admin" and role in ("admin", "teacher"):
+    if current_user.role != "admin" and role in ("admin", "teacher"):
         return jsonify({"error": "权限不足"}), 403
     existing = get_user_by_username(username)
     if existing:
@@ -306,7 +324,7 @@ def api_create_user():
         "password_hash": generate_password_hash(password),
         "role": role,
         "name": name,
-        "created_by": g.user["id"],
+        "created_by": current_user.id,
     })
     return jsonify({"id": uid, "message": "用户创建成功"}), 201
 
@@ -318,7 +336,7 @@ def api_users_template():
     import csv, io
     output = io.StringIO()
     writer = csv.writer(output)
-    if g.user["role"] == "admin":
+    if current_user.role == "admin":
         writer.writerow(["用户名", "密码", "姓名", "角色"])
         writer.writerow(["zhangsan", "123456", "张三", "student"])
     else:
@@ -344,7 +362,7 @@ def api_users_import():
     reader = csv.DictReader(io.StringIO(content))
     required_cols_teacher = {"用户名", "密码", "姓名"}
     required_cols_admin = {"用户名", "密码", "姓名", "角色"}
-    if g.user["role"] == "admin":
+    if current_user.role == "admin":
         if not reader.fieldnames or not required_cols_admin.issubset(reader.fieldnames):
             return jsonify({"error": "CSV 格式错误，需要列: 用户名, 密码, 姓名, 角色"}), 400
     else:
@@ -361,7 +379,7 @@ def api_users_import():
         if not username or not password:
             result["errors"].append(f"第 {row_num} 行: 用户名和密码不能为空")
             continue
-        if g.user["role"] == "teacher":
+        if current_user.role == "teacher":
             role = "student"
         elif role not in ("student", "teacher"):
             result["errors"].append(f"第 {row_num} 行: 无效的角色 '{role}'")
@@ -379,7 +397,7 @@ def api_users_import():
                 "password_hash": generate_password_hash(password),
                 "role": role,
                 "name": name,
-                "created_by": g.user["id"],
+                "created_by": current_user.id,
             })
             result["created"] += 1
         except Exception as e:
@@ -394,8 +412,8 @@ def api_update_user(uid):
     target = get_user(uid)
     if not target:
         return jsonify({"error": "用户不存在"}), 404
-    if g.user["role"] == "teacher":
-        if target.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher":
+        if target.created_by != current_user.id:
             return jsonify({"error": "只能编辑自己创建的学生"}), 403
     update_data = {}
     if "username" in data:
@@ -417,8 +435,8 @@ def api_delete_user(uid):
     target = get_user(uid)
     if not target:
         return jsonify({"error": "用户不存在"}), 404
-    if g.user["role"] == "teacher":
-        if target.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher":
+        if target.created_by != current_user.id:
             return jsonify({"error": "只能删除自己创建的学生"}), 403
     delete_user(uid)
     return jsonify({"message": "用户已删除"})
@@ -429,12 +447,12 @@ def api_delete_user(uid):
 @app.route("/api/classes", methods=["GET"])
 @login_required
 def api_list_classes():
-    if g.user["role"] == "admin":
+    if current_user.role == "admin":
         classes = list_classes()
-    elif g.user["role"] == "teacher":
-        classes = list_classes(created_by=g.user["id"])
+    elif current_user.role == "teacher":
+        classes = list_classes(created_by=current_user.id)
     else:
-        classes = get_classes_for_student(g.user["id"])
+        classes = get_classes_for_student(current_user.id)
     return jsonify(classes)
 
 
@@ -449,7 +467,7 @@ def api_create_class():
     cid = create_class({
         "name": name,
         "description": data.get("description", ""),
-        "created_by": g.user["id"],
+        "created_by": current_user.id,
     })
     return jsonify({"id": cid, "message": "课程创建成功"}), 201
 
@@ -460,10 +478,10 @@ def api_get_class(cid):
     cls = get_class(cid)
     if not cls:
         return jsonify({"error": "课程不存在"}), 404
-    if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher" and cls.get("created_by") != current_user.id:
         return jsonify({"error": "权限不足"}), 403
-    if g.user["role"] == "student":
-        ok = check_user_in_class_group(g.user["id"], cid)
+    if current_user.role == "student":
+        ok = check_user_in_class_group(current_user.id, cid)
         if not ok:
             return jsonify({"error": "权限不足"}), 403
     return jsonify(cls)
@@ -476,7 +494,7 @@ def api_update_class(cid):
     cls = get_class(cid)
     if not cls:
         return jsonify({"error": "课程不存在"}), 404
-    if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher" and cls.get("created_by") != current_user.id:
         return jsonify({"error": "只能编辑自己创建的课程"}), 403
     data = request.get_json() or {}
     update_data = {}
@@ -496,13 +514,13 @@ def api_delete_class(cid):
     cls = get_class(cid)
     if not cls:
         return jsonify({"error": "课程不存在"}), 404
-    if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher" and cls.get("created_by") != current_user.id:
         return jsonify({"error": "只能删除自己创建的课程"}), 403
     cluster_names = list_cluster_names_by_class_id(cid)
     detach_clusters_from_class(cid)
     task_ids = []
     for name in cluster_names:
-        tid = delete_cluster_async(name, created_by=g.user["id"])
+        tid = delete_cluster_async(name, created_by=current_user.id)
         task_ids.append(tid)
     delete_class(cid)
     return jsonify({
@@ -550,7 +568,7 @@ def api_classes_import():
         if not class_name or not group_name or not username:
             result["errors"].append(f"第 {row_num} 行: 课程名称、组名称、用户名不能为空")
             continue
-        created_by_filter = g.user["id"] if g.user["role"] == "teacher" else None
+        created_by_filter = current_user.id if current_user.role == "teacher" else None
         class_obj = get_class_by_name(class_name, created_by=created_by_filter)
         if not class_obj:
             result["errors"].append(f"第 {row_num} 行: 课程 '{class_name}' 不存在")
@@ -560,8 +578,8 @@ def api_classes_import():
             result["errors"].append(f"第 {row_num} 行: 用户 '{username}' 不存在")
             continue
         try:
-            group_id = get_or_create_group(class_obj["id"], group_name, g.user["id"])
-            add_group_member(group_id, user_obj["id"])
+            group_id = get_or_create_group(class_obj["id"], group_name, current_user.id)
+            add_group_member(group_id, user_obj.id)
             result["created"] += 1
         except ValueError as e:
             result["skipped"] += 1
@@ -583,8 +601,8 @@ def api_list_groups_batch():
     except ValueError:
         return jsonify({"error": "无效的 class_ids 参数"}), 400
 
-    if g.user["role"] == "student":
-        groups = get_user_groups(g.user["id"])
+    if current_user.role == "student":
+        groups = get_user_groups(current_user.id)
         result = {}
         for grp in groups:
             cid = str(grp["class_id"])
@@ -595,8 +613,8 @@ def api_list_groups_batch():
             })
         return jsonify(result)
 
-    if g.user["role"] == "teacher":
-        teacher_classes = list_classes(created_by=g.user["id"])
+    if current_user.role == "teacher":
+        teacher_classes = list_classes(created_by=current_user.id)
         allowed_ids = [c["id"] for c in teacher_classes]
         class_ids = [cid for cid in class_ids if cid in allowed_ids]
 
@@ -624,10 +642,10 @@ def api_list_groups(cid):
     cls = get_class(cid)
     if not cls:
         return jsonify({"error": "课程不存在"}), 404
-    if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher" and cls.get("created_by") != current_user.id:
         return jsonify({"error": "权限不足"}), 403
-    if g.user["role"] == "student":
-        groups = get_user_groups(g.user["id"])
+    if current_user.role == "student":
+        groups = get_user_groups(current_user.id)
         groups_in_class = [g for g in groups if g["class_id"] == cid]
         return jsonify(groups_in_class)
     groups = list_groups(class_id=cid)
@@ -655,12 +673,12 @@ def api_create_group():
     cls = get_class(class_id)
     if not cls:
         return jsonify({"error": "课程不存在"}), 404
-    if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher" and cls.get("created_by") != current_user.id:
         return jsonify({"error": "只能在自己创建的课程中创建组"}), 403
     gid = create_group({
         "name": name,
         "class_id": class_id,
-        "created_by": g.user["id"],
+        "created_by": current_user.id,
     })
     return jsonify({"id": gid, "message": "组创建成功"}), 201
 
@@ -672,13 +690,13 @@ def api_delete_group(gid):
     grp = get_group(gid)
     if not grp:
         return jsonify({"error": "组不存在"}), 404
-    if g.user["role"] == "teacher" and grp.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher" and grp.get("created_by") != current_user.id:
         return jsonify({"error": "只能删除自己创建的组"}), 403
     cluster_names = list_cluster_names_by_group_id(gid)
     detach_clusters_from_group(gid)
     task_ids = []
     for name in cluster_names:
-        tid = delete_cluster_async(name, created_by=g.user["id"])
+        tid = delete_cluster_async(name, created_by=current_user.id)
         task_ids.append(tid)
     delete_group(gid)
     return jsonify({
@@ -707,7 +725,7 @@ def api_add_group_member(gid):
     target = get_user(user_id)
     if not target:
         return jsonify({"error": "用户不存在"}), 404
-    if target["role"] != "student":
+    if target.role != "student":
         return jsonify({"error": "只能将学生加入组"}), 400
     try:
         add_group_member(gid, user_id)
@@ -750,14 +768,14 @@ def _check_vm_access(node, vmid):
     cluster = find_cluster_by_vm(node, vmid)
     if cluster:
         g._vm_cluster = cluster
-    if g.user["role"] == "admin":
+    if current_user.role == "admin":
         return True
     if not cluster:
         return False
-    if g.user["role"] == "teacher":
-        return cluster.get("created_by") == g.user["id"]
-    if g.user["role"] == "student":
-        student_group_ids = get_student_group_ids(g.user["id"])
+    if current_user.role == "teacher":
+        return cluster.get("created_by") == current_user.id
+    if current_user.role == "student":
+        student_group_ids = get_student_group_ids(current_user.id)
         return cluster.get("group_id") in student_group_ids
     return False
 
@@ -777,7 +795,7 @@ def api_error_handler(f):
 @app.route("/")
 @login_required
 def index():
-    if g.user["role"] == "student":
+    if current_user.role == "student":
         return render_template("student.html")
     return render_template("index.html")
 
@@ -1490,28 +1508,28 @@ def openwrt_restart_dnsmasq():
 
 def _check_cluster_access(name):
     """Check if current user can access the named cluster."""
-    if g.user["role"] == "admin":
+    if current_user.role == "admin":
         return True
     cluster = get_cluster(name)
     if not cluster:
         return False
-    if g.user["role"] == "teacher":
-        return cluster.get("created_by") == g.user["id"]
-    if g.user["role"] == "student":
-        student_group_ids = get_student_group_ids(g.user["id"])
+    if current_user.role == "teacher":
+        return cluster.get("created_by") == current_user.id
+    if current_user.role == "student":
+        student_group_ids = get_student_group_ids(current_user.id)
         return cluster.get("group_id") in student_group_ids
     return False
 
 
 def _filter_clusters(clusters_dict):
     """Filter clusters dict based on user role."""
-    if g.user["role"] == "admin":
+    if current_user.role == "admin":
         return clusters_dict
-    if g.user["role"] == "teacher":
-        uid = g.user["id"]
+    if current_user.role == "teacher":
+        uid = current_user.id
         return {k: v for k, v in clusters_dict.items() if v.get("created_by") == uid}
-    if g.user["role"] == "student":
-        group_ids = get_student_group_ids(g.user["id"])
+    if current_user.role == "student":
+        group_ids = get_student_group_ids(current_user.id)
         return {k: v for k, v in clusters_dict.items() if v.get("group_id") in group_ids}
     return {}
 
@@ -1572,7 +1590,7 @@ def k8s_create_cluster():
         password=password,
         pve_server_id=pve_server_id,
     )
-    save_cluster(name, {**cluster, "created_by": g.user["id"]})
+    save_cluster(name, {**cluster, "created_by": current_user.id})
     safe = {k: v for k, v in cluster.items() if k != "ssh_private_key"}
     return jsonify({"name": name, "cluster": safe}), 201
 
@@ -1583,7 +1601,7 @@ def k8s_create_cluster():
 def k8s_delete_cluster(name):
     if not _check_cluster_access(name):
         return jsonify({"error": "无权操作该集群"}), 403
-    task_id = delete_cluster_async(name, created_by=g.user["id"])
+    task_id = delete_cluster_async(name, created_by=current_user.id)
     return jsonify({"task_id": task_id}), 202
 
 
@@ -1629,7 +1647,7 @@ def k8s_create_cluster_async_route():
         pve_server_id=pve_server_id,
         group_id=group_id,
         class_id=class_id,
-        created_by=g.user["id"],
+        created_by=current_user.id,
     )
     return jsonify({"task_id": task_id}), 202
 
@@ -1661,7 +1679,7 @@ def k8s_batch_create_clusters():
         pve_node,
         password=password,
         pve_server_id=pve_server_id,
-        created_by=g.user["id"],
+        created_by=current_user.id,
         class_id=class_id,
     )
     return jsonify({"task_ids": task_ids, "count": len(task_ids)}), 202
@@ -1671,7 +1689,7 @@ def k8s_batch_create_clusters():
 @login_required
 @k8s_api_error_handler
 def k8s_list_tasks():
-    created_by = None if g.user["role"] == "admin" else g.user["id"]
+    created_by = None if current_user.role == "admin" else current_user.id
     return jsonify({"tasks": list_tasks(created_by=created_by)})
 
 
@@ -1721,7 +1739,7 @@ def k8s_deploy_cluster(name):
         return jsonify({"error": "集群不存在"}), 404
     if cluster.get("status") != "running":
         return jsonify({"error": "集群状态异常，无法部署 K8s"}), 400
-    task_id = deploy_k8s_async(name, created_by=g.user["id"])
+    task_id = deploy_k8s_async(name, created_by=current_user.id)
     return jsonify({"task_id": task_id}), 202
 
 
@@ -1734,7 +1752,7 @@ def k8s_cluster_vm_action_all(name):
     cluster = get_cluster(name)
     if not cluster:
         return jsonify({"error": "集群不存在"}), 404
-    if g.user["role"] == "student":
+    if current_user.role == "student":
         return jsonify({"error": "无权操作"}), 403
     data = request.get_json() or {}
     action = data.get("action", "")
@@ -1761,9 +1779,9 @@ def api_class_vm_action_all(cid):
     cls = get_class(cid)
     if not cls:
         return jsonify({"error": "课程不存在"}), 404
-    if g.user["role"] == "teacher" and cls.get("created_by") != g.user["id"]:
+    if current_user.role == "teacher" and cls.get("created_by") != current_user.id:
         return jsonify({"error": "只能操作自己创建的课程"}), 403
-    if g.user["role"] == "student":
+    if current_user.role == "student":
         return jsonify({"error": "无权操作"}), 403
     data = request.get_json() or {}
     action = data.get("action", "")

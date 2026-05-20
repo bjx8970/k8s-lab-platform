@@ -4,6 +4,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime
 
+from flask_login import UserMixin
 from sqlalchemy import (
     Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
     create_engine, func,
@@ -120,7 +121,7 @@ class PVEServer(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
-class User(Base):
+class User(Base, UserMixin):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
     username = Column(String(64), unique=True, nullable=False, index=True)
@@ -132,6 +133,15 @@ class User(Base):
     created_at = Column(DateTime, default=func.now())
 
     group_memberships = relationship("GroupMember", back_populates="user", cascade="all, delete-orphan")
+
+
+def load_user(user_id):
+    """Flask-Login user_loader: returns User ORM object or None."""
+    session = get_session()
+    try:
+        return session.get(User, user_id)
+    finally:
+        session.close()
 
 
 class SchoolClass(Base):
@@ -584,7 +594,7 @@ def get_user(user_id):
         u = session.query(User).filter_by(id=user_id).first()
         if not u:
             return None
-        return _user_to_dict(u)
+        return u
     finally:
         session.close()
 
@@ -595,7 +605,7 @@ def get_user_by_username(username):
         u = session.query(User).filter_by(username=username).first()
         if not u:
             return None
-        return _user_to_dict(u)
+        return u
     finally:
         session.close()
 
