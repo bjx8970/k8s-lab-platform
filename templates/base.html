@@ -165,6 +165,7 @@
         .badge-red { background: var(--danger-bg); color: var(--danger); }
         .page-title { font-size: 20px; font-weight: 600; color: var(--text); margin-bottom: 16px; }
         .card p { color: var(--text-secondary); font-size: 14px; }
+        @keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
     </style>
 </head>
 <body>
@@ -215,6 +216,16 @@
         </div>
         <div class="content">
             {% block content %}{% endblock %}
+        </div>
+    </div>
+    <div id="global-toast-container" style="position:fixed;top:70px;right:20px;z-index:2000;display:flex;flex-direction:column;gap:8px"></div>
+    <div class="modal-overlay" id="shared-modal">
+        <div class="modal-card" style="width:420px;text-align:center">
+            <p id="shared-modal-message" style="font-size:15px;margin:16px 0 24px;color:#333;line-height:1.6"></p>
+            <div id="shared-modal-buttons" style="display:flex;gap:10px;justify-content:center">
+                <button class="btn btn-primary" id="shared-modal-ok-btn">确定</button>
+                <button class="btn" id="shared-modal-cancel-btn" style="display:none">取消</button>
+            </div>
         </div>
     </div>
     <script>
@@ -332,15 +343,55 @@ function renderTaskRow(task, label, isDone) {
         + '</div>';
 }
 
-async function cancelTask(taskId) {
-    if (!confirm('确定取消该任务？')) return;
-    try {
-        await fetch('/api/k8s/tasks/' + taskId + '/cancel', { method: 'POST' });
-        pollTaskList();
-    } catch (e) {
-        alert('取消失败: ' + e.message);
+    function showConfirm(msg) {
+        return new Promise(function(resolve) {
+            document.getElementById('shared-modal-message').textContent = msg;
+            document.getElementById('shared-modal-cancel-btn').style.display = '';
+            document.getElementById('shared-modal-ok-btn').textContent = '确认';
+            document.getElementById('shared-modal').className = 'modal-overlay show';
+            document.getElementById('shared-modal-ok-btn').onclick = function() {
+                document.getElementById('shared-modal').className = 'modal-overlay';
+                resolve(true);
+            };
+            document.getElementById('shared-modal-cancel-btn').onclick = function() {
+                document.getElementById('shared-modal').className = 'modal-overlay';
+                resolve(false);
+            };
+        });
     }
-}
+
+    function showAlert(msg) {
+        return new Promise(function(resolve) {
+            document.getElementById('shared-modal-message').textContent = msg;
+            document.getElementById('shared-modal-cancel-btn').style.display = 'none';
+            document.getElementById('shared-modal-ok-btn').textContent = '确定';
+            document.getElementById('shared-modal').className = 'modal-overlay show';
+            document.getElementById('shared-modal-ok-btn').onclick = function() {
+                document.getElementById('shared-modal').className = 'modal-overlay';
+                resolve();
+            };
+        });
+    }
+
+    function showToast(msg, type) {
+        type = type || 'info';
+        var c = document.getElementById('global-toast-container');
+        var t = document.createElement('div');
+        t.style.cssText = 'padding:10px 16px;border-radius:6px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,.12);background:#fff;border-left:4px solid ' + (type === 'success' ? '#52c41a' : type === 'error' ? '#ff4d4f' : '#1890ff') + ';animation:fadeIn .3s;max-width:360px';
+        t.textContent = msg;
+        c.appendChild(t);
+        setTimeout(function() { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 300); }, 3000);
+    }
+
+    async function cancelTask(taskId) {
+        if (!await showConfirm('确定取消该任务？')) return;
+        try {
+            await fetch('/api/k8s/tasks/' + taskId + '/cancel', { method: 'POST' });
+            pollTaskList();
+        } catch (e) {
+            showToast('取消失败: ' + e.message, 'error');
+        }
+    }
 
 function openTaskLog(taskId) {
     window.open('/k8s/logs/' + taskId, '_blank');

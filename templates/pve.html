@@ -272,12 +272,12 @@ async function saveServer() {
 }
 
 async function deleteServer(id) {
-    if (!confirm('确定删除此 PVE 服务器？')) return;
+    if (!await showConfirm('确定删除此 PVE 服务器？')) return;
     try {
         await api('DELETE', '/servers/' + id);
         loadServers();
     } catch (e) {
-        alert('删除失败: ' + e.message);
+        showToast('删除失败: ' + e.message, 'error');
     }
 }
 

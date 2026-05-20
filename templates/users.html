@@ -144,13 +144,13 @@ async function saveUser() {
 }
 
 async function deleteUser(id) {
-  if (!confirm('确定删除此用户？')) return;
-  try {
-    await apiReq('DELETE', '/' + id);
-    loadUsers();
-  } catch (e) {
-    alert('删除失败: ' + e.message);
-  }
+    if (!await showConfirm('确定删除此用户？')) return;
+    try {
+        await apiReq('DELETE', '/' + id);
+        loadUsers();
+    } catch (e) {
+        showToast('删除失败: ' + e.message, 'error');
+    }
 }
 
 function downloadUserTemplate() {
@@ -171,10 +171,10 @@ async function importUsers(input) {
     if (result.errors.length) {
       msg += '\n⚠️ ' + result.errors.length + ' 个错误：\n' + result.errors.slice(0, 5).join('\n');
     }
-    alert(msg);
+    await showAlert(msg);
     loadUsers();
   } catch (e) {
-    alert('导入失败: ' + e.message);
+    showToast('导入失败: ' + e.message, 'error');
   }
   input.value = '';
 }
