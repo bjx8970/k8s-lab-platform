@@ -16,8 +16,6 @@
     <div id="cluster-list" style="font-size:14px">加载中...</div>
 </div>
 
-<div id="toast-container" style="position:fixed;top:70px;right:20px;z-index:2000;display:flex;flex-direction:column;gap:8px"></div>
-
 <div class="modal-overlay" id="key-modal">
     <div class="modal-card" style="width:600px">
         <h3 style="margin-bottom:12px">SSH 密钥</h3>
@@ -103,19 +101,6 @@ async function api(method, path, body) {
     if (!res.ok) throw new Error(data.error || 'Request failed');
     return data;
 }
-
-function showToast(msg, type) {
-    type = type || 'info';
-    var c = document.getElementById('toast-container');
-    var t = document.createElement('div');
-    t.style.cssText = 'padding:10px 16px;border-radius:6px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,.12);background:#fff;border-left:4px solid ' + (type === 'success' ? '#52c41a' : type === 'error' ? '#ff4d4f' : '#1890ff') + ';animation:fadeIn .3s;max-width:360px';
-    t.textContent = msg;
-    c.appendChild(t);
-    setTimeout(function() { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 300); }, 3000);
-}
-var styleToast = document.createElement('style');
-styleToast.textContent = '@keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}';
-document.head.appendChild(styleToast);
 
 async function loadClusters() {
     const el = $('cluster-list');
@@ -249,7 +234,7 @@ async function batchCreate() {
         document.querySelectorAll('#form-group-container input[type=checkbox]:checked')
     ).map(cb => parseInt(cb.value));
     if (!selected.length) {
-        alert('请至少勾选一个组，或不选组直接点"创建集群"创建演示集群');
+        await showAlert('请至少勾选一个组，或不选组直接点"创建集群"创建演示集群');
         return;
     }
     $('btn-batch').disabled = true;
@@ -292,7 +277,7 @@ function closeCreateForm() {
 
 async function clusterVmAction(name, action) {
     const msg = action === 'start' ? '启动' : '停止';
-    if (!confirm('确定' + msg + '集群 ' + name + ' 的所有虚拟机？')) return;
+    if (!await showConfirm('确定' + msg + '集群 ' + name + ' 的所有虚拟机？')) return;
     try {
         const res = await fetch('/api/k8s/clusters/' + encodeURIComponent(name) + '/vm-action-all', {
             method: 'POST',
@@ -301,10 +286,10 @@ async function clusterVmAction(name, action) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || '操作失败');
-        alert(msg + '完成: ' + data.message);
+        showToast(msg + '完成', 'success');
         loadClusters();
     } catch (e) {
-        alert(msg + '失败: ' + e.message);
+        showToast(msg + '失败: ' + e.message, 'error');
     }
 }
 
@@ -319,7 +304,7 @@ async function deployK8s(name) {
 }
 
 async function deleteCluster(event, name) {
-    if (!confirm('确定删除集群 ' + name + ' ？\n这将释放所有虚拟机并清理 OpenWrt 配置。')) return;
+    if (!await showConfirm('确定删除集群 ' + name + ' ？\n这将释放所有虚拟机并清理 OpenWrt 配置。')) return;
     var btn = event && event.target;
     if (btn) { btn.disabled = true; btn.textContent = '删除中...'; }
     _forceDeleteName = name;
@@ -336,15 +321,15 @@ async function deleteCluster(event, name) {
 
 async function forceDeleteCluster() {
     if (!_forceDeleteName) return;
-    if (!confirm('确定强制删除集群 ' + _forceDeleteName + ' ？\n此操作将仅删除数据库记录，不会清理 PVE/OpenWrt 资源。')) return;
+    if (!await showConfirm('确定强制删除集群 ' + _forceDeleteName + ' ？\n此操作将仅删除数据库记录，不会清理 PVE/OpenWrt 资源。')) return;
     try {
         const res = await fetch(API + '/clusters/' + encodeURIComponent(_forceDeleteName) + '/force', { method: 'DELETE' });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || res.statusText);
-        alert('强制删除成功');
+        showToast('强制删除成功', 'success');
         location.reload();
     } catch (e) {
-        alert('强制删除失败: ' + e.message);
+        showToast('强制删除失败: ' + e.message, 'error');
     }
 }
 
@@ -357,9 +342,9 @@ async function vmAction(node, vmid, action) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || '操作失败');
-        alert(action === 'start' ? '已启动' : '已停止');
+        showToast(action === 'start' ? '已启动' : '已停止', 'success');
     } catch (e) {
-        alert('操作失败: ' + e.message);
+        showToast('操作失败: ' + e.message, 'error');
     }
 }
 
@@ -370,7 +355,7 @@ async function showSshKey(name) {
         $('key-public').value = data.public_key || '(无)';
         $('key-modal').className = 'modal-overlay show';
     } catch (e) {
-        alert('获取密钥失败: ' + e.message);
+        showToast('获取密钥失败: ' + e.message, 'error');
     }
 }
 

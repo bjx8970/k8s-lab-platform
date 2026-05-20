@@ -166,14 +166,14 @@ async function saveClass() {
 
 async function classVmAction(cid, action) {
   var msg = action === 'start' ? '启动' : '停止';
-  if (!confirm('确定' + msg + '该课程下所有集群的虚拟机？')) return;
+  if (!await showConfirm('确定' + msg + '该课程下所有集群的虚拟机？')) return;
   var btn = event && event.target;
   if (btn) { btn.disabled = true; btn.textContent = msg + '中...'; }
   try {
     var r = await api('POST', 'classes/' + cid + '/vm-action-all', { action: action });
-    alert(msg + '完成: ' + r.message);
+    showToast(msg + '完成', 'success');
   } catch (e) {
-    alert(msg + '失败: ' + e.message);
+    showToast(msg + '失败: ' + e.message, 'error');
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = action === 'start' ? '▶ 启动全部' : '⏹ 停止全部'; }
   }
@@ -205,28 +205,28 @@ async function saveGroup() {
 }
 
 async function deleteGroup(event, id) {
-  if (!confirm('确定删除此组？')) return;
+  if (!await showConfirm('确定删除此组？')) return;
   var btn = event && event.target;
   if (btn) { btn.disabled = true; btn.textContent = '删除中...'; }
   try {
     var r = await api('DELETE', 'groups/' + id);
-    alert(r.message || '删除成功');
+    showToast(r.message || '删除成功', 'success');
     loadClasses();
   } catch (e) {
-    alert('删除失败: ' + e.message);
+    showToast('删除失败: ' + e.message, 'error');
   }
 }
 
 async function deleteClass(event, id) {
-  if (!confirm('确定删除此课程及其所有组？')) return;
+  if (!await showConfirm('确定删除此课程及其所有组？')) return;
   var btn = event && event.target;
   if (btn) { btn.disabled = true; btn.textContent = '删除中...'; }
   try {
     var r = await api('DELETE', 'classes/' + id);
-    alert(r.message || '删除成功');
+    showToast(r.message || '删除成功', 'success');
     loadClasses();
   } catch (e) {
-    alert('删除失败: ' + e.message);
+    showToast('删除失败: ' + e.message, 'error');
   }
 }
 
@@ -279,7 +279,7 @@ async function addMember() {
 }
 
 async function removeMember(userId) {
-  if (!confirm('确定移除此成员？')) return;
+  if (!await showConfirm('确定移除此成员？')) return;
   try {
     await api('DELETE', 'groups/' + _currentGroupId + '/members/' + userId);
     await loadMembers(_currentGroupId);
@@ -306,10 +306,10 @@ async function importClasses(input) {
     if (result.errors.length) {
       msg += '\n⚠️ ' + result.errors.length + ' 个错误：\n' + result.errors.slice(0, 5).join('\n');
     }
-    alert(msg);
+    await showAlert(msg);
     loadClasses();
   } catch (e) {
-    alert('导入失败: ' + e.message);
+    showToast('导入失败: ' + e.message, 'error');
   }
   input.value = '';
 }

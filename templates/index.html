@@ -80,7 +80,7 @@ var _labelMap = {'pending':'未部署','installing':'部署中','installed':'已
 
 async function clusterVmAction(name, action) {
     var msg = action === 'start' ? '启动' : '停止';
-    if (!confirm('确定' + msg + '集群 ' + name + ' 的所有虚拟机？')) return;
+    if (!await showConfirm('确定' + msg + '集群 ' + name + ' 的所有虚拟机？')) return;
     try {
         var r = await fetch('/api/k8s/clusters/' + encodeURIComponent(name) + '/vm-action-all', {
             method: 'POST',
@@ -89,12 +89,12 @@ async function clusterVmAction(name, action) {
         });
         var d = await r.json();
         if (!r.ok) throw new Error(d.error || '操作失败');
-        alert(msg + '完成');
+        showToast(msg + '完成', 'success');
         var cl = await (await fetch('/api/k8s/clusters')).json();
         renderClassCards(cl);
         refreshVmStatuses(cl);
     } catch (e) {
-        alert(msg + '失败: ' + e.message);
+        showToast(msg + '失败: ' + e.message, 'error');
     }
 }
 
@@ -107,9 +107,9 @@ async function vmAction(node, vmid, action) {
         });
         var d = await r.json();
         if (!r.ok) throw new Error(d.error || '操作失败');
-        alert(action === 'start' ? '已启动' : '已停止');
+        showToast(action === 'start' ? '已启动' : '已停止', 'success');
     } catch (e) {
-        alert('操作失败: ' + e.message);
+        showToast('操作失败: ' + e.message, 'error');
     }
 }
 
