@@ -29,6 +29,13 @@
 <div id="class-clusters-section" style="margin-top:24px"></div>
 {% endif %}
 
+<style>
+.vm-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#e6f7ff;border:1px solid #91d5ff;border-radius:5px;font-size:12px;color:#1890ff}
+.vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
+.vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
+.vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
+.vm-btn:hover{background:#1890ff;color:#fff}
+</style>
 
 <script>
 const USER_ROLE = '{{ g.user.role }}';
@@ -58,7 +65,7 @@ async function loadStats() {
         const r = await fetch('/api/k8s/clusters');
         var clusters = await r.json();
         document.getElementById('stat-clusters').textContent = Object.keys(clusters).length;
-        if (USER_ROLE === 'teacher') renderClassCards(clusters);
+        if (USER_ROLE === 'teacher') { renderClassCards(clusters); refreshVmStatuses(clusters); }
     } catch(e) {}
 }
 
@@ -84,6 +91,7 @@ async function clusterVmAction(name, action) {
         alert(msg + '完成');
         var cl = await (await fetch('/api/k8s/clusters')).json();
         renderClassCards(cl);
+        refreshVmStatuses(cl);
     } catch (e) {
         alert(msg + '失败: ' + e.message);
     }
@@ -135,10 +143,10 @@ function renderClassCards(clusters) {
             if (c.vms) {
                 for (var vn in c.vms) {
                     var v = c.vms[vn];
-                    vmsHtml += '<span style="background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff;border-radius:5px;font-size:12px;padding:3px 8px;display:inline-flex;align-items:center;gap:4px">' +
+                    vmsHtml += '<span class="vm-tag" id="vm-' + name + '-' + v.vmid + '">' +
                         escStats(vn) + ' (' + v.role + ')' +
-                        '<button onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'start\')" style="padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2">▶</button>' +
-                        '<button onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'stop\')" style="padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2">⏹</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'start\')">▶</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'stop\')">⏹</button>' +
                         '</span>';
                 }
             }
@@ -159,6 +167,40 @@ function renderClassCards(clusters) {
     }
     if (html) {
         document.getElementById('class-clusters-section').innerHTML = html;
+    }
+}
+
+async function refreshVmStatuses(clusters) {
+    var vmList = [];
+    var vmMap = {};
+    for (var cname in clusters) {
+        var c = clusters[cname];
+        if (!c.vms) continue;
+        for (var vn in c.vms) {
+            var vm = c.vms[vn];
+            var el = document.getElementById('vm-' + cname + '-' + vm.vmid);
+            if (!el) continue;
+            var key = vm.node + '_' + vm.vmid;
+            vmList.push({node: vm.node, vmid: vm.vmid});
+            vmMap[key] = el;
+        }
+    }
+    if (!vmList.length) return;
+    try {
+        var res = await fetch('/api/pve/vms/status/batch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({vms: vmList}),
+        });
+        var data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'batch failed');
+        for (var key in (data.statuses || {})) {
+            var st = data.statuses[key];
+            var el = vmMap[key];
+            if (el) el.className = 'vm-tag' + (st.status === 'running' ? ' vm-running' : ' vm-stopped');
+        }
+    } catch(e) {
+        for (var k in vmMap) { vmMap[k].className = 'vm-tag vm-stopped'; }
     }
 }
 
