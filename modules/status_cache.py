@@ -8,7 +8,7 @@ _monitor_started = False
 _last_refresh_error = None
 _last_build_error = None
 
-REFRESH_INTERVAL = 15
+REFRESH_INTERVAL = 300
 CACHE_TTL = 60
 
 
@@ -186,6 +186,12 @@ def get_vm_status(node, vmid, no_fallback=False):
         return {"status": result}
     except Exception:
         return {"status": "unknown"}
+
+
+def update_vm_status(node, vmid, status):
+    key = f"{node}_{vmid}"
+    with _cache_lock:
+        _vm_cache[key] = {"status": status, "updated_at": time.time()}
 
 
 def dump_cache():

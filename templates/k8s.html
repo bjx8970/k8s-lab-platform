@@ -342,6 +342,12 @@ async function vmAction(node, vmid, action) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || '操作失败');
+        const _key = node + '_' + vmid;
+        const _st = action === 'start' ? 'running' : 'stopped';
+        vmStatusCache[_key] = _st;
+        document.querySelectorAll('[id$="-' + vmid + '"]').forEach(function(_el) {
+            if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag' + (_st === 'running' ? ' vm-running' : ' vm-stopped');
+        });
         showToast(action === 'start' ? '已启动' : '已停止', 'success');
     } catch (e) {
         showToast('操作失败: ' + e.message, 'error');
