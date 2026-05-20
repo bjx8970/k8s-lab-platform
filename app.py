@@ -22,7 +22,7 @@ from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster
 from modules.pg_client import PGClient, PGError
-from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor
+from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor, update_vm_status
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
@@ -1068,6 +1068,7 @@ def pve_start_vm(node, vmid):
         return jsonify({"error": "无权访问该虚拟机"}), 403
     client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
     result = client.start_vm(node, vmid)
+    update_vm_status(node, vmid, "running")
     return jsonify(result)
 
 
@@ -1081,6 +1082,7 @@ def pve_stop_vm(node, vmid):
     force = data.get("force", False)
     client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
     result = client.stop_vm(node, vmid, force)
+    update_vm_status(node, vmid, "stopped")
     return jsonify(result)
 
 
@@ -1746,8 +1748,10 @@ def k8s_cluster_vm_action_all(name):
         try:
             if action == "start":
                 client.start_vm(vm_info["node"], vm_info["vmid"])
+                update_vm_status(vm_info["node"], vm_info["vmid"], "running")
             else:
                 client.stop_vm(vm_info["node"], vm_info["vmid"])
+                update_vm_status(vm_info["node"], vm_info["vmid"], "stopped")
             results.append({"vm": vm_name, "status": "ok"})
         except Exception as e:
             results.append({"vm": vm_name, "status": "failed", "error": str(e)})
@@ -1788,8 +1792,10 @@ def api_class_vm_action_all(cid):
             try:
                 if action == "start":
                     client.start_vm(vm_info["node"], vm_info["vmid"])
+                    update_vm_status(vm_info["node"], vm_info["vmid"], "running")
                 else:
                     client.stop_vm(vm_info["node"], vm_info["vmid"])
+                    update_vm_status(vm_info["node"], vm_info["vmid"], "stopped")
                 results.append({"cluster": name, "vm": vm_name, "status": "ok"})
             except Exception as e:
                 results.append({"cluster": name, "vm": vm_name, "status": "failed", "error": str(e)})
