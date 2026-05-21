@@ -28,7 +28,7 @@ from modules.pg_client import PGClient, PGError
 from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor, update_vm_status
 
 from flask_socketio import SocketIO, emit
-from modules.ssh_terminal import SSHManager, SSHConnectionError, TooManyConnectionsError
+from modules.ssh_terminal import SSHManager, SSHConnectionError, SessionExistsError, TooManyConnectionsError
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
@@ -43,7 +43,7 @@ login_manager.login_message = None
 csrf = CSRFProtect(app)
 
 socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*", manage_session=False)
-ssh_manager = SSHManager(max_connections=64, idle_timeout=900)
+ssh_manager = SSHManager()
 ssh_manager.init_app(socketio)
 
 
@@ -1830,9 +1830,6 @@ def api_class_vm_action_all(cid):
     return jsonify({"results": results, "message": f"{ok}/{len(results)}"})
 
 
-@app.route("/api/k8s/clusters/<name>/upload-ssh-key", methods=["POST"])
-
-
 @app.route("/k8s/logs/<task_id>")
 @login_required
 @k8s_api_error_handler
@@ -1899,8 +1896,8 @@ def webssh_connect(auth=None):
     if not current_user.is_authenticated:
         return False
 
-@socketio.on("ssh_connect", namespace="/webssh")
-def webssh_ssh_connect(data):
+@socketio.on("session_create", namespace="/webssh")
+def webssh_session_create(data):
     if not current_user.is_authenticated:
         emit("ssh_error", {"message": "未登录"})
         return
@@ -1936,7 +1933,7 @@ def webssh_ssh_connect(data):
     now = time.time()
     sid = request.sid
     prev = _webssh_connect_times.get(sid, 0)
-    if now - prev < 30:
+    if now - prev < 10:
         emit("ssh_error", {"message": "操作过于频繁，请稍后再试"})
         return
     _webssh_connect_times[sid] = now
@@ -1947,18 +1944,259 @@ def webssh_ssh_connect(data):
     username = "k8s"
     password = cluster.get("password", "k8s.1234")
 
+    owner = {
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "role": current_user.role,
+    }
+
     try:
-        ssh_manager.create(
-            sid, host, port, username, password, cluster_name, timeout=10,
-            user_info={"id": current_user.id, "username": current_user.username, "role": current_user.role},
+        session = ssh_manager.create_session(
+            cluster_name, owner, host, port, username, password
         )
-        emit("ssh_connected", {"message": "已连接到 " + cluster_name})
+        ssh_manager.connect_session(session.session_id)
+        ssh_manager.bind_ws(sid, session.session_id, role="owner")
+        emit("session_created", {
+            "session_id": session.session_id,
+            "cluster": cluster_name,
+        })
+    except SessionExistsError as e:
+        emit("ssh_error", {"message": str(e)})
     except TooManyConnectionsError as e:
         emit("ssh_error", {"message": str(e)})
     except SSHConnectionError as e:
         emit("ssh_error", {"message": str(e)})
     except Exception as e:
         emit("ssh_error", {"message": f"连接失败: {e}"})
+
+@socketio.on("session_reconnect", namespace="/webssh")
+def webssh_session_reconnect(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
+
+    cluster_name = data.get("cluster", "")
+    if not cluster_name:
+        emit("ssh_error", {"message": "缺少集群名称"})
+        return
+
+    session = ssh_manager.get_session_by_cluster(current_user.id, cluster_name)
+    if not session:
+        emit("ssh_error", {"message": "会话不存在"})
+        return
+
+    if session.status == "terminated":
+        emit("ssh_error", {"message": "会话已终止"})
+        return
+
+    sid = request.sid
+    ssh_manager.bind_ws(sid, session.session_id, role="owner")
+
+    if session.status == "disconnected":
+        try:
+            ssh_manager.connect_session(session.session_id)
+        except SSHConnectionError as e:
+            emit("ssh_error", {"message": str(e)})
+            return
+
+    replay = session.get_log_replay()
+    if replay:
+        emit("log_replay", {"lines": replay})
+
+    if session.takeover_active and session.takeover_by:
+        socketio.emit("takeover_notify", {
+            "by": session.takeover_by.get("username", ""),
+            "cluster": session.cluster_name,
+        }, to=sid, namespace="/webssh")
+
+    emit("session_reconnected", {
+        "session_id": session.session_id,
+        "cluster": cluster_name,
+    })
+
+@socketio.on("session_terminate", namespace="/webssh")
+def webssh_session_terminate(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
+
+    cluster_name = data.get("cluster", "")
+    if not cluster_name:
+        emit("ssh_error", {"message": "缺少集群名称"})
+        return
+
+    ok = ssh_manager.terminate_by_owner(current_user.id, cluster_name)
+    if ok:
+        emit("session_terminated", {"cluster": cluster_name})
+    else:
+        emit("ssh_error", {"message": "会话不存在或无权终止"})
+
+@socketio.on("takeover_start", namespace="/webssh")
+def webssh_takeover_start(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
+    if current_user.role not in ("admin", "teacher"):
+        emit("ssh_error", {"message": "权限不足"})
+        return
+
+    session_id = data.get("session_id", "")
+    session = ssh_manager.get_session(session_id)
+    if not session:
+        emit("ssh_error", {"message": "会话不存在"})
+        return
+
+    if not _check_cluster_access(session.cluster_name):
+        emit("ssh_error", {"message": "无权访问该集群"})
+        return
+
+    sid = request.sid
+
+    if session.takeover_active and session.takeover_by and session.takeover_by.get("user_id") == current_user.id:
+        ssh_manager.bind_ws(sid, session_id, role="takeover")
+        replay = session.get_log_replay()
+        if replay:
+            emit("log_replay", {"lines": replay})
+        emit("takeover_started", {"session_id": session_id, "cluster": session.cluster_name})
+        return
+
+    ok, result = ssh_manager.takeover_session(session_id, {
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "role": current_user.role,
+    })
+    if not ok:
+        emit("ssh_error", {"message": result})
+        return
+
+    ssh_manager.bind_ws(sid, session_id, role="takeover")
+
+    replay = session.get_log_replay()
+    if replay:
+        emit("log_replay", {"lines": replay})
+
+    emit("takeover_started", {"session_id": session_id, "cluster": session.cluster_name})
+    socketio.emit("takeover_notify", {
+        "by": current_user.username,
+        "cluster": session.cluster_name,
+    }, to=session.owner_sid, namespace="/webssh")
+
+@socketio.on("takeover_stop", namespace="/webssh")
+def webssh_takeover_stop(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
+
+    session_id = data.get("session_id", "")
+    session = ssh_manager.get_session(session_id)
+    if not session:
+        emit("ssh_error", {"message": "会话不存在"})
+        return
+
+    if not session.takeover_by or session.takeover_by.get("user_id") != current_user.id:
+        emit("ssh_error", {"message": "无权释放该接管"})
+        return
+
+    ssh_manager.unbind_ws(request.sid)
+
+    emit("takeover_stopped", {"session_id": session_id})
+    if session.owner_sid:
+        socketio.emit("takeover_released", {}, to=session.owner_sid, namespace="/webssh")
+
+@socketio.on("view_start", namespace="/webssh")
+def webssh_view_start(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
+    if current_user.role not in ("admin", "teacher"):
+        emit("ssh_error", {"message": "权限不足"})
+        return
+
+    session_id = data.get("session_id", "")
+    session = ssh_manager.get_session(session_id)
+    if not session:
+        emit("ssh_error", {"message": "会话不存在"})
+        return
+
+    if not _check_cluster_access(session.cluster_name):
+        emit("ssh_error", {"message": "无权访问该集群"})
+        return
+
+    sid = request.sid
+    ssh_manager.view_session(session_id, sid)
+
+    replay = session.get_log_replay()
+    if replay:
+        emit("log_replay", {"lines": replay})
+
+    emit("view_started", {"session_id": session_id, "cluster": session.cluster_name})
+
+@socketio.on("view_stop", namespace="/webssh")
+def webssh_view_stop(data):
+    session_id = data.get("session_id", "")
+    ssh_manager.unview_session(request.sid)
+    emit("view_stopped", {"session_id": session_id})
+
+@socketio.on("reconnect_request", namespace="/webssh")
+def webssh_reconnect_request(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
+
+    session_id = data.get("session_id", "")
+    session = ssh_manager.get_session(session_id)
+    if not session:
+        emit("ssh_error", {"message": "会话不存在"})
+        return
+
+    if session.owner["user_id"] != current_user.id:
+        emit("ssh_error", {"message": "无权操作该会话"})
+        return
+
+    ok, result = ssh_manager.request_reconnect(session_id, {
+        "user_id": current_user.id,
+        "username": current_user.username,
+    })
+    if not ok:
+        emit("ssh_error", {"message": result})
+        return
+
+    emit("reconnect_requested", {"session_id": session_id, "expires_at": session.reconnect_expires_at})
+    if session.takeover_sid:
+        socketio.emit("reconnect_request_notify", {
+            "session_id": session_id,
+            "student": current_user.username,
+            "cluster": session.cluster_name,
+        }, to=session.takeover_sid, namespace="/webssh")
+
+@socketio.on("reconnect_response", namespace="/webssh")
+def webssh_reconnect_response(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
+
+    session_id = data.get("session_id", "")
+    action = data.get("action", "")
+    session = ssh_manager.get_session(session_id)
+    if not session:
+        emit("ssh_error", {"message": "会话不存在"})
+        return
+
+    if not session.takeover_by or session.takeover_by.get("user_id") != current_user.id:
+        emit("ssh_error", {"message": "无权操作"})
+        return
+
+    accepted = action == "accept"
+    if accepted:
+        ssh_manager.unbind_ws(request.sid)
+        emit("takeover_accepted", {"session_id": session_id})
+    session.clear_reconnect_request()
+
+    if session.owner_sid:
+        socketio.emit("reconnect_response", {
+            "accepted": accepted,
+            "session_id": session_id,
+        }, to=session.owner_sid, namespace="/webssh")
 
 @socketio.on("ssh_data", namespace="/webssh")
 def webssh_ssh_data(data):
@@ -1974,11 +2212,11 @@ def webssh_ssh_resize(data):
 
 @socketio.on("disconnect", namespace="/webssh")
 def webssh_disconnect():
-    ssh_manager.remove(request.sid)
+    ssh_manager.unbind_ws(request.sid)
     _webssh_connect_times.pop(request.sid, None)
 
 
-# ── Admin WebSSH Management ──
+# ── WebSSH REST API ──
 
 @app.route("/admin/webssh")
 @login_required
@@ -1986,20 +2224,73 @@ def webssh_disconnect():
 def admin_webssh():
     return render_template("admin_webssh.html")
 
-@app.route("/api/admin/webssh/connections", methods=["GET"])
+@app.route("/api/webssh/sessions", methods=["GET"])
 @login_required
-@admin_required
-def api_admin_webssh_list():
-    return jsonify({"connections": ssh_manager.list_connections()})
+def api_webssh_sessions():
+    if current_user.role == "admin":
+        sessions = ssh_manager.list_sessions()
+    elif current_user.role == "teacher":
+        sessions = ssh_manager.list_sessions(filter_role="student")
+    else:
+        sessions = ssh_manager.list_sessions(filter_user_id=current_user.id)
+    return jsonify({"sessions": sessions})
 
-@app.route("/api/admin/webssh/connections/<sid>", methods=["DELETE"])
+@app.route("/api/webssh/cluster/<name>", methods=["GET"])
+@login_required
+def api_webssh_cluster_status(name):
+    if not _check_cluster_access(name):
+        return jsonify({"error": "无权访问"}), 403
+    session = ssh_manager.get_session_by_cluster(current_user.id, name)
+    if session:
+        return jsonify({"has_session": True, "session": session.to_dict()})
+    return jsonify({"has_session": False})
+
+@app.route("/api/teacher/student-sessions", methods=["GET"])
+@login_required
+def api_teacher_student_sessions():
+    if current_user.role not in ("admin", "teacher"):
+        return jsonify({"error": "权限不足"}), 403
+    sessions = ssh_manager.list_sessions(filter_role="student")
+    return jsonify({"sessions": sessions})
+
+@app.route("/api/admin/webssh/config", methods=["GET"])
 @login_required
 @admin_required
-def api_admin_webssh_disconnect(sid):
-    ok = ssh_manager.disconnect_by_sid(sid)
+def api_webssh_config_get():
+    return jsonify(ssh_manager.get_config())
+
+@app.route("/api/admin/webssh/config", methods=["PUT"])
+@login_required
+@admin_required
+def api_webssh_config_set():
+    data = request.get_json() or {}
+    ssh_manager.set_config(data)
+    return jsonify({"message": "配置已保存"})
+
+@app.route("/api/admin/webssh/sessions/<session_id>", methods=["DELETE"])
+@login_required
+@admin_required
+def api_admin_webssh_terminate(session_id):
+    ok = ssh_manager.terminate_session(session_id)
     if ok:
-        return jsonify({"message": "已断开连接"})
-    return jsonify({"error": "连接不存在"}), 404
+        return jsonify({"message": "会话已终止"})
+    return jsonify({"error": "会话不存在"}), 404
+
+@app.route("/api/webssh/sessions/<cluster_name>/terminate", methods=["POST"])
+@login_required
+def api_webssh_terminate_session(cluster_name):
+    if not _check_cluster_access(cluster_name):
+        return jsonify({"error": "无权访问该集群"}), 403
+    session = ssh_manager.get_session_by_cluster(current_user.id, cluster_name)
+    if not session:
+        return jsonify({"error": "会话不存在"}), 404
+    if session.owner.get("user_id") != current_user.id:
+        return jsonify({"error": "无权终止"}), 403
+    targets = list(session._get_all_targets())
+    ssh_manager.terminate_by_owner(current_user.id, cluster_name)
+    for sid in targets:
+        socketio.emit("session_terminated", {"cluster": cluster_name}, to=sid, namespace="/webssh")
+    return jsonify({"message": "会话已终止"})
 
 
 if __name__ == "__main__":

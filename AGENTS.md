@@ -18,18 +18,20 @@ python app.py            # Flask dev at :5000 (with WebSSH via simple-websocket)
 - `modules/k8s_manager.py` — cluster orchestration, async via `modules/task_queue.py` + in-memory `_task_store` (lost on restart, 30 min expiry).
 - `modules/pg_client.py` — PostgreSQL connection test via `pg8000` (UI only, not runtime persistence).
 - `modules/status_cache.py` — background VM status cache (300s refresh, 60s TTL). Call `update_vm_status()` after VM start/stop.
-- `modules/ssh_terminal.py` — WebSSH session manager. Handles paramiko SSH connections to client VMs, bidirectional data forwarding via SocketIO. Max 64 concurrent sessions, 900s idle timeout.
+- `modules/ssh_terminal.py` — WebSSH 会话池管理器。`SSHSession` 持久化 SSH 连接，`SSHManager` 管理会话池。支持接管/查看模式、日志缓冲、断线重连、可配置限额。
 
 ## WebSSH
 
-Student interface includes an in-browser terminal (xterm.js + SocketIO + paramiko) for SSH access to client VMs.
-- Connection: Flask server → client VM internal IP `10.100.{id}.101:22` (direct, no port forward)
-- Auth: SocketIO session verifies `current_user`; `_check_cluster_access()` on each connect
-- Concurrency: max 64 simultaneous SSH sessions, 15 min idle timeout, 30s rate limit per connect
-- Frontend: `static/vendor/` contains socket.io, xterm.js, xterm-addon-fit (local, no CDN)
-- Dev mode: `simple-websocket` transport (no monkey-patching)
-- Production: `python run.py` (Werkzeug threaded server, `allow_unsafe_werkzeug=True`)
-- Admin management: `/admin/webssh` — view active connections, force disconnect
+学生界面包含浏览器终端（xterm.js + SocketIO + paramiko），用于 SSH 访问客户端 VM。
+- 连接：Flask 服务器 → OpenWrt WAN IP → client VM `10.100.{id}.101:22`（端口转发）
+- 认证：SocketIO 会话验证 `current_user`；每次连接执行 `_check_cluster_access()`
+- 会话模型：每 (user_id, cluster_name) 最多 1 个 SSHSession。窗口关闭不中断 SSH，保留至超时。
+- 接管模式：教师/管理员可接管学生会话，学生收到通知并可请求恢复（10 秒倒计时）。
+- 查看模式：教师/管理员可查看会话输出，学生无感知，不可输入。
+- 前端：`static/vendor/` 包含 socket.io, xterm.js, xterm-addon-fit（本地，无 CDN）
+- 传输层：`simple-websocket`（无 monkey-patching）
+- 生产：`python run.py`（Werkzeug threaded 服务器，`allow_unsafe_werkzeug=True`）
+- 管理：`/admin/webssh` — 查看/终止会话、配置限额（全局/学生/教师最大连接数、超时时间）
 
 ## Initial setup flow
 

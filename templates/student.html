@@ -9,9 +9,12 @@
         <div id="terminal-header">
             <span id="terminal-title">Web终端</span>
             <span id="terminal-status" style="margin-left:12px;font-size:12px;color:#aaa"></span>
+            <span id="takeover-indicator" style="margin-left:12px;font-size:12px;color:#faad14;display:none">教师正在操作</span>
+            <button id="request-reconnect-btn" onclick="requestReconnectFromTerminal()" style="display:none;padding:4px 12px;border:1px solid #faad14;border-radius:4px;background:#fff7e6;color:#d46b08;font-size:12px;cursor:pointer;font-weight:500;margin-left:8px">请求恢复</button>
+            <span id="student-reconnect-countdown" style="display:none;margin-left:8px;font-size:12px;color:#faad14"></span>
             <span style="flex:1"></span>
-            <button id="terminal-fullscreen" onclick="toggleTerminalFullscreen()" title="全屏">⛶</button>
-            <button id="terminal-close" onclick="closeTerminal()" title="断开">✕</button>
+            <button id="terminal-fullscreen" onclick="toggleTerminalFullscreen()" title="全屏">&#9974;</button>
+            <button id="terminal-close" onclick="closeTerminal()" title="断开">&#10005;</button>
         </div>
         <div id="terminal-body"></div>
     </div>
@@ -30,8 +33,15 @@
 .vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
 .vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
 .vm-btn:hover{background:#1890ff;color:#fff}
-.webssh-btn{padding:4px 12px;border:1px solid #52c41a;border-radius:4px;background:#f6ffed;color:#52c41a;font-size:12px;cursor:pointer;font-weight:500}
-.webssh-btn:hover{background:#52c41a;color:#fff}
+.ssh-btn{padding:4px 12px;border:1px solid #52c41a;border-radius:4px;background:#f6ffed;color:#52c41a;font-size:12px;cursor:pointer;font-weight:500}
+.ssh-btn:hover{background:#52c41a;color:#fff}
+.ssh-btn-reconnect{padding:4px 12px;border:1px solid #1890ff;border-radius:4px;background:#e6f7ff;color:#1890ff;font-size:12px;cursor:pointer;font-weight:500}
+.ssh-btn-reconnect:hover{background:#1890ff;color:#fff}
+.ssh-btn-terminate{padding:4px 12px;border:1px solid #ff4d4f;border-radius:4px;background:#fff2f0;color:#ff4d4f;font-size:12px;cursor:pointer;font-weight:500}
+.ssh-btn-terminate:hover{background:#ff4d4f;color:#fff}
+.ssh-btn-request{padding:4px 12px;border:1px solid #faad14;border-radius:4px;background:#fff7e6;color:#d46b08;font-size:12px;cursor:pointer;font-weight:500}
+.ssh-btn-request:hover{background:#faad14;color:#fff}
+.ssh-takeover-notice{font-size:12px;color:#faad14;margin-left:8px}
 
 #terminal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center}
 #terminal-container{width:90%;height:85%;background:#1e1e1e;border-radius:8px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.4)}
@@ -54,7 +64,12 @@ var terminalSocket = null;
 var terminal = null;
 var fitAddon = null;
 var currentClusterName = null;
+var currentSessionId = null;
 var terminalConnected = false;
+var isTakenOver = false;
+var countdownTimer = null;
+var studentCountdownTimer = null;
+var clusterSessionStates = {};
 
 function esc(s) {
     if (!s) return '';
@@ -129,10 +144,24 @@ async function loadMyClusters() {
     try {
         var r = await fetch('/api/k8s/clusters');
         var clusters = await r.json();
+        await loadSessionStates(clusters);
         renderCards(clusters);
         refreshVmStatuses(clusters);
     } catch (e) {
         document.getElementById('student-clusters-section').innerHTML = '<div class="card"><p style="color:#ff4d4f">加载失败: ' + esc(e.message) + '</p></div>';
+    }
+}
+
+async function loadSessionStates(clusters) {
+    clusterSessionStates = {};
+    for (var name in clusters) {
+        try {
+            var r = await fetch('/api/webssh/cluster/' + encodeURIComponent(name));
+            var d = await r.json();
+            if (d.has_session) {
+                clusterSessionStates[name] = d.session;
+            }
+        } catch(e) {}
     }
 }
 
@@ -158,7 +187,7 @@ function renderCards(clusters) {
         var clsName = classOrder[ci];
         var items = grouped[clsName];
         html += '<div class="card" style="margin-bottom:16px">' +
-            '<h3 style="margin-bottom:12px;font-size:16px">📚 ' + esc(clsName) + ' (' + items.length + ' 个集群)</h3>';
+            '<h3 style="margin-bottom:12px;font-size:16px">&#128218; ' + esc(clsName) + ' (' + items.length + ' 个集群)</h3>';
 
         for (var ii = 0; ii < items.length; ii++) {
             var c = items[ii].data;
@@ -184,17 +213,19 @@ function renderCards(clusters) {
                     var _extra = _cached === 'running' ? ' vm-running' : (_cached === 'stopped' ? ' vm-stopped' : '');
                     vmsHtml += '<span class="vm-tag' + _extra + '" id="vm-' + esc(cname) + '-' + v.vmid + '">' +
                         esc(vn) + ' (' + v.role + ')' +
-                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'start\')">▶</button>' +
-                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'stop\')">⏹</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'start\')">&#9654;</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'stop\')">&#9209;</button>' +
                         '</span>';
                 }
             }
+
+            var btnHtml = renderSessionButtons(cname, c);
 
             html += '<div class="mycluster-item">' +
                 '<div class="mycluster-header">' +
                     '<span class="mycluster-name">' + esc(label) + '</span>' +
                     '<span style="display:flex;gap:8px;align-items:center">' +
-                        '<button class="webssh-btn" onclick="openTerminal(\'' + esc(cname) + '\')">Web终端</button>' +
+                        btnHtml +
                         '<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500;' + badgeStyle + '">' + k8sLabel + '</span>' +
                     '</span>' +
                 '</div>' +
@@ -207,8 +238,244 @@ function renderCards(clusters) {
     document.getElementById('student-clusters-section').innerHTML = html;
 }
 
+function renderSessionButtons(clusterName, clusterData) {
+    var session = clusterSessionStates[clusterName];
+    if (!session) {
+        return '<button class="ssh-btn" onclick="createSession(\'' + esc(clusterName) + '\')">连接</button>';
+    }
+
+    if (session.takeover_active) {
+        return '<button class="ssh-btn-reconnect" onclick="reconnectSession(\'' + esc(clusterName) + '\')">重新连接</button>' +
+               '<span class="ssh-takeover-notice">教师 ' + esc(session.takeover_by ? session.takeover_by.username : '') + ' 正在操作</span>';
+    }
+
+    if (session.status === 'terminated') {
+        return '<button class="ssh-btn" onclick="createSession(\'' + esc(clusterName) + '\')">连接</button>';
+    }
+
+    if (session.status === 'disconnected') {
+        return '<button class="ssh-btn-reconnect" onclick="reconnectSession(\'' + esc(clusterName) + '\')">重新连接</button>' +
+               '<button class="ssh-btn-terminate" onclick="terminateSession(\'' + esc(clusterName) + '\')">终止会话</button>';
+    }
+
+    if (session.status === 'connected') {
+        return '<button class="ssh-btn-reconnect" onclick="reconnectSession(\'' + esc(clusterName) + '\')">打开终端</button>' +
+               '<button class="ssh-btn-terminate" onclick="terminateSession(\'' + esc(clusterName) + '\')">终止会话</button>';
+    }
+
+    return '';
+}
+
+async function createSession(clusterName) {
+    initTerminal();
+    currentClusterName = clusterName;
+    document.getElementById('terminal-overlay').style.display = 'flex';
+    document.getElementById('terminal-title').textContent = 'Web终端 - ' + clusterName;
+    document.getElementById('terminal-status').textContent = '连接中...';
+    document.getElementById('terminal-status').style.color = '#ffd591';
+    document.getElementById('takeover-indicator').style.display = 'none';
+    isTakenOver = false;
+    setTimeout(function() { fitAddon.fit(); }, 100);
+
+    if (!terminalSocket) {
+        initSocket();
+    }
+
+    terminalSocket.emit('session_create', {cluster: clusterName});
+}
+
+async function reconnectSession(clusterName) {
+    initTerminal();
+    currentClusterName = clusterName;
+    document.getElementById('terminal-overlay').style.display = 'flex';
+    document.getElementById('terminal-title').textContent = 'Web终端 - ' + clusterName;
+    document.getElementById('terminal-status').textContent = '重新连接中...';
+    document.getElementById('terminal-status').style.color = '#ffd591';
+    document.getElementById('takeover-indicator').style.display = 'none';
+    isTakenOver = false;
+    setTimeout(function() { fitAddon.fit(); }, 100);
+
+    if (!terminalSocket) {
+        initSocket();
+    }
+
+    terminalSocket.emit('session_reconnect', {cluster: clusterName});
+}
+
+async function terminateSession(clusterName) {
+    if (!await showConfirm('确定终止该会话？SSH 连接将被关闭。')) return;
+    try {
+        var r = await fetch('/api/webssh/sessions/' + encodeURIComponent(clusterName) + '/terminate', {
+            method: 'POST',
+        });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '终止失败');
+        delete clusterSessionStates[clusterName];
+        loadMyClusters();
+        showToast('会话已终止', 'success');
+    } catch(e) {
+        showToast('终止失败: ' + e.message, 'error');
+    }
+}
+
+async function requestReconnect(sessionId, clusterName) {
+    if (!terminalSocket) return;
+    terminalSocket.emit('reconnect_request', {session_id: sessionId});
+    showToast('已发送恢复请求', 'info');
+    showStudentReconnectCountdown();
+}
+
+function requestReconnectFromTerminal() {
+    if (currentSessionId && currentClusterName && terminalSocket) {
+        requestReconnect(currentSessionId, currentClusterName);
+    }
+}
+
+function showStudentReconnectCountdown() {
+    var countdownEl = document.getElementById('student-reconnect-countdown');
+    var btn = document.getElementById('request-reconnect-btn');
+    if (!countdownEl) return;
+    if (btn) btn.style.display = 'none';
+    var seconds = 10;
+    countdownEl.textContent = '正在请求恢复 (' + seconds + '秒)';
+    countdownEl.style.display = '';
+    if (studentCountdownTimer) clearInterval(studentCountdownTimer);
+    studentCountdownTimer = setInterval(function() {
+        seconds--;
+        if (seconds > 0) {
+            countdownEl.textContent = '正在请求恢复 (' + seconds + '秒)';
+        } else if (seconds === 0) {
+            countdownEl.textContent = '等待恢复...';
+        }
+        if (seconds <= 0) {
+            clearInterval(studentCountdownTimer);
+            studentCountdownTimer = null;
+        }
+    }, 1000);
+}
+
+function hideStudentReconnectCountdown() {
+    var countdownEl = document.getElementById('student-reconnect-countdown');
+    if (countdownEl) countdownEl.style.display = 'none';
+    if (studentCountdownTimer) { clearInterval(studentCountdownTimer); studentCountdownTimer = null; }
+}
+
+function initSocket() {
+    terminalSocket = io('/webssh', {
+        reconnection: true,
+        reconnectionAttempts: 3,
+        reconnectionDelay: 1000,
+    });
+
+    terminalSocket.on('connect', function() {
+        if (currentClusterName && currentSessionId) {
+            terminalSocket.emit('session_reconnect', {cluster: currentClusterName});
+        }
+    });
+
+    terminalSocket.on('session_created', function(data) {
+        currentSessionId = data.session_id;
+        terminalConnected = true;
+        document.getElementById('terminal-status').textContent = '已连接';
+        document.getElementById('terminal-status').style.color = '#52c41a';
+        terminal.writeln('\x1b[32m已连接到 ' + data.cluster + '\x1b[0m\r\n');
+    });
+
+    terminalSocket.on('session_reconnected', function(data) {
+        currentSessionId = data.session_id;
+        terminalConnected = true;
+        document.getElementById('terminal-status').textContent = '已连接';
+        document.getElementById('terminal-status').style.color = '#52c41a';
+    });
+
+    terminalSocket.on('log_replay', function(data) {
+        if (terminal && data.lines) {
+            terminal.write(data.lines);
+        }
+    });
+
+    terminalSocket.on('session_terminated', function(data) {
+        delete clusterSessionStates[data.cluster];
+        if (data.cluster === currentClusterName) {
+            terminal.writeln('\r\n\x1b[33m会话已终止\x1b[0m\r\n');
+            document.getElementById('terminal-status').textContent = '已终止';
+            document.getElementById('terminal-status').style.color = '#ff4d4f';
+        }
+        loadMyClusters();
+    });
+
+    terminalSocket.on('ssh_output', function(data) {
+        if (terminal) terminal.write(data.data);
+    });
+
+    terminalSocket.on('ssh_error', function(data) {
+        terminalConnected = false;
+        document.getElementById('terminal-status').textContent = '错误';
+        document.getElementById('terminal-status').style.color = '#ff4d4f';
+        if (terminal) terminal.writeln('\x1b[31m' + (data.message || '连接失败') + '\x1b[0m\r\n');
+    });
+
+    terminalSocket.on('ssh_disconnected', function(data) {
+        terminalConnected = false;
+        document.getElementById('terminal-status').textContent = '已断开';
+        document.getElementById('terminal-status').style.color = '#ff4d4f';
+        if (terminal) terminal.writeln('\r\n\x1b[33m' + (data.reason || '连接已断开') + '\x1b[0m\r\n');
+    });
+
+    terminalSocket.on('takeover_notify', function(data) {
+        isTakenOver = true;
+        document.getElementById('takeover-indicator').style.display = '';
+        document.getElementById('request-reconnect-btn').style.display = '';
+        document.getElementById('takeover-indicator').textContent = '教师 ' + (data.by || '') + ' 正在操作';
+        showToast('教师 ' + (data.by || '') + ' 正在操作您的终端', 'warning');
+    });
+
+    terminalSocket.on('takeover_released', function() {
+        isTakenOver = false;
+        document.getElementById('takeover-indicator').style.display = 'none';
+        document.getElementById('request-reconnect-btn').style.display = 'none';
+        hideStudentReconnectCountdown();
+        showToast('教师已释放终端', 'success');
+    });
+
+    terminalSocket.on('reconnect_request_notify', function() {
+    });
+
+    terminalSocket.on('reconnect_requested', function(data) {
+        showStudentReconnectCountdown();
+    });
+
+    terminalSocket.on('reconnect_response', function(data) {
+        hideStudentReconnectCountdown();
+        if (data.accepted) {
+            isTakenOver = false;
+            document.getElementById('takeover-indicator').style.display = 'none';
+            document.getElementById('request-reconnect-btn').style.display = 'none';
+            showToast('已恢复终端控制', 'success');
+            if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+        } else {
+            showToast('教师拒绝了恢复请求', 'error');
+        }
+        loadMyClusters();
+    });
+
+    terminalSocket.on('disconnect', function() {
+        terminalConnected = false;
+        document.getElementById('terminal-status').textContent = '连接断开';
+        document.getElementById('terminal-status').style.color = '#ff4d4f';
+    });
+
+    terminalSocket.on('connect_error', function() {
+        document.getElementById('terminal-status').textContent = '连接服务器失败';
+        document.getElementById('terminal-status').style.color = '#ff4d4f';
+    });
+}
+
 function initTerminal() {
-    if (terminal) return;
+    if (terminal) {
+        terminal.clear();
+        return;
+    }
     terminal = new Terminal({
         cursorBlink: true,
         fontSize: 14,
@@ -242,9 +509,17 @@ function initTerminal() {
     terminal.open(document.getElementById('terminal-body'));
     fitAddon.fit();
 
-    terminal.onData(function(data) {
+    terminal.onKey(function(e) {
+        if (isTakenOver) return;
         if (terminalSocket && terminalSocket.connected) {
-            terminalSocket.emit('ssh_data', {data: data});
+            terminalSocket.emit('ssh_data', {data: e.key});
+        }
+    });
+    terminal.element.addEventListener('paste', function(e) {
+        e.preventDefault();
+        var text = (e.clipboardData || window.clipboardData).getData('text');
+        if (terminalSocket && terminalSocket.connected) {
+            terminalSocket.emit('ssh_data', {data: text});
         }
     });
     terminal.onResize(function(size) {
@@ -254,71 +529,6 @@ function initTerminal() {
     });
 }
 
-function openTerminal(clusterName) {
-    currentClusterName = clusterName;
-    terminalConnected = false;
-    document.getElementById('terminal-overlay').style.display = 'flex';
-    document.getElementById('terminal-title').textContent = 'Web终端 - ' + clusterName;
-    document.getElementById('terminal-status').textContent = '连接中...';
-    document.getElementById('terminal-status').style.color = '#ffd591';
-
-    initTerminal();
-    setTimeout(function() { fitAddon.fit(); }, 100);
-
-    if (!terminalSocket) {
-        terminalSocket = io('/webssh', {
-            reconnection: true,
-            reconnectionAttempts: 3,
-            reconnectionDelay: 1000,
-        });
-
-        terminalSocket.on('connect', function() {
-            terminalSocket.emit('ssh_connect', {cluster: currentClusterName});
-        });
-
-        terminalSocket.on('ssh_connected', function(data) {
-            terminalConnected = true;
-            document.getElementById('terminal-status').textContent = '已连接';
-            document.getElementById('terminal-status').style.color = '#52c41a';
-            terminal.writeln('\x1b[32m' + (data.message || '已连接') + '\x1b[0m\r\n');
-        });
-
-        terminalSocket.on('ssh_output', function(data) {
-            if (terminal) terminal.write(data.data);
-        });
-
-        terminalSocket.on('ssh_error', function(data) {
-            terminalConnected = false;
-            document.getElementById('terminal-status').textContent = '错误';
-            document.getElementById('terminal-status').style.color = '#ff4d4f';
-            if (terminal) terminal.writeln('\x1b[31m' + (data.message || '连接失败') + '\x1b[0m\r\n');
-        });
-
-        terminalSocket.on('ssh_disconnected', function(data) {
-            terminalConnected = false;
-            document.getElementById('terminal-status').textContent = '已断开';
-            document.getElementById('terminal-status').style.color = '#ff4d4f';
-            if (terminal) terminal.writeln('\r\n\x1b[33m' + (data.reason || '连接已断开') + '\x1b[0m\r\n');
-        });
-
-        terminalSocket.on('disconnect', function() {
-            terminalConnected = false;
-            document.getElementById('terminal-status').textContent = '连接断开';
-            document.getElementById('terminal-status').style.color = '#ff4d4f';
-        });
-
-        terminalSocket.on('connect_error', function() {
-            document.getElementById('terminal-status').textContent = '连接服务器失败';
-            document.getElementById('terminal-status').style.color = '#ff4d4f';
-        });
-    } else if (terminalSocket.connected) {
-        terminalSocket.emit('ssh_connect', {cluster: currentClusterName});
-    } else {
-        terminalSocket.connect();
-        terminalSocket.emit('ssh_connect', {cluster: currentClusterName});
-    }
-}
-
 function closeTerminal() {
     if (terminalSocket) {
         terminalSocket.disconnect();
@@ -326,12 +536,19 @@ function closeTerminal() {
     document.getElementById('terminal-overlay').style.display = 'none';
     terminalConnected = false;
     currentClusterName = null;
+    currentSessionId = null;
+    isTakenOver = false;
     if (terminal) {
         terminal.dispose();
         terminal = null;
         fitAddon = null;
     }
-    terminalSocket = null;
+    if (terminalSocket) {
+        terminalSocket = null;
+    }
+    if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+    hideStudentReconnectCountdown();
+    loadMyClusters();
 }
 
 function toggleTerminalFullscreen() {
