@@ -1895,7 +1895,7 @@ def db_test():
 _webssh_connect_times = {}
 
 @socketio.on("connect", namespace="/webssh")
-def webssh_connect():
+def webssh_connect(auth=None):
     if not current_user.is_authenticated:
         return False
 

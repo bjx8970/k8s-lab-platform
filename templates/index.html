@@ -369,6 +369,12 @@ function closeTerminal() {
     document.getElementById('terminal-overlay').style.display = 'none';
     terminalConnected = false;
     currentClusterName = null;
+    if (terminal) {
+        terminal.dispose();
+        terminal = null;
+        fitAddon = null;
+    }
+    terminalSocket = null;
 }
 
 function toggleTerminalFullscreen() {
