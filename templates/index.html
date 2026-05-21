@@ -29,17 +29,88 @@
 <div id="class-clusters-section" style="margin-top:24px"></div>
 {% endif %}
 
+{% if current_user.role in ('admin', 'teacher') %}
+<div id="active-clusters-section" style="margin-top:24px"></div>
+{% endif %}
+
+<div id="terminal-overlay" style="display:none">
+    <div id="terminal-container">
+        <div id="terminal-header">
+            <span id="terminal-title">Web终端</span>
+            <span id="terminal-status" style="margin-left:12px;font-size:12px;color:#aaa"></span>
+            <span id="takeover-indicator" style="margin-left:12px;font-size:12px;color:#faad14;display:none">接管模式</span>
+            <span style="flex:1"></span>
+            <button id="terminal-fullscreen" onclick="toggleTerminalFullscreen()" title="全屏">&#9974;</button>
+            <button id="terminal-close" onclick="closeTerminal()" title="断开">&#10005;</button>
+        </div>
+        <div id="terminal-body"></div>
+    </div>
+</div>
+
+<div id="reconnect-popup" style="display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:#fff;border-radius:12px;padding:28px 32px;box-shadow:0 8px 40px rgba(0,0,0,.2);z-index:10000;text-align:center;min-width:360px">
+    <h3 style="margin:0 0 8px;font-size:16px;color:#333">&#9888; 学生请求恢复连接</h3>
+    <p id="reconnect-popup-student" style="margin:0 0 16px;font-size:14px;color:#666"></p>
+    <div style="height:6px;background:#f0f0f0;border-radius:3px;overflow:hidden;margin-bottom:16px">
+        <div id="reconnect-countdown-bar" style="height:100%;background:#faad14;border-radius:3px;transition:width 1s linear;width:100%"></div>
+    </div>
+    <p id="reconnect-countdown-text" style="font-size:13px;color:#999;margin:0 0 16px">10 秒后自动恢复</p>
+    <div style="display:flex;gap:10px;justify-content:center">
+        <button onclick="acceptReconnect()" style="padding:8px 24px;border:1px solid #52c41a;border-radius:6px;background:#f6ffed;color:#52c41a;font-size:14px;cursor:pointer">允许恢复</button>
+        <button onclick="rejectReconnect()" style="padding:8px 24px;border:1px solid #ff4d4f;border-radius:6px;background:#fff2f0;color:#ff4d4f;font-size:14px;cursor:pointer">拒绝</button>
+    </div>
+</div>
+
 <style>
 .vm-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#f5f5f5;border:1px solid #d9d9d9;border-radius:5px;font-size:12px;color:#999}
 .vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
 .vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
 .vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
 .vm-btn:hover{background:#1890ff;color:#fff}
+.webssh-btn{padding:4px 12px;border:1px solid #52c41a;border-radius:4px;background:#f6ffed;color:#52c41a;font-size:12px;cursor:pointer;font-weight:500}
+.webssh-btn:hover{background:#52c41a;color:#fff}
+.takeover-btn{padding:4px 12px;border:1px solid #722ed1;border-radius:4px;background:#f9f0ff;color:#722ed1;font-size:12px;cursor:pointer;font-weight:500}
+.takeover-btn:hover{background:#722ed1;color:#fff}
+.view-btn{padding:4px 12px;border:1px solid #13c2c2;border-radius:4px;background:#e6fffb;color:#13c2c2;font-size:12px;cursor:pointer;font-weight:500}
+.view-btn:hover{background:#13c2c2;color:#fff}
+.active-cluster-row{display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid #f0f0f0;gap:12px}
+.active-cluster-row:last-child{border-bottom:none}
+.collapsible-header{cursor:pointer;user-select:none;display:flex;align-items:center;gap:8px;padding:10px 14px;font-size:14px;font-weight:600}
+.collapsible-header:hover{background:#f5f5f5}
+.collapsible-body{overflow:hidden;transition:max-height 0.25s ease}
+.role-badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:500}
+.role-student{background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff}
+.role-teacher{background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a}
+.role-admin{background:#fff7e6;border:1px solid #ffd591;color:#d46b08}
+
+#terminal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center}
+#terminal-container{width:90%;height:85%;background:#1e1e1e;border-radius:8px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.4)}
+#terminal-container.fullscreen{width:100%;height:100%;border-radius:0}
+#terminal-header{display:flex;align-items:center;padding:8px 16px;background:#2d2d2d;border-bottom:1px solid #3d3d3d;color:#ccc;font-size:14px;user-select:none}
+#terminal-header button{background:none;border:none;color:#ccc;font-size:16px;cursor:pointer;padding:4px 8px;border-radius:3px;margin-left:4px}
+#terminal-header button:hover{background:#444;color:#fff}
+#terminal-body{flex:1;overflow:hidden;position:relative}
+#terminal-body .xterm{padding:8px;height:100%}
 </style>
+
+<script src="/static/vendor/socket.io/socket.io.min.js"></script>
+<link rel="stylesheet" href="/static/vendor/xterm/xterm.min.css">
+<script src="/static/vendor/xterm/xterm.js"></script>
+<script src="/static/vendor/xterm/xterm-addon-fit.js"></script>
 
 <script>
 const USER_ROLE = '{{ current_user.role }}';
+const USER_ID = parseInt('{{ current_user.id }}');
 var vmStatusCache = {};
+var terminalSocket = null;
+var terminal = null;
+var fitAddon = null;
+var currentClusterName = null;
+var currentSessionId = null;
+var terminalMode = 'owner';
+var terminalConnected = false;
+var reconnectPopupSessionId = null;
+var reconnectCountdownTimer = null;
+var reconnectCountdownSeconds = 10;
 
 function escStats(s) {
     if (!s) return '';
@@ -66,7 +137,16 @@ async function loadStats() {
         const r = await fetch('/api/k8s/clusters');
         var clusters = await r.json();
         document.getElementById('stat-clusters').textContent = Object.keys(clusters).length;
-        if (USER_ROLE === 'teacher') { renderClassCards(clusters); refreshVmStatuses(clusters); }
+        if (USER_ROLE === 'teacher') {
+            await loadStudentSessions();
+            renderClassCards(clusters);
+            refreshVmStatuses(clusters);
+            renderActiveClustersTeacher(clusters);
+        } else if (USER_ROLE === 'admin') {
+            var sr = await fetch('/api/webssh/sessions');
+            var sd = await sr.json();
+            renderActiveClustersAdmin(sd.sessions || [], clusters);
+        }
     } catch(e) {}
 }
 
@@ -77,6 +157,20 @@ var _badgeStyles = {
     'failed': 'background:#fff2f0;border:1px solid #ffccc7;color:#ff4d4f',
 };
 var _labelMap = {'pending':'未部署','installing':'部署中','installed':'已部署','failed':'部署失败'};
+
+var studentSessions = {};
+
+async function loadStudentSessions() {
+    try {
+        var r = await fetch('/api/teacher/student-sessions');
+        var d = await r.json();
+        studentSessions = {};
+        for (var i = 0; i < (d.sessions || []).length; i++) {
+            var s = d.sessions[i];
+            studentSessions[s.cluster_name] = s;
+        }
+    } catch(e) {}
+}
 
 async function clusterVmAction(name, action) {
     var msg = action === 'start' ? '启动' : '停止';
@@ -91,8 +185,10 @@ async function clusterVmAction(name, action) {
         if (!r.ok) throw new Error(d.error || '操作失败');
         showToast(msg + '完成', 'success');
         var cl = await (await fetch('/api/k8s/clusters')).json();
+        await loadStudentSessions();
         renderClassCards(cl);
         refreshVmStatuses(cl);
+        loadActiveClustersRefresh();
     } catch (e) {
         showToast(msg + '失败: ' + e.message, 'error');
     }
@@ -136,7 +232,7 @@ function renderClassCards(clusters) {
         var clsName = classOrder[ci];
         var items = grouped[clsName];
         html += '<div class="card" style="margin-bottom:16px">' +
-            '<h3 style="margin-bottom:12px;font-size:16px">📚 ' + escStats(clsName) + ' (' + items.length + ' 个集群)</h3>';
+            '<h3 style="margin-bottom:12px;font-size:16px">&#128218; ' + escStats(clsName) + ' (' + items.length + ' 个集群)</h3>';
         for (var ii = 0; ii < items.length; ii++) {
             var item = items[ii];
             var c = item.data;
@@ -155,17 +251,21 @@ function renderClassCards(clusters) {
                     var _extra = _cached === 'running' ? ' vm-running' : (_cached === 'stopped' ? ' vm-stopped' : '');
                     vmsHtml += '<span class="vm-tag' + _extra + '" id="vm-' + name + '-' + v.vmid + '">' +
                         escStats(vn) + ' (' + v.role + ')' +
-                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'start\')">▶</button>' +
-                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'stop\')">⏹</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'start\')">&#9654;</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'stop\')">&#9209;</button>' +
                         '</span>';
                 }
             }
+
+            var actionBtns = renderTeacherActionButtons(name, c);
+
             html += '<div style="border:1px solid #f0f0f0;border-radius:8px;padding:14px 16px;margin-bottom:8px">' +
                 '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">' +
                     '<strong style="font-size:15px">' + escStats(label) + '</strong>' +
                     '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
-                        '<button onclick="clusterVmAction(\'' + name + '\',\'start\')" style="padding:3px 10px;border:1px solid #91d5ff;border-radius:4px;background:#fff;color:#1890ff;font-size:12px;cursor:pointer">▶ 启动全部</button>' +
-                        '<button onclick="clusterVmAction(\'' + name + '\',\'stop\')" style="padding:3px 10px;border:1px solid #ffccc7;border-radius:4px;background:#fff;color:#ff4d4f;font-size:12px;cursor:pointer">⏹ 停止全部</button>' +
+                        actionBtns +
+                        '<button onclick="clusterVmAction(\'' + name + '\',\'start\')" style="padding:3px 10px;border:1px solid #91d5ff;border-radius:4px;background:#fff;color:#1890ff;font-size:12px;cursor:pointer">&#9654; 启动全部</button>' +
+                        '<button onclick="clusterVmAction(\'' + name + '\',\'stop\')" style="padding:3px 10px;border:1px solid #ffccc7;border-radius:4px;background:#fff;color:#ff4d4f;font-size:12px;cursor:pointer">&#9209; 停止全部</button>' +
                         '<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500;' + badgeStyle + '">' + k8sLabel + '</span>' +
                     '</div>' +
                 '</div>' +
@@ -177,6 +277,209 @@ function renderClassCards(clusters) {
     }
     if (html) {
         document.getElementById('class-clusters-section').innerHTML = html;
+    }
+}
+
+function renderTeacherActionButtons(clusterName, clusterData) {
+    var session = studentSessions[clusterName];
+    if (!session || session.status === 'terminated') {
+        return '';
+    }
+
+    var ownerName = session.owner ? session.owner.username : '';
+    var statusText = '';
+    if (session.takeover_active) {
+        var taker = session.takeover_by ? session.takeover_by.username : '';
+        statusText = '<span style="font-size:11px;color:#faad14;margin-right:8px">已被 ' + escStats(taker) + ' 接管</span>';
+    } else if (session.status === 'connected') {
+        statusText = '<span style="font-size:11px;color:#52c41a;margin-right:8px">在线 (' + escStats(ownerName) + ')</span>';
+    } else if (session.status === 'disconnected') {
+        statusText = '<span style="font-size:11px;color:#999;margin-right:8px">离线 (' + escStats(ownerName) + ')</span>';
+    }
+
+    if (session.takeover_active && session.takeover_by && session.takeover_by.user_id === parseInt('{{ current_user.id }}')) {
+        return statusText + '<button class="takeover-btn" onclick="openTakeoverTerminal(\'' + session.session_id + '\',\'' + escStats(clusterName) + '\')">查看终端</button>';
+    }
+
+    return statusText +
+        '<button class="takeover-btn" onclick="takeoverSession(\'' + session.session_id + '\',\'' + escStats(clusterName) + '\')">接管</button>' +
+        '<button class="view-btn" onclick="viewSession(\'' + session.session_id + '\',\'' + escStats(clusterName) + '\')">查看</button>';
+}
+
+function renderSessionActionButtons(session) {
+    if (session.takeover_active && session.takeover_by && session.takeover_by.user_id === USER_ID) {
+        return '<button class="takeover-btn" onclick="openTakeoverTerminal(\'' + session.session_id + '\',\'' + escStats(session.cluster_name) + '\')">查看终端</button>';
+    }
+    if (session.takeover_active) {
+        var taker = session.takeover_by ? session.takeover_by.username : '';
+        return '<span style="font-size:11px;color:#faad14">已被 ' + escStats(taker) + ' 接管</span>';
+    }
+    return '<button class="takeover-btn" onclick="takeoverSession(\'' + session.session_id + '\',\'' + escStats(session.cluster_name) + '\')">接管</button>' +
+           '<button class="view-btn" onclick="viewSession(\'' + session.session_id + '\',\'' + escStats(session.cluster_name) + '\')">查看</button>';
+}
+
+function renderActiveClustersAdmin(sessions, clusters) {
+    var activeMap = {};
+    for (var i = 0; i < sessions.length; i++) {
+        var s = sessions[i];
+        if (s.status === 'terminated') continue;
+        if (!activeMap[s.cluster_name]) activeMap[s.cluster_name] = [];
+        activeMap[s.cluster_name].push(s);
+    }
+
+    var entries = [];
+    for (var cname in activeMap) {
+        var c = clusters[cname];
+        if (!c) continue;
+        entries.push({name: cname, cluster: c, sessions: activeMap[cname]});
+    }
+
+    entries.sort(function(a, b) {
+        var idA = parseInt(a.name.replace('k8s_', '')) || 0;
+        var idB = parseInt(b.name.replace('k8s_', '')) || 0;
+        return idA - idB;
+    });
+
+    if (entries.length === 0) {
+        document.getElementById('active-clusters-section').innerHTML = '';
+        return;
+    }
+
+    var html = '<div class="card">' +
+        '<h3 style="margin-bottom:12px;font-size:15px">&#128308; 使用中的集群</h3>' +
+        '<table style="width:100%;font-size:13px">' +
+        '<thead><tr><th style="text-align:left;padding:8px 0">集群</th><th style="text-align:left;padding:8px 0">课程 / 组</th><th style="text-align:left;padding:8px 0">用户</th><th style="text-align:left;padding:8px 0">状态</th><th style="text-align:left;padding:8px 0">操作</th></tr></thead>' +
+        '<tbody>';
+
+    for (var ei = 0; ei < entries.length; ei++) {
+        var entry = entries[ei];
+        var clsLabel = entry.cluster.class_name || '—';
+        var grpLabel = entry.cluster.group_name || '演示集群';
+        var classGrp = escStats(clsLabel) + ' / ' + escStats(grpLabel);
+
+        for (var si = 0; si < entry.sessions.length; si++) {
+            var s = entry.sessions[si];
+            var ownerName = s.owner ? s.owner.username : '';
+            var roleLabel = s.owner ? s.owner.role : '';
+            var roleBadgeClass = roleLabel === 'student' ? 'role-student' : (roleLabel === 'teacher' ? 'role-teacher' : 'role-admin');
+            var roleBadge = '<span class="role-badge ' + roleBadgeClass + '">' + (roleLabel === 'student' ? '学生' : (roleLabel === 'teacher' ? '教师' : '管理员')) + '</span>';
+
+            var statusHtml = '';
+            if (s.takeover_active) {
+                var taker = s.takeover_by ? s.takeover_by.username : '';
+                statusHtml = '<span style="color:#faad14">被 ' + escStats(taker) + ' 接管</span>';
+            } else if (s.status === 'connected') {
+                statusHtml = '<span style="color:#52c41a">● 在线</span>';
+            } else {
+                statusHtml = '<span style="color:#999">○ 离线</span>';
+            }
+
+            var btns = renderSessionActionButtons(s);
+
+            html += '<tr class="active-cluster-row">' +
+                '<td style="font-weight:500">' + escStats(entry.name) + '</td>' +
+                '<td>' + classGrp + '</td>' +
+                '<td>' + escStats(ownerName) + ' ' + roleBadge + '</td>' +
+                '<td>' + statusHtml + '</td>' +
+                '<td>' + btns + '</td>' +
+                '</tr>';
+        }
+    }
+
+    html += '</tbody></table></div>';
+    document.getElementById('active-clusters-section').innerHTML = html;
+}
+
+function renderActiveClustersTeacher(clusters) {
+    var activeClusterNames = {};
+    for (var cname in studentSessions) {
+        var s = studentSessions[cname];
+        if (s.status !== 'terminated') {
+            activeClusterNames[cname] = s;
+        }
+    }
+
+    var byClass = {};
+    var classOrder = [];
+    for (var cname in activeClusterNames) {
+        var c = clusters[cname];
+        if (!c) continue;
+        if (!c.group_id) continue;
+        var key = c.class_name || '未分类';
+        if (!byClass[key]) { byClass[key] = []; classOrder.push(key); }
+        byClass[key].push({name: cname, cluster: c, session: activeClusterNames[cname]});
+    }
+
+    if (classOrder.length === 0) {
+        document.getElementById('active-clusters-section').innerHTML = '';
+        return;
+    }
+
+    var html = '<div class="card">' +
+        '<h3 style="margin-bottom:12px;font-size:15px">&#128308; 使用中的集群</h3>';
+
+    for (var ci = 0; ci < classOrder.length; ci++) {
+        var clsName = classOrder[ci];
+        var items = byClass[clsName];
+        var uid = 'ac-' + ci;
+
+        html += '<div style="border:1px solid #f0f0f0;border-radius:8px;margin-bottom:8px;overflow:hidden">' +
+            '<div class="collapsible-header" onclick="toggleCollapsible(this)" data-target="' + uid + '">' +
+                '<span class="collapse-arrow" style="display:inline-block;width:16px;text-align:center;transition:transform 0.2s">&#9660;</span>' +
+                escStats(clsName) + ' <span style="color:#999;font-weight:400;font-size:12px">(' + items.length + ')</span>' +
+            '</div>' +
+            '<div class="collapsible-body" id="' + uid + '">';
+
+        for (var ii = 0; ii < items.length; ii++) {
+            var item = items[ii];
+            var grpLabel = item.cluster.group_name || item.name;
+            var s = item.session;
+            var ownerName = s.owner ? s.owner.username : '';
+
+            var statusHtml = '';
+            if (s.takeover_active) {
+                var taker = s.takeover_by ? s.takeover_by.username : '';
+                statusHtml = '<span style="color:#faad14">被 ' + escStats(taker) + ' 接管</span>';
+            } else if (s.status === 'connected') {
+                statusHtml = '<span style="color:#52c41a">● 在线</span>';
+            } else {
+                statusHtml = '<span style="color:#999">○ 离线</span>';
+            }
+
+            var k8s = item.cluster.k8s_status || 'pending';
+            var k8sLabel = _labelMap[k8s] || k8s;
+            var badgeStyle = _badgeStyles[k8s] || _badgeStyles['pending'];
+            var k8sBadge = '<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:500;' + badgeStyle + '">' + k8sLabel + '</span>';
+
+            var btns = renderSessionActionButtons(s);
+
+            html += '<div class="active-cluster-row" style="padding-left:32px">' +
+                '<span style="font-weight:500;min-width:80px">' + escStats(grpLabel) + '</span>' +
+                '<span style="color:#999;font-size:12px;min-width:60px">' + escStats(ownerName) + '</span>' +
+                '<span style="font-size:12px">' + statusHtml + '</span>' +
+                k8sBadge +
+                '<span style="flex:1"></span>' +
+                btns +
+                '</div>';
+        }
+
+        html += '</div></div>';
+    }
+
+    html += '</div>';
+    document.getElementById('active-clusters-section').innerHTML = html;
+}
+
+function toggleCollapsible(header) {
+    var targetId = header.getAttribute('data-target');
+    var body = document.getElementById(targetId);
+    var arrow = header.querySelector('.collapse-arrow');
+    if (body.style.maxHeight && body.style.maxHeight !== '0px') {
+        body.style.maxHeight = '0px';
+        arrow.style.transform = 'rotate(-90deg)';
+    } else {
+        body.style.maxHeight = body.scrollHeight + 'px';
+        arrow.style.transform = 'rotate(0deg)';
     }
 }
 
@@ -214,6 +517,295 @@ async function refreshVmStatuses(clusters) {
         for (var k in vmMap) { vmMap[k].className = 'vm-tag vm-stopped'; }
     }
 }
+
+function initTerminal() {
+    if (terminal) {
+        terminal.clear();
+        return;
+    }
+    terminal = new Terminal({
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: '"Cascadia Code", "Fira Code", "Source Code Pro", Consolas, monospace',
+        theme: {
+            background: '#1e1e1e',
+            foreground: '#d4d4d4',
+            cursor: '#d4d4d4',
+            cursorAccent: '#1e1e1e',
+            selection: 'rgba(255,255,255,0.15)',
+            black: '#1e1e1e',
+            red: '#f44747',
+            green: '#6a9955',
+            yellow: '#d7ba7d',
+            blue: '#569cd6',
+            magenta: '#c586c0',
+            cyan: '#4dc9b0',
+            white: '#d4d4d4',
+            brightBlack: '#808080',
+            brightRed: '#f44747',
+            brightGreen: '#6a9955',
+            brightYellow: '#d7ba7d',
+            brightBlue: '#569cd6',
+            brightMagenta: '#c586c0',
+            brightCyan: '#4dc9b0',
+            brightWhite: '#ffffff',
+        },
+    });
+    fitAddon = new FitAddon.FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(document.getElementById('terminal-body'));
+    fitAddon.fit();
+
+    terminal.onKey(function(e) {
+        if (terminalMode === 'viewer') return;
+        if (terminalSocket && terminalSocket.connected) {
+            terminalSocket.emit('ssh_data', {data: e.key});
+        }
+    });
+    terminal.element.addEventListener('paste', function(e) {
+        e.preventDefault();
+        var text = (e.clipboardData || window.clipboardData).getData('text');
+        if (terminalSocket && terminalSocket.connected) {
+            terminalSocket.emit('ssh_data', {data: text});
+        }
+    });
+    terminal.onResize(function(size) {
+        if (terminalSocket && terminalSocket.connected) {
+            terminalSocket.emit('ssh_resize', {cols: size.cols, rows: size.rows});
+        }
+    });
+}
+
+function initTeacherSocket() {
+    terminalSocket = io('/webssh', {
+        reconnection: true,
+        reconnectionAttempts: 3,
+        reconnectionDelay: 1000,
+    });
+
+    terminalSocket.on('connect', function() {
+        if (currentSessionId && terminalMode === 'takeover') {
+            terminalSocket.emit('takeover_start', {session_id: currentSessionId});
+        } else if (currentSessionId && terminalMode === 'viewer') {
+            terminalSocket.emit('view_start', {session_id: currentSessionId});
+        }
+    });
+
+    terminalSocket.on('takeover_started', function(data) {
+        terminalConnected = true;
+        document.getElementById('terminal-status').textContent = '接管中';
+        document.getElementById('terminal-status').style.color = '#faad14';
+        document.getElementById('takeover-indicator').style.display = '';
+    });
+
+    terminalSocket.on('view_started', function(data) {
+        terminalConnected = true;
+        document.getElementById('terminal-status').textContent = '查看中';
+        document.getElementById('terminal-status').style.color = '#13c2c2';
+        document.getElementById('takeover-indicator').style.display = 'none';
+    });
+
+    terminalSocket.on('log_replay', function(data) {
+        if (terminal && data.lines) {
+            terminal.write(data.lines);
+        }
+    });
+
+    terminalSocket.on('ssh_output', function(data) {
+        if (terminal) terminal.write(data.data);
+    });
+
+    terminalSocket.on('ssh_error', function(data) {
+        document.getElementById('terminal-status').textContent = '错误';
+        document.getElementById('terminal-status').style.color = '#ff4d4f';
+        if (terminal) terminal.writeln('\x1b[31m' + (data.message || '连接失败') + '\x1b[0m\r\n');
+    });
+
+    terminalSocket.on('ssh_disconnected', function(data) {
+        terminalConnected = false;
+        document.getElementById('terminal-status').textContent = '已断开';
+        document.getElementById('terminal-status').style.color = '#ff4d4f';
+        if (terminal) terminal.writeln('\r\n\x1b[33m' + (data.reason || '连接已断开') + '\x1b[0m\r\n');
+    });
+
+    terminalSocket.on('reconnect_request_notify', function(data) {
+        showReconnectPopup(data.session_id, data.student, data.cluster);
+    });
+
+    terminalSocket.on('takeover_accepted', function(data) {
+        document.getElementById('terminal-overlay').style.display = 'none';
+        if (terminal) { terminal.dispose(); terminal = null; fitAddon = null; }
+        currentSessionId = null;
+        currentClusterName = null;
+        terminalMode = 'owner';
+        loadStudentSessions();
+        loadStats();
+        loadActiveClustersRefresh();
+    });
+
+    terminalSocket.on('disconnect', function() {
+        terminalConnected = false;
+        document.getElementById('terminal-status').textContent = '连接断开';
+        document.getElementById('terminal-status').style.color = '#ff4d4f';
+    });
+}
+
+function takeoverSession(sessionId, clusterName) {
+    currentSessionId = sessionId;
+    currentClusterName = clusterName;
+    terminalMode = 'takeover';
+    document.getElementById('terminal-overlay').style.display = 'flex';
+    document.getElementById('terminal-title').textContent = '接管 - ' + clusterName;
+    document.getElementById('terminal-status').textContent = '接管中...';
+    document.getElementById('terminal-status').style.color = '#ffd591';
+    document.getElementById('takeover-indicator').style.display = '';
+    document.getElementById('takeover-indicator').textContent = '接管模式';
+
+    initTerminal();
+    setTimeout(function() { fitAddon.fit(); }, 100);
+
+    if (!terminalSocket) {
+        initTeacherSocket();
+    } else {
+        terminalSocket.emit('takeover_start', {session_id: sessionId});
+    }
+}
+
+function viewSession(sessionId, clusterName) {
+    currentSessionId = sessionId;
+    currentClusterName = clusterName;
+    terminalMode = 'viewer';
+    document.getElementById('terminal-overlay').style.display = 'flex';
+    document.getElementById('terminal-title').textContent = '查看 - ' + clusterName;
+    document.getElementById('terminal-status').textContent = '查看中...';
+    document.getElementById('terminal-status').style.color = '#ffd591';
+    document.getElementById('takeover-indicator').style.display = 'none';
+
+    initTerminal();
+    setTimeout(function() { fitAddon.fit(); }, 100);
+
+    if (!terminalSocket) {
+        initTeacherSocket();
+    } else {
+        terminalSocket.emit('view_start', {session_id: sessionId});
+    }
+}
+
+function openTakeoverTerminal(sessionId, clusterName) {
+    takeoverSession(sessionId, clusterName);
+}
+
+function loadActiveClustersRefresh() {
+    if (USER_ROLE === 'admin') {
+        Promise.all([fetch('/api/webssh/sessions').then(r => r.json()), fetch('/api/k8s/clusters').then(r => r.json())])
+            .then(function(results) {
+                renderActiveClustersAdmin(results[0].sessions || [], results[1]);
+            }).catch(function() {});
+    } else if (USER_ROLE === 'teacher') {
+        Promise.all([fetch('/api/teacher/student-sessions').then(r => r.json()), fetch('/api/k8s/clusters').then(r => r.json())])
+            .then(function(results) {
+                studentSessions = {};
+                for (var i = 0; i < (results[0].sessions || []).length; i++) {
+                    var s = results[0].sessions[i];
+                    studentSessions[s.cluster_name] = s;
+                }
+                renderActiveClustersTeacher(results[1]);
+            }).catch(function() {});
+    }
+}
+
+function closeTerminal() {
+    if (terminalSocket && currentSessionId) {
+        if (terminalMode === 'takeover') {
+            terminalSocket.emit('takeover_stop', {session_id: currentSessionId});
+        } else if (terminalMode === 'viewer') {
+            terminalSocket.emit('view_stop', {session_id: currentSessionId});
+        }
+    }
+    if (terminalSocket) {
+        terminalSocket.disconnect();
+        terminalSocket = null;
+    }
+    document.getElementById('terminal-overlay').style.display = 'none';
+    terminalConnected = false;
+    currentClusterName = null;
+    currentSessionId = null;
+    terminalMode = 'owner';
+    if (terminal) {
+        terminal.dispose();
+        terminal = null;
+        fitAddon = null;
+    }
+    loadStudentSessions();
+    loadStats();
+    loadActiveClustersRefresh();
+}
+
+function showReconnectPopup(sessionId, student, cluster) {
+    reconnectPopupSessionId = sessionId;
+    reconnectCountdownSeconds = 10;
+    document.getElementById('reconnect-popup-student').textContent = student + ' 请求恢复对 ' + cluster + ' 的控制';
+    document.getElementById('reconnect-popup').style.display = 'block';
+    document.getElementById('reconnect-countdown-bar').style.width = '100%';
+    document.getElementById('reconnect-countdown-text').textContent = '10 秒后自动恢复';
+
+    if (reconnectCountdownTimer) clearInterval(reconnectCountdownTimer);
+    reconnectCountdownTimer = setInterval(function() {
+        reconnectCountdownSeconds--;
+        var pct = (reconnectCountdownSeconds / 10) * 100;
+        document.getElementById('reconnect-countdown-bar').style.width = pct + '%';
+        document.getElementById('reconnect-countdown-text').textContent = reconnectCountdownSeconds + ' 秒后自动恢复';
+        if (reconnectCountdownSeconds <= 0) {
+            clearInterval(reconnectCountdownTimer);
+            reconnectCountdownTimer = null;
+            acceptReconnect();
+        }
+    }, 1000);
+}
+
+function hideReconnectPopup() {
+    document.getElementById('reconnect-popup').style.display = 'none';
+    if (reconnectCountdownTimer) {
+        clearInterval(reconnectCountdownTimer);
+        reconnectCountdownTimer = null;
+    }
+    reconnectPopupSessionId = null;
+}
+
+function acceptReconnect() {
+    if (terminalSocket && reconnectPopupSessionId) {
+        terminalSocket.emit('reconnect_response', {session_id: reconnectPopupSessionId, action: 'accept'});
+    }
+    hideReconnectPopup();
+    showToast('已允许学生恢复连接', 'success');
+}
+
+function rejectReconnect() {
+    if (terminalSocket && reconnectPopupSessionId) {
+        terminalSocket.emit('reconnect_response', {session_id: reconnectPopupSessionId, action: 'reject'});
+    }
+    hideReconnectPopup();
+    showToast('已拒绝恢复请求', 'info');
+}
+
+function toggleTerminalFullscreen() {
+    var container = document.getElementById('terminal-container');
+    container.classList.toggle('fullscreen');
+    setTimeout(function() { fitAddon.fit(); }, 150);
+}
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') {
+        var overlay = document.getElementById('terminal-overlay');
+        if (overlay && overlay.style.display !== 'none') {
+            closeTerminal();
+        }
+        var popup = document.getElementById('reconnect-popup');
+        if (popup && popup.style.display !== 'none') {
+            hideReconnectPopup();
+        }
+    }
+});
 
 document.addEventListener('DOMContentLoaded', loadStats);
 </script>

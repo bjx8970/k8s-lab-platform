@@ -1,0 +1,226 @@
+{% extends "base.html" %}
+{% block page_heading %}WebSSH 管理{% endblock %}
+{% block content %}
+
+<div style="display:flex;gap:16px;margin-bottom:20px">
+    <div class="card" style="flex:1">
+        <h3 style="margin-bottom:16px;font-size:15px">&#9881; 连接限制设置</h3>
+        <div id="config-form">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+                <div class="form-group">
+                    <label>全局最大连接数</label>
+                    <input type="number" id="cfg-global_max" class="form-control" min="1" max="200">
+                </div>
+                <div class="form-group">
+                    <label>每学生最大连接数</label>
+                    <input type="number" id="cfg-student_max" class="form-control" min="1" max="20">
+                </div>
+                <div class="form-group">
+                    <label>每教师最大连接数</label>
+                    <input type="number" id="cfg-teacher_max" class="form-control" min="1" max="20">
+                </div>
+                <div class="form-group">
+                    <label>无操作超时 (秒)</label>
+                    <input type="number" id="cfg-idle_timeout" class="form-control" min="60" step="60">
+                </div>
+                <div class="form-group">
+                    <label>关闭保留时长 (秒)</label>
+                    <input type="number" id="cfg-retention_time" class="form-control" min="60" step="60">
+                </div>
+            </div>
+            <div style="margin-top:12px">
+                <button onclick="saveConfig()" class="btn btn-primary">保存配置</button>
+            </div>
+        </div>
+    </div>
+    <div class="card" style="flex:1">
+        <h3 style="margin-bottom:16px;font-size:15px">&#128200; 当前状态</h3>
+        <div id="stats-display" style="font-size:14px;line-height:2">
+            <div>活跃连接: <strong id="stat-active">0</strong></div>
+            <div>断开保留: <strong id="stat-disconnected">0</strong></div>
+            <div>被接管: <strong id="stat-takenover">0</strong></div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 style="margin:0;font-size:15px">&#128187; 会话列表</h3>
+        <button onclick="refreshSessions()" class="btn" id="refresh-btn">刷新</button>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>所有者</th>
+                <th>角色</th>
+                <th>集群</th>
+                <th>状态</th>
+                <th>接管者</th>
+                <th>查看者</th>
+                <th>创建时间</th>
+                <th>最后活动</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody id="session-table">
+            <tr><td colspan="9" style="text-align:center;color:#999;padding:40px 0">加载中...</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<style>
+.status-connected{color:#52c41a;font-weight:600}
+.status-disconnected{color:#faad14;font-weight:600}
+.status-terminated{color:#ff4d4f;font-weight:600}
+</style>
+
+<script>
+var sessions = [];
+var config = {};
+
+async function loadConfig() {
+    try {
+        var r = await fetch('/api/admin/webssh/config');
+        config = await r.json();
+        document.getElementById('cfg-global_max').value = config.global_max || 64;
+        document.getElementById('cfg-student_max').value = config.student_max || 3;
+        document.getElementById('cfg-teacher_max').value = config.teacher_max || 8;
+        document.getElementById('cfg-idle_timeout').value = config.idle_timeout || 1800;
+        document.getElementById('cfg-retention_time').value = config.retention_time || 1800;
+    } catch(e) {
+        showToast('加载配置失败: ' + e.message, 'error');
+    }
+}
+
+async function saveConfig() {
+    var newConfig = {
+        global_max: parseInt(document.getElementById('cfg-global_max').value),
+        student_max: parseInt(document.getElementById('cfg-student_max').value),
+        teacher_max: parseInt(document.getElementById('cfg-teacher_max').value),
+        idle_timeout: parseInt(document.getElementById('cfg-idle_timeout').value),
+        retention_time: parseInt(document.getElementById('cfg-retention_time').value),
+    };
+    try {
+        var r = await fetch('/api/admin/webssh/config', {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(newConfig),
+        });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '保存失败');
+        showToast('配置已保存', 'success');
+        config = newConfig;
+    } catch(e) {
+        showToast('保存失败: ' + e.message, 'error');
+    }
+}
+
+async function refreshSessions() {
+    var btn = document.getElementById('refresh-btn');
+    btn.disabled = true;
+    btn.textContent = '刷新中...';
+    try {
+        var r = await fetch('/api/webssh/sessions');
+        var d = await r.json();
+        sessions = d.sessions || [];
+        renderSessions(sessions);
+        updateStats(sessions);
+    } catch(e) {
+        document.getElementById('session-table').innerHTML = '<tr><td colspan="9" style="text-align:center;color:#ff4d4f;padding:20px">' + esc(e.message) + '</td></tr>';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '刷新';
+    }
+}
+
+function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatDuration(seconds) {
+    if (!seconds) return '-';
+    if (seconds < 60) return seconds + 's';
+    var m = Math.floor(seconds / 60);
+    var s = seconds % 60;
+    if (m < 60) return m + 'm';
+    var h = Math.floor(m / 60);
+    var rm = m % 60;
+    return h + 'h ' + rm + 'm';
+}
+
+function formatTime(ts) {
+    if (!ts) return '-';
+    var d = new Date(ts * 1000);
+    return d.toLocaleString('zh-CN');
+}
+
+function updateStats(sessions) {
+    var active = 0, disconnected = 0, takenover = 0;
+    for (var i = 0; i < sessions.length; i++) {
+        var s = sessions[i];
+        if (s.status === 'connected') active++;
+        if (s.status === 'disconnected') disconnected++;
+        if (s.takeover_active) takenover++;
+    }
+    document.getElementById('stat-active').textContent = active;
+    document.getElementById('stat-disconnected').textContent = disconnected;
+    document.getElementById('stat-takenover').textContent = takenover;
+}
+
+function renderSessions(sessions) {
+    if (sessions.length === 0) {
+        document.getElementById('session-table').innerHTML = '<tr><td colspan="9" style="text-align:center;color:#999;padding:40px 0">暂无会话</td></tr>';
+        return;
+    }
+
+    var html = '';
+    for (var i = 0; i < sessions.length; i++) {
+        var s = sessions[i];
+        var statusClass = s.status === 'connected' ? 'status-connected' : (s.status === 'disconnected' ? 'status-disconnected' : 'status-terminated');
+        var statusLabel = s.status === 'connected' ? '在线' : (s.status === 'disconnected' ? '离线' : '已终止');
+        var roleBadge = s.owner.role === 'student' ? 'badge badge-blue' : (s.owner.role === 'teacher' ? 'badge badge-green' : 'badge badge-orange');
+        var roleLabel = s.owner.role === 'student' ? '学生' : (s.owner.role === 'teacher' ? '教师' : '管理员');
+        var takeoverHtml = s.takeover_by ? esc(s.takeover_by.username) : '-';
+        var viewerHtml = s.viewer_count > 0 ? s.viewer_count + ' 人' : '-';
+        var now = Date.now() / 1000;
+        var idleTime = s.last_input_time ? Math.floor(now - s.last_input_time) : 0;
+
+        var actionBtns = '<button class="btn btn-sm btn-danger" onclick="terminateSession(\'' + s.session_id + '\')">终止</button>';
+
+        html += '<tr>' +
+            '<td>' + esc(s.owner.username) + '</td>' +
+            '<td><span class="' + roleBadge + '">' + roleLabel + '</span></td>' +
+            '<td>' + esc(s.cluster_name) + '</td>' +
+            '<td><span class="' + statusClass + '">' + statusLabel + '</span></td>' +
+            '<td>' + takeoverHtml + '</td>' +
+            '<td>' + viewerHtml + '</td>' +
+            '<td style="font-size:12px">' + formatTime(s.created_at) + '</td>' +
+            '<td style="font-size:12px">' + formatDuration(idleTime) + ' 前</td>' +
+            '<td>' + actionBtns + '</td>' +
+            '</tr>';
+    }
+    document.getElementById('session-table').innerHTML = html;
+}
+
+async function terminateSession(sessionId) {
+    if (!await showConfirm('确定强制终止该会话？')) return;
+    try {
+        var r = await fetch('/api/admin/webssh/sessions/' + encodeURIComponent(sessionId), { method: 'DELETE' });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '终止失败');
+        showToast(d.message, 'success');
+        refreshSessions();
+    } catch(e) {
+        showToast('终止失败: ' + e.message, 'error');
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadConfig();
+    refreshSessions();
+    setInterval(refreshSessions, 15000);
+});
+</script>
+{% endblock %}
