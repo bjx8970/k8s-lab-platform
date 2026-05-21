@@ -9,7 +9,6 @@ _last_refresh_error = None
 _last_build_error = None
 
 REFRESH_INTERVAL = 300
-CACHE_TTL = 60
 
 
 def _get_pve_server_configs():
@@ -158,34 +157,11 @@ def _cache_worker():
             pass
 
 
-def get_vm_status(node, vmid, no_fallback=False):
+def get_vm_status(node, vmid):
     key = f"{node}_{vmid}"
     with _cache_lock:
         entry = _vm_cache.get(key)
-        if entry and (time.time() - entry.get("updated_at", 0)) < CACHE_TTL:
-            return {"status": entry["status"]}
-
-    if no_fallback:
-        return {"status": "unknown"}
-
-    try:
-        from modules.db import find_cluster_by_vm
-        cluster_obj = find_cluster_by_vm(node, vmid)
-        if not cluster_obj:
-            return {"status": "unknown"}
-        sid = cluster_obj.get("pve_server_id", 0)
-        configs = _get_pve_server_configs()
-        clients = _build_clients(configs)
-        client = clients.get(sid)
-        if not client:
-            return {"status": "unknown"}
-        data = client.get_vm_status(node, vmid)
-        result = data.get("status", "unknown")
-        with _cache_lock:
-            _vm_cache[key] = {"status": result, "updated_at": time.time()}
-        return {"status": result}
-    except Exception:
-        return {"status": "unknown"}
+        return {"status": entry["status"]} if entry else {"status": "unknown"}
 
 
 def update_vm_status(node, vmid, status):

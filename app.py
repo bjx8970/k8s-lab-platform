@@ -1018,7 +1018,7 @@ def pve_get_vms_status_batch():
         if not node or not vmid:
             continue
         key = f"{node}_{vmid}"
-        results[key] = get_cached_vm_status(node, vmid, no_fallback=True)
+        results[key] = get_cached_vm_status(node, vmid)
     return jsonify({"statuses": results})
 
 
