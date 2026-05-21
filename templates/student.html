@@ -24,20 +24,24 @@
 .mycluster-item{border:1px solid #f0f0f0;border-radius:8px;padding:14px 16px;margin-bottom:8px}
 .mycluster-item .mycluster-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
 .mycluster-item .mycluster-name{font-size:15px;font-weight:600}
-.mycluster-item .mycluster-ssh{background:#f6f8fa;border:1px solid #e8eaed;border-radius:6px;padding:10px 14px;margin-top:8px;font-size:13px;line-height:1.8}
+.mycluster-item .mycluster-action-bar{display:flex;align-items:center;gap:12px;margin-top:12px;padding-top:12px;border-top:1px solid #f0f0f0}
+.mycluster-item .mycluster-ssh{background:#f6f8fa;border:1px solid #e8eaed;border-radius:6px;padding:10px 14px;margin-top:8px;font-size:13px;line-height:1.8;display:none}
+.mycluster-item .mycluster-ssh.show{display:block}
 .mycluster-item .mycluster-ssh .ssh-label{color:#666;display:inline-block;min-width:56px}
 .mycluster-item .mycluster-ssh code{background:#e8eaed;padding:2px 8px;border-radius:4px;font-family:SFMono-Regular,Consolas,monospace;font-size:13px;color:#d63384}
+.view-ssh-btn{padding:4px 12px;border:1px solid #1890ff;border-radius:4px;background:#e6f7ff;color:#1890ff;font-size:12px;cursor:pointer;font-weight:500}
+.view-ssh-btn:hover{background:#1890ff;color:#fff}
 .mycluster-item .mycluster-vms{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .vm-tag{background:#f5f5f5;border:1px solid #d9d9d9;color:#999;border-radius:5px;font-size:12px;padding:3px 8px;display:inline-flex;align-items:center;gap:4px}
 .vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
 .vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
 .vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
 .vm-btn:hover{background:#1890ff;color:#fff}
-.ssh-btn{padding:4px 12px;border:1px solid #52c41a;border-radius:4px;background:#f6ffed;color:#52c41a;font-size:12px;cursor:pointer;font-weight:500}
-.ssh-btn:hover{background:#52c41a;color:#fff}
-.ssh-btn-reconnect{padding:4px 12px;border:1px solid #1890ff;border-radius:4px;background:#e6f7ff;color:#1890ff;font-size:12px;cursor:pointer;font-weight:500}
-.ssh-btn-reconnect:hover{background:#1890ff;color:#fff}
-.ssh-btn-terminate{padding:4px 12px;border:1px solid #ff4d4f;border-radius:4px;background:#fff2f0;color:#ff4d4f;font-size:12px;cursor:pointer;font-weight:500}
+.ssh-btn{padding:8px 24px;border:2px solid #52c41a;border-radius:6px;background:#52c41a;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
+.ssh-btn:hover{background:#73d13d;border-color:#73d13d}
+.ssh-btn-reconnect{padding:8px 20px;border:2px solid #1890ff;border-radius:6px;background:#1890ff;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
+.ssh-btn-reconnect:hover{background:#40a9ff;border-color:#40a9ff}
+.ssh-btn-terminate{padding:8px 16px;border:2px solid #ff4d4f;border-radius:6px;background:#fff2f0;color:#ff4d4f;font-size:13px;cursor:pointer;font-weight:600}
 .ssh-btn-terminate:hover{background:#ff4d4f;color:#fff}
 .ssh-btn-request{padding:4px 12px;border:1px solid #faad14;border-radius:4px;background:#fff7e6;color:#d46b08;font-size:12px;cursor:pointer;font-weight:500}
 .ssh-btn-request:hover{background:#faad14;color:#fff}
@@ -75,14 +79,6 @@ function esc(s) {
     if (!s) return '';
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
-
-var _badgeStyles = {
-    'pending': 'background:#fff7e6;border:1px solid #ffd591;color:#d46b08',
-    'installing': 'background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff',
-    'installed': 'background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a',
-    'failed': 'background:#fff2f0;border:1px solid #ffccc7;color:#ff4d4f',
-};
-var _labelMap = {'pending':'未部署','installing':'部署中','installed':'已部署','failed':'部署失败'};
 
 async function vmAction(node, vmid, action) {
     try {
@@ -193,12 +189,9 @@ function renderCards(clusters) {
             var c = items[ii].data;
             var cname = items[ii].name;
             var label = c.group_name || '集群';
-            var k8sStatus = c.k8s_status || 'pending';
-            var k8sLabel = _labelMap[k8sStatus] || k8sStatus;
-            var badgeStyle = _badgeStyles[k8sStatus] || _badgeStyles['pending'];
             var host = esc('{{ (get_config("openwrt") or {}).get("host", "") }}') + ':' + (c.ssh_port || '');
             var pw = esc(c.password || 'k8s.1234');
-            var sshInfo = '<div class="mycluster-ssh">' +
+            var sshInfo = '<div class="mycluster-ssh" id="ssh-info-' + esc(cname) + '">' +
                 '<span class="ssh-label">地址</span> <code>' + host + '</code><br>' +
                 '<span class="ssh-label">用户</span> <code>k8s</code><br>' +
                 '<span class="ssh-label">密码</span> <code>' + pw + '</code>' +
@@ -224,10 +217,10 @@ function renderCards(clusters) {
             html += '<div class="mycluster-item">' +
                 '<div class="mycluster-header">' +
                     '<span class="mycluster-name">' + esc(label) + '</span>' +
-                    '<span style="display:flex;gap:8px;align-items:center">' +
-                        btnHtml +
-                        '<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500;' + badgeStyle + '">' + k8sLabel + '</span>' +
-                    '</span>' +
+                '</div>' +
+                '<div class="mycluster-action-bar">' +
+                    btnHtml +
+                    '<button class="view-ssh-btn" onclick="toggleSshInfo(\'' + esc(cname) + '\')">&#128274; 查看连接信息</button>' +
                 '</div>' +
                 sshInfo +
                 (vmsHtml ? '<div class="mycluster-vms">' + vmsHtml + '</div>' : '') +
@@ -264,6 +257,12 @@ function renderSessionButtons(clusterName, clusterData) {
     }
 
     return '';
+}
+
+function toggleSshInfo(clusterName) {
+    var el = document.getElementById('ssh-info-' + clusterName);
+    if (!el) return;
+    el.classList.toggle('show');
 }
 
 async function createSession(clusterName) {
