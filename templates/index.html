@@ -808,5 +808,10 @@ document.addEventListener('keydown', function(e) {
 });
 
 document.addEventListener('DOMContentLoaded', loadStats);
+
+function onSessionUpdate(data) {
+    loadActiveClustersRefresh();
+    loadStats();
+}
 </script>
 {% endblock %}

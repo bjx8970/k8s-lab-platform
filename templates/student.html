@@ -567,5 +567,9 @@ document.addEventListener('keydown', function(e) {
 });
 
 document.addEventListener('DOMContentLoaded', loadMyClusters);
+
+function onSessionUpdate(data) {
+    loadMyClusters();
+}
 </script>
 {% endblock %}

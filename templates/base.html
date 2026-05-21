@@ -230,6 +230,7 @@
             </div>
         </div>
     </div>
+    <script src="/static/vendor/socket.io/socket.io.min.js"></script>
     <script>
     (function() {
         var token = document.querySelector('meta[name="csrf-token"]');
@@ -252,6 +253,29 @@
     }
     </script>
 
+    <script>
+    var stateSocket = null;
+    (function() {
+        stateSocket = io('/state', {
+            reconnection: true,
+            reconnectionAttempts: 5,
+            reconnectionDelay: 2000,
+        });
+
+        stateSocket.on('task_update', function(data) {
+            if (typeof updateTaskFromEvent === 'function') {
+                updateTaskFromEvent(data);
+            }
+        });
+
+        stateSocket.on('session_update', function(data) {
+            if (typeof onSessionUpdate === 'function') {
+                onSessionUpdate(data);
+            }
+        });
+    })();
+    </script>
+
 {% if current_user.role in ('admin', 'teacher') %}
 <script>
 var _taskPanelOpen = false;
@@ -260,7 +284,7 @@ function toggleTaskPanel() {
     _taskPanelOpen = !_taskPanelOpen;
     var p = document.getElementById('task-panel');
     if (p) p.style.display = _taskPanelOpen ? 'block' : 'none';
-    if (_taskPanelOpen) pollTaskList();
+    if (_taskPanelOpen) loadTaskList();
 }
 
 function htmlEscape(s) {
@@ -272,7 +296,7 @@ function shortId(id) {
     return id ? id.substring(0, 8) : '';
 }
 
-async function pollTaskList() {
+async function loadTaskList() {
     if (!_taskPanelOpen) return;
     try {
         var r = await fetch('/api/k8s/tasks');
@@ -280,9 +304,35 @@ async function pollTaskList() {
         if (!r.ok) throw new Error(d.error);
         renderTaskList(d.tasks || []);
     } catch (e) {
-        console.error('poll tasks failed:', e);
+        console.error('load tasks failed:', e);
     }
-    setTimeout(pollTaskList, 5000);
+}
+
+function updateTaskFromEvent(data) {
+    var badge = document.getElementById('task-badge');
+    if (!badge) return;
+    if (data.status === 'running') {
+        badge.style.display = '';
+        badge.textContent = '...';
+    }
+    refreshTaskBadge();
+    if (_taskPanelOpen) {
+        loadTaskList();
+    }
+}
+
+async function refreshTaskBadge() {
+    try {
+        var r = await fetch('/api/k8s/tasks');
+        var d = await r.json();
+        if (!r.ok) return;
+        var running = d.tasks.filter(function(t) { return t.status === 'running'; });
+        var badge = document.getElementById('task-badge');
+        if (badge) {
+            badge.style.display = running.length > 0 ? '' : 'none';
+            badge.textContent = running.length || '...';
+        }
+    } catch(e) {}
 }
 
 function renderTaskList(tasks) {

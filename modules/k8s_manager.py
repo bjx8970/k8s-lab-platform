@@ -25,6 +25,7 @@ class K8sError(Exception):
 _task_store = {}
 _task_lock = threading.Lock()
 _task_cancel_events = {}
+_on_task_update = None
 
 _openwrt_locks = {}
 _openwrt_locks_lock = threading.Lock()
@@ -32,6 +33,11 @@ _openwrt_locks_lock = threading.Lock()
 
 def _new_task_id():
     return uuid.uuid4().hex[:12]
+
+
+def set_on_task_update(callback):
+    global _on_task_update
+    _on_task_update = callback
 
 
 def _update_task(task_id, status="running", progress=0, message="", result=None, error=None,
@@ -58,6 +64,8 @@ def _update_task(task_id, status="running", progress=0, message="", result=None,
             "progress": progress,
             "message": message,
         })
+    if _on_task_update:
+        _on_task_update(task_id, status, progress, message, entry.get("created_by"), queue)
 
 
 def _append_log(task_id, message):
