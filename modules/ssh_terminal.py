@@ -6,6 +6,8 @@ from collections import deque
 
 import paramiko
 
+from modules.db import get_config as db_get_config, set_config as db_set_config
+
 
 class SSHConnectionError(Exception):
     pass
@@ -262,6 +264,10 @@ class SSHManager:
         self.idle_timeout = 1800
         self.retention_time = 1800
 
+        persisted = db_get_config("webssh")
+        if persisted:
+            self.set_config(persisted)
+
         self._lock = threading.Lock()
         self._cleanup_running = False
         self._cleanup_thread = None
@@ -500,6 +506,13 @@ class SSHManager:
             self.idle_timeout = int(config["idle_timeout"])
         if "retention_time" in config:
             self.retention_time = int(config["retention_time"])
+        db_set_config("webssh", {
+            "global_max": self.global_max,
+            "student_max": self.student_max,
+            "teacher_max": self.teacher_max,
+            "idle_timeout": self.idle_timeout,
+            "retention_time": self.retention_time,
+        })
 
     def _remove_session(self, session_id):
         session = self._sessions.pop(session_id, None)
