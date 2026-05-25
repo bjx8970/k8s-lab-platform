@@ -21,71 +21,109 @@
 </div>
 
 <div class="modal-overlay" id="shutdown-vote-modal" style="z-index:10000">
-    <div style="max-width:520px;width:90%;background:#fff;border-radius:12px;padding:32px 36px;box-shadow:0 12px 48px rgba(0,0,0,0.25)">
-        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
-            <span id="shutdown-vote-icon" style="font-size:24px">&#9888;&#65039;</span>
-            <h3 id="shutdown-vote-title" style="margin:0;font-size:20px;font-weight:600">关机确认</h3>
+    <div class="vote-modal-card">
+        <div class="vote-modal-header">
+            <span class="vote-modal-icon" id="shutdown-vote-icon">&#9888;&#65039;</span>
+            <h3 class="vote-modal-title" id="shutdown-vote-title">关机确认</h3>
         </div>
-        <p id="shutdown-vote-message" style="font-size:14px;color:#555;line-height:1.7;margin:0 0 16px"></p>
-        <div id="shutdown-vote-vm-section" style="background:#f6f8fa;border:1px solid #e8eaed;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;display:none"></div>
-        <div id="shutdown-vote-cluster-warning" style="background:#fff2f0;border:1px solid #ffccc7;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;color:#cf1322;display:none">
+        <p class="vote-modal-msg" id="shutdown-vote-message"></p>
+        <div class="vote-modal-section" id="shutdown-vote-vm-section"></div>
+        <div class="vote-modal-warning" id="shutdown-vote-cluster-warning">
             <strong>&#9888;&#65039; 集群关机提醒：</strong>此操作将关闭该集群的<b>全部节点</b>，请确认
         </div>
-        <div style="text-align:center">
-            <div id="shutdown-vote-countdown" style="font-size:36px;font-weight:700;color:#1890ff;margin:12px 0 8px">30s</div>
-            <div id="shutdown-vote-bar" style="height:4px;background:#e8eaed;border-radius:2px;margin:0 0 16px;overflow:hidden">
+        <div class="vote-modal-countdown-area">
+            <div class="vote-modal-num" id="shutdown-vote-countdown">30s</div>
+            <div class="vote-modal-bar" style="height:4px;background:#e8eaed">
                 <div id="shutdown-vote-bar-fill" style="height:100%;width:100%;background:#1890ff;border-radius:2px;transition:width 1s linear"></div>
             </div>
         </div>
-        <div id="shutdown-vote-actions" style="display:none;gap:12px;justify-content:center;margin-top:8px">
+        <div class="vote-modal-actions" id="shutdown-vote-actions">
             <button class="btn btn-primary" onclick="castShutdownVote(true)" style="min-width:120px;padding:10px 24px;font-size:15px">&#10003; 同意关机</button>
             <button class="btn btn-danger" onclick="castShutdownVote(false)" style="min-width:120px;padding:10px 24px;font-size:15px">&#10007; 拒绝</button>
         </div>
-        <div id="shutdown-vote-pending" style="display:none;margin-top:8px;text-align:center">
+        <div class="vote-modal-pending" id="shutdown-vote-pending">
             <p style="color:#888;margin-bottom:12px;font-size:14px">等待中... 已同意: <strong id="shutdown-vote-agreed-count" style="color:#1890ff">1</strong>/<span id="shutdown-vote-total-count">0</span></p>
-            <button class="btn" onclick="cancelShutdownVote()" style="border-color:#999;color:#666;padding:8px 20px">取消操作</button>
+            <button class="btn" onclick="cancelShutdownVote()" style="padding:8px 20px">取消操作</button>
         </div>
-        <div id="shutdown-vote-waiting" style="display:none;margin-top:8px;text-align:center">
+        <div class="vote-modal-waiting" id="shutdown-vote-waiting">
             <p style="color:#888;font-size:14px">已投票，等待其他同学...</p>
         </div>
     </div>
 </div>
 
 <style>
-.mycluster-item{border:1px solid #f0f0f0;border-radius:8px;padding:14px 16px;margin-bottom:8px}
-.mycluster-item .mycluster-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
-.mycluster-item .mycluster-name{font-size:15px;font-weight:600}
-.mycluster-item .mycluster-action-bar{display:flex;align-items:center;gap:12px;margin-top:12px;padding-top:12px;border-top:1px solid #f0f0f0}
-.mycluster-item .mycluster-ssh{background:#f6f8fa;border:1px solid #e8eaed;border-radius:6px;padding:10px 14px;margin-top:8px;font-size:13px;line-height:1.8;display:none}
+/* ── Cluster Cards ── */
+.mycluster-item {
+  background:#fff;
+  border-radius:10px;
+  padding:20px 24px;
+  margin-bottom:8px;
+  box-shadow:var(--card-shadow);
+  transition:box-shadow .2s, transform .2s;
+  animation:fadeIn .3s ease;
+}
+.mycluster-item:hover{box-shadow:var(--shadow-lg)}
+.mycluster-item .mycluster-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:2px}
+.mycluster-item .mycluster-name{font-size:16px;font-weight:600;color:var(--text)}
+.mycluster-item .mycluster-action-bar{display:flex;align-items:center;gap:10px;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
+.mycluster-item .mycluster-ssh{background:#f6f8fa;border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-top:10px;font-size:13px;line-height:1.9;display:none}
 .mycluster-item .mycluster-ssh.show{display:block}
-.mycluster-item .mycluster-ssh .ssh-label{color:#666;display:inline-block;min-width:56px}
+.mycluster-item .mycluster-ssh .ssh-label{color:var(--text-secondary);display:inline-block;min-width:60px}
 .mycluster-item .mycluster-ssh code{background:#e8eaed;padding:2px 8px;border-radius:4px;font-family:SFMono-Regular,Consolas,monospace;font-size:13px;color:#d63384}
-.view-ssh-btn{padding:4px 12px;border:1px solid #1890ff;border-radius:4px;background:#e6f7ff;color:#1890ff;font-size:12px;cursor:pointer;font-weight:500}
-.view-ssh-btn:hover{background:#1890ff;color:#fff}
-.mycluster-item .mycluster-vms{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-.vm-tag{background:#f5f5f5;border:1px solid #d9d9d9;color:#999;border-radius:5px;font-size:12px;padding:3px 8px;display:inline-flex;align-items:center;gap:4px}
-.vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
-.vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
-.vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
-.vm-btn:hover{background:#1890ff;color:#fff}
-.ssh-btn{padding:8px 24px;border:2px solid #52c41a;border-radius:6px;background:#52c41a;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
-.ssh-btn:hover{background:#73d13d;border-color:#73d13d}
-.ssh-btn-reconnect{padding:8px 20px;border:2px solid #1890ff;border-radius:6px;background:#1890ff;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
-.ssh-btn-reconnect:hover{background:#40a9ff;border-color:#40a9ff}
-.ssh-btn-terminate{padding:8px 16px;border:2px solid #ff4d4f;border-radius:6px;background:#fff2f0;color:#ff4d4f;font-size:13px;cursor:pointer;font-weight:600}
-.ssh-btn-terminate:hover{background:#ff4d4f;color:#fff}
-.ssh-btn-request{padding:4px 12px;border:1px solid #faad14;border-radius:4px;background:#fff7e6;color:#d46b08;font-size:12px;cursor:pointer;font-weight:500}
-.ssh-btn-request:hover{background:#faad14;color:#fff}
-.ssh-takeover-notice{font-size:12px;color:#faad14;margin-left:8px}
+.view-ssh-btn{padding:5px 14px;border:1px solid var(--primary);border-radius:6px;background:var(--primary-bg);color:var(--primary);font-size:12px;cursor:pointer;font-weight:500;transition:all .2s}
+.view-ssh-btn:hover{background:var(--primary);color:#fff}
+.mycluster-item .mycluster-vms{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
 
+/* ── VM Tags ── */
+.vm-tag{background:#f5f5f5;border:1px solid #d9d9d9;color:var(--text-muted);border-radius:6px;font-size:12px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;transition:all .2s}
+.vm-tag.vm-running{background:var(--success-bg);border-color:var(--success);color:var(--success)}
+.vm-tag.vm-stopped{background:var(--danger-bg);border-color:var(--danger);color:var(--danger)}
+.vm-btn{padding:1px 6px;border:1px solid #91d5ff;border-radius:4px;background:transparent;color:var(--primary);font-size:11px;cursor:pointer;line-height:1.3;transition:all .2s}
+.vm-btn:hover{background:var(--primary);color:#fff;border-color:var(--primary)}
+.vm-btn.vm-btn-green{border-color:var(--success);color:var(--success)}
+.vm-btn.vm-btn-green:hover{background:var(--success);color:#fff}
+.vm-btn.vm-btn-red{border-color:var(--danger);color:var(--danger)}
+.vm-btn.vm-btn-red:hover{background:var(--danger);color:#fff}
+
+/* ── SSH Session Buttons ── */
+.ssh-btn{padding:8px 24px;border:2px solid var(--success);border-radius:8px;background:var(--success);color:#fff;font-size:14px;cursor:pointer;font-weight:600;transition:all .2s}
+.ssh-btn:hover{background:#73d13d;border-color:#73d13d}
+.ssh-btn-reconnect{padding:8px 20px;border:2px solid var(--primary);border-radius:8px;background:var(--primary);color:#fff;font-size:14px;cursor:pointer;font-weight:600;transition:all .2s}
+.ssh-btn-reconnect:hover{background:var(--primary-hover);border-color:var(--primary-hover)}
+.ssh-btn-terminate{padding:8px 16px;border:2px solid var(--danger);border-radius:8px;background:var(--danger-bg);color:var(--danger);font-size:13px;cursor:pointer;font-weight:600;transition:all .2s}
+.ssh-btn-terminate:hover{background:var(--danger);color:#fff}
+.ssh-btn-request{padding:4px 12px;border:1px solid var(--warning);border-radius:6px;background:var(--warning-bg);color:#d46b08;font-size:12px;cursor:pointer;font-weight:500;transition:all .2s}
+.ssh-btn-request:hover{background:var(--warning);color:#fff}
+.ssh-takeover-notice{font-size:12px;color:var(--warning);margin-left:8px}
+
+/* ── Voting Modal ── */
+.vote-modal-card{max-width:520px;width:90%;background:#fff;border-radius:12px;padding:32px 36px;box-shadow:0 12px 48px rgba(0,0,0,0.25)}
+.vote-modal-header{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.vote-modal-icon{font-size:24px}
+.vote-modal-title{margin:0;font-size:20px;font-weight:600}
+.vote-modal-msg{font-size:14px;color:#555;line-height:1.7;margin:0 0 16px}
+.vote-modal-section{background:#f6f8fa;border:1px solid var(--border);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;display:none}
+.vote-modal-warning{background:var(--danger-bg);border:1px solid #ffccc7;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;color:#cf1322;display:none}
+.vote-modal-countdown-area{text-align:center}
+.vote-modal-num{font-size:36px;font-weight:700;color:var(--primary);margin:12px 0 8px}
+.vote-modal-bar{border-radius:2px;margin:0 0 16px;overflow:hidden}
+.vote-modal-actions{display:none;gap:12px;justify-content:center;margin-top:8px}
+.vote-modal-pending{display:none;margin-top:8px;text-align:center}
+.vote-modal-waiting{display:none;margin-top:8px;text-align:center}
+
+/* ── Terminal ── */
 #terminal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center}
-#terminal-container{width:90%;height:85%;background:#1e1e1e;border-radius:8px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.4)}
+#terminal-container{width:90%;height:85%;background:#1e1e1e;border-radius:10px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,0.5)}
 #terminal-container.fullscreen{width:100%;height:100%;border-radius:0}
 #terminal-header{display:flex;align-items:center;padding:8px 16px;background:#2d2d2d;border-bottom:1px solid #3d3d3d;color:#ccc;font-size:14px;user-select:none}
-#terminal-header button{background:none;border:none;color:#ccc;font-size:16px;cursor:pointer;padding:4px 8px;border-radius:3px;margin-left:4px}
+#terminal-header button{background:none;border:none;color:#ccc;font-size:16px;cursor:pointer;padding:4px 8px;border-radius:4px;margin-left:4px;transition:all .2s}
 #terminal-header button:hover{background:#444;color:#fff}
 #terminal-body{flex:1;overflow:hidden;position:relative}
 #terminal-body .xterm{padding:8px;height:100%}
+
+/* ── Misc ── */
+.section-heading{font-size:16px;font-weight:600;color:var(--text);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.cluster-label{font-size:12px;color:var(--text-muted)}
 </style>
 
 <script src="/static/vendor/socket.io/socket.io.min.js"></script>
@@ -314,7 +352,7 @@ function renderCards(clusters) {
         var clsName = classOrder[ci];
         var items = grouped[clsName];
         html += '<div class="card" style="margin-bottom:16px">' +
-            '<h3 style="margin-bottom:12px;font-size:16px">&#128218; ' + esc(clsName) + ' (' + items.length + ' 个集群)</h3>';
+            '<h3 class="section-heading">&#128218; ' + esc(clsName) + ' <span class="cluster-label">(' + items.length + ' 个集群)</span></h3>';
 
         for (var ii = 0; ii < items.length; ii++) {
             var c = items[ii].data;
@@ -347,9 +385,9 @@ function renderCards(clusters) {
             var vmCount = c.vms ? Object.keys(c.vms).length : 0;
             var clusterBtns = '';
             if (vmCount > 0) {
-                clusterBtns = '<span style="font-size:12px;color:#999;margin-right:4px">全部:</span>' +
-                    '<button class="vm-btn" onclick="event.stopPropagation();clusterVmAction(\'' + esc(cname) + '\',\'start\')" style="border-color:#52c41a;color:#52c41a">&#9654; 启动</button>' +
-                    '<button class="vm-btn" onclick="event.stopPropagation();clusterVmAction(\'' + esc(cname) + '\',\'stop\')" style="border-color:#ff4d4f;color:#ff4d4f">&#9209; 关机</button>';
+                clusterBtns = '<span class="cluster-label">全部:</span>' +
+                    '<button class="vm-btn vm-btn-green" onclick="event.stopPropagation();clusterVmAction(\'' + esc(cname) + '\',\'start\')">&#9654; 启动</button>' +
+                    '<button class="vm-btn vm-btn-red" onclick="event.stopPropagation();clusterVmAction(\'' + esc(cname) + '\',\'stop\')">&#9209; 关机</button>';
             }
 
             html += '<div class="mycluster-item">' +
