@@ -1,0 +1,4 @@
+.checkbox-group{border:1px solid #d9d9d9;border-radius:4px;padding:8px 12px;max-height:180px;overflow-y:auto;background:#fff}
+.checkbox-group label{display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;font-weight:400;font-size:13px}
+.checkbox-group label:last-child{margin-bottom:0}
+

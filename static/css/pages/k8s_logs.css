@@ -1,0 +1,8 @@
+.progress-fill.success{background:#52c41a}
+.progress-fill.error{background:#ff4d4f}
+#log-container div{margin:0}
+#log-container .log-time{color:#888}
+#log-container .log-info{color:#d4d4d4}
+#log-container .log-warn{color:#dcdcaa}
+#log-container .log-done{color:#52c41a;font-weight:500}
+#log-container .log-err{color:#f44747}

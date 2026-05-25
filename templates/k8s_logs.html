@@ -1,28 +1,31 @@
 {% extends "base.html" %}
+{% block extra_head %}
+<link rel="stylesheet" href="/static/css/pages/k8s_logs.css">
+{% endblock %}
 {% block content %}
-<div style="max-width:900px;margin:0 auto;padding:20px">
-    <h2 style="margin-bottom:8px"><span id="task-type-label">任务</span>日志</h2>
-    <div style="font-size:13px;color:#666;margin-bottom:16px">Task ID: <code id="task-id">{{ task_id }}</code></div>
+<div class="k8s-log-wrapper">
+    <h2 class="mb-2">任务日志</h2>
+    <div class="text-medium fs-13 mb-4">Task ID: <code id="task-id">{{ task_id }}</code></div>
 
-    <div id="status-badge" style="display:inline-block;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:500;margin-bottom:12px">等待中</div>
+    <div id="status-badge" class="k8s-log-status-badge mb-3">等待中</div>
 
-    <div class="progress-bar" style="width:100%;height:10px;background:#e8e8e8;border-radius:5px;overflow:hidden;margin-bottom:20px">
-        <div id="progress-fill" class="progress-fill" style="width:0%;height:100%;background:#1890ff;border-radius:5px;transition:width .5s ease"></div>
+    <div class="progress-bar k8s-log-progress">
+        <div id="progress-fill" class="progress-fill k8s-log-progress-fill"></div>
     </div>
 
-    <div id="log-container" style="background:#1e1e1e;color:#d4d4d4;border-radius:6px;padding:12px;font-family:'Cascadia Code','Fira Code','Consolas',monospace;font-size:13px;line-height:1.6;height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></div>
+    <div id="log-container" class="k8s-log-container"></div>
 </div>
 
 <style>
-.progress-fill.success{background:#52c41a}
-.progress-fill.error{background:#ff4d4f}
-#log-container div{margin:0}
-#log-container .log-time{color:#888}
-#log-container .log-info{color:#d4d4d4}
-#log-container .log-warn{color:#dcdcaa}
-#log-container .log-done{color:#52c41a;font-weight:500}
-#log-container .log-err{color:#f44747}
+.k8s-log-wrapper{max-width:900px;margin:0 auto;padding:20px}
+.k8s-log-wrapper h2{margin-bottom:8px}
+.k8s-log-status-badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:500}
+.k8s-log-progress{width:100%;height:10px;background:#e8e8e8;border-radius:5px;overflow:hidden;margin-bottom:20px}
+.k8s-log-progress-fill{width:0%;height:100%;background:#1890ff;border-radius:5px;transition:width .5s ease}
+.k8s-log-container{background:#1e1e1e;color:#d4d4d4;border-radius:6px;padding:12px;font-family:'Cascadia Code','Fira Code','Consolas',monospace;font-size:13px;line-height:1.6;height:500px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
 </style>
+
+
 
 <script>
 const API = '/api/k8s';
@@ -65,20 +68,18 @@ function updateStatus(task) {
     const pct = task.progress || 0;
     progressFill.style.width = pct + '%';
     progressFill.className = 'progress-fill';
+    statusBadge.className = 'badge';
     if (task.status === 'completed') {
         progressFill.classList.add('success');
         statusBadge.textContent = '✅ 已完成';
-        statusBadge.style.background = '#f6ffed';
-        statusBadge.style.color = '#52c41a';
+        statusBadge.classList.add('badge-green');
     } else if (task.status === 'error') {
         progressFill.classList.add('error');
         statusBadge.textContent = '❌ 失败';
-        statusBadge.style.background = '#fff2f0';
-        statusBadge.style.color = '#ff4d4f';
+        statusBadge.classList.add('badge-red');
     } else {
         statusBadge.textContent = '⏳ 运行中 (' + pct + '%)';
-        statusBadge.style.background = '#e6f7ff';
-        statusBadge.style.color = '#1890ff';
+        statusBadge.classList.add('badge-blue');
     }
 }
 

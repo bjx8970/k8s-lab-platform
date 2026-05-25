@@ -1,92 +1,67 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>K8s Lab Platform - 数据库配置</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f0f2f5; }
-        .setup-card { background: #fff; border-radius: 8px; padding: 40px 36px; width: 460px; box-shadow: 0 2px 12px rgba(0,0,0,.08); }
-        .setup-card h1 { font-size: 20px; text-align: center; margin-bottom: 8px; color: #333; }
-        .setup-card h1 span { color: #1890ff; }
-        .setup-card .desc { font-size: 13px; color: #999; text-align: center; margin-bottom: 24px; }
-        .form-group { margin-bottom: 18px; }
-        .form-group label { display: block; font-size: 14px; color: #333; margin-bottom: 6px; font-weight: 500; }
-        .form-control { width: 100%; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; outline: none; transition: border-color .2s; box-sizing: border-box; }
-        .form-control:focus { border-color: #1890ff; box-shadow: 0 0 0 2px rgba(24,144,255,.2); }
-        .btn { display: block; width: 100%; padding: 9px 0; border: none; border-radius: 4px; background: #1890ff; color: #fff; font-size: 15px; cursor: pointer; transition: background .2s; }
-        .btn:hover { background: #40a9ff; }
-        .btn:disabled { background: #91caff; cursor: not-allowed; }
-        .error { color: #ff4d4f; font-size: 13px; margin-top: 10px; text-align: center; display: none; }
-        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    </style>
-</head>
-<body>
-    <div class="setup-card">
-        <h1>K8s Lab <span>Platform</span></h1>
-        <div class="desc">首次运行，请配置 PostgreSQL 数据库连接</div>
-        <div class="form-group">
-            <label>主机地址 *</label>
-            <input id="f-host" class="form-control" placeholder="127.0.0.1">
-        </div>
-        <div class="form-row">
-            <div class="form-group">
-                <label>端口</label>
-                <input id="f-port" class="form-control" type="number" value="5432">
-            </div>
-            <div class="form-group">
-                <label>用户名 *</label>
-                <input id="f-user" class="form-control" placeholder="postgres">
-            </div>
-        </div>
-        <div class="form-row">
-            <div class="form-group">
-                <label>密码 *</label>
-                <input id="f-password" class="form-control" type="password">
-            </div>
-            <div class="form-group">
-                <label>数据库名 *</label>
-                <input id="f-database" class="form-control" placeholder="k8s_lab">
-            </div>
-        </div>
-        <button class="btn" id="btn-save" onclick="saveConfig()">保存配置</button>
-        <div class="error" id="config-error"></div>
+{% extends "_standalone_base.html" %}
+{% block title %}K8s Lab Platform - 数据库配置{% endblock %}
+{% block standalone_content %}
+<h1>K8s Lab <span>Platform</span></h1>
+<div class="desc">首次运行，请配置 PostgreSQL 数据库连接</div>
+<div class="form-group">
+    <label>主机地址 *</label>
+    <input id="f-host" class="form-control" placeholder="127.0.0.1">
+</div>
+<div class="form-row">
+    <div class="form-group">
+        <label>端口</label>
+        <input id="f-port" class="form-control" type="number" value="5432">
     </div>
-    <script>
-    async function saveConfig() {
-        const btn = document.getElementById('btn-save');
-        const err = document.getElementById('config-error');
-        const host = document.getElementById('f-host').value.trim();
-        const port = parseInt(document.getElementById('f-port').value) || 5432;
-        const user = document.getElementById('f-user').value.trim();
-        const password = document.getElementById('f-password').value;
-        const database = document.getElementById('f-database').value.trim();
-        btn.disabled = true;
-        err.style.display = 'none';
-        if (!host || !user || !password || !database) {
-            err.textContent = '请填写所有必填项';
-            err.style.display = 'block';
-            btn.disabled = false;
-            return;
-        }
-        try {
-            const res = await fetch('/api/db-config', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ host, port, user, password, database })
-            });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.error || '配置失败');
-            window.location.href = '/';
-        } catch (e) {
-            err.textContent = e.message;
-            err.style.display = 'block';
-        } finally {
-            btn.disabled = false;
-        }
+    <div class="form-group">
+        <label>用户名 *</label>
+        <input id="f-user" class="form-control" placeholder="postgres">
+    </div>
+</div>
+<div class="form-row">
+    <div class="form-group">
+        <label>密码 *</label>
+        <input id="f-password" class="form-control" type="password">
+    </div>
+    <div class="form-group">
+        <label>数据库名 *</label>
+        <input id="f-database" class="form-control" placeholder="k8s_lab">
+    </div>
+</div>
+<button class="btn" id="btn-save" onclick="saveConfig()">保存配置</button>
+<div class="error" id="config-error"></div>
+<script>
+async function saveConfig() {
+    const btn = document.getElementById('btn-save');
+    const err = document.getElementById('config-error');
+    const host = document.getElementById('f-host').value.trim();
+    const port = parseInt(document.getElementById('f-port').value) || 5432;
+    const user = document.getElementById('f-user').value.trim();
+    const password = document.getElementById('f-password').value;
+    const database = document.getElementById('f-database').value.trim();
+    btn.disabled = true;
+    err.style.display = 'none';
+    if (!host || !user || !password || !database) {
+        err.textContent = '请填写所有必填项';
+        err.style.display = 'block';
+        btn.disabled = false;
+        return;
     }
-    document.addEventListener('keydown', function(e) { if (e.key === 'Enter') saveConfig(); });
-    </script>
-</body>
-</html>
+    try {
+        const res = await fetch('/api/db-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, port, user, password, database })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '配置失败');
+        window.location.href = '/';
+    } catch (e) {
+        err.textContent = e.message;
+        err.style.display = 'block';
+    } finally {
+        btn.disabled = false;
+    }
+}
+document.addEventListener('keydown', function(e) { if (e.key === 'Enter') saveConfig(); });
+</script>
+{% endblock %}

@@ -2702,6 +2702,12 @@ def api_webssh_sessions():
         sessions = ssh_manager.list_sessions(filter_user_id=current_user.id)
     return jsonify({"sessions": sessions})
 
+@app.route("/api/webssh/my-sessions", methods=["GET"])
+@login_required
+def api_webssh_my_sessions():
+    sessions = ssh_manager.list_sessions(filter_user_id=current_user.id)
+    return jsonify({"sessions": sessions})
+
 @app.route("/api/webssh/cluster/<name>", methods=["GET"])
 @login_required
 def api_webssh_cluster_status(name):
