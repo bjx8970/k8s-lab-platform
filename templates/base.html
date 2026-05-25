@@ -456,7 +456,7 @@ function renderTaskRow(task, label, isDone) {
         if (!await showConfirm('确定取消该任务？')) return;
         try {
             await fetch('/api/k8s/tasks/' + taskId + '/cancel', { method: 'POST' });
-            pollTaskList();
+            loadTaskList();
         } catch (e) {
             showToast('取消失败: ' + e.message, 'error');
         }
