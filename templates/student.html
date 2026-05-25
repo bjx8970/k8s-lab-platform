@@ -386,8 +386,8 @@ function renderCards(clusters) {
             var clusterBtns = '';
             if (vmCount > 0) {
                 clusterBtns = '<span class="cluster-label">全部:</span>' +
-                    '<button class="vm-btn vm-btn-green" onclick="event.stopPropagation();clusterVmAction(\'' + esc(cname) + '\',\'start\')">&#9654; 启动</button>' +
-                    '<button class="vm-btn vm-btn-red" onclick="event.stopPropagation();clusterVmAction(\'' + esc(cname) + '\',\'stop\')">&#9209; 关机</button>';
+                    '<button class="vm-btn vm-btn-green" onclick="event.stopPropagation();clusterVmAction(\'' + esc(cname) + '\',\'start\')">&#9654; 全部启动</button>' +
+                    '<button class="vm-btn vm-btn-red" onclick="event.stopPropagation();clusterVmAction(\'' + esc(cname) + '\',\'stop\')">&#9209; 全部关机</button>';
             }
 
             html += '<div class="mycluster-item">' +
