@@ -72,8 +72,10 @@
 .takeover-btn:hover{background:#722ed1;color:#fff}
 .view-btn{padding:4px 12px;border:1px solid #13c2c2;border-radius:4px;background:#e6fffb;color:#13c2c2;font-size:12px;cursor:pointer;font-weight:500}
 .view-btn:hover{background:#13c2c2;color:#fff}
-.active-cluster-row{display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid #f0f0f0;gap:12px}
+.active-cluster-row{padding:10px 14px;border-bottom:1px solid #f0f0f0}
 .active-cluster-row:last-child{border-bottom:none}
+.active-cluster-row-flex{display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid #f0f0f0;gap:12px}
+.active-cluster-row-flex:last-child{border-bottom:none}
 .collapsible-header{cursor:pointer;user-select:none;display:flex;align-items:center;gap:8px;padding:10px 14px;font-size:14px;font-weight:600}
 .collapsible-header:hover{background:#f5f5f5}
 .collapsible-body{overflow:hidden;transition:max-height 0.25s ease}
@@ -347,8 +349,8 @@ function renderActiveClustersAdmin(sessions, clusters) {
 
     var html = '<div class="card">' +
         '<h3 style="margin-bottom:12px;font-size:15px">&#128308; 使用中的集群</h3>' +
-        '<table style="width:100%;font-size:13px">' +
-        '<thead><tr><th style="text-align:left;padding:8px 0">集群</th><th style="text-align:left;padding:8px 0">课程 / 组</th><th style="text-align:left;padding:8px 0">用户</th><th style="text-align:left;padding:8px 0">状态</th><th style="text-align:left;padding:8px 0">操作</th></tr></thead>' +
+        '<table style="width:100%;font-size:13px;border-collapse:collapse">' +
+        '<thead><tr style="border-bottom:2px solid #e5e5ea"><th style="text-align:left;padding:10px 14px;font-weight:600;color:#6e6e73;font-size:12px;text-transform:uppercase;letter-spacing:.5px">集群</th><th style="text-align:left;padding:10px 14px;font-weight:600;color:#6e6e73;font-size:12px;text-transform:uppercase;letter-spacing:.5px">课程 / 组</th><th style="text-align:left;padding:10px 14px;font-weight:600;color:#6e6e73;font-size:12px;text-transform:uppercase;letter-spacing:.5px">用户</th><th style="text-align:left;padding:10px 14px;font-weight:600;color:#6e6e73;font-size:12px;text-transform:uppercase;letter-spacing:.5px">状态</th><th style="text-align:left;padding:10px 14px;font-weight:600;color:#6e6e73;font-size:12px;text-transform:uppercase;letter-spacing:.5px">操作</th></tr></thead>' +
         '<tbody>';
 
     for (var ei = 0; ei < entries.length; ei++) {
@@ -377,11 +379,11 @@ function renderActiveClustersAdmin(sessions, clusters) {
             var btns = renderSessionActionButtons(s);
 
             html += '<tr class="active-cluster-row">' +
-                '<td style="font-weight:500">' + escStats(entry.name) + '</td>' +
-                '<td>' + classGrp + '</td>' +
-                '<td>' + escStats(ownerName) + ' ' + roleBadge + '</td>' +
-                '<td>' + statusHtml + '</td>' +
-                '<td>' + btns + '</td>' +
+                '<td style="padding:10px 14px;font-weight:500">' + escStats(entry.name) + '</td>' +
+                '<td style="padding:10px 14px">' + classGrp + '</td>' +
+                '<td style="padding:10px 14px">' + escStats(ownerName) + ' ' + roleBadge + '</td>' +
+                '<td style="padding:10px 14px">' + statusHtml + '</td>' +
+                '<td style="padding:10px 14px">' + btns + '</td>' +
                 '</tr>';
         }
     }
@@ -453,7 +455,7 @@ function renderActiveClustersTeacher(clusters) {
 
             var btns = renderSessionActionButtons(s);
 
-            html += '<div class="active-cluster-row" style="padding-left:32px">' +
+            html += '<div class="active-cluster-row-flex" style="padding-left:32px">' +
                 '<span style="font-weight:500;min-width:80px">' + escStats(grpLabel) + '</span>' +
                 '<span style="color:#999;font-size:12px;min-width:60px">' + escStats(ownerName) + '</span>' +
                 '<span style="font-size:12px">' + statusHtml + '</span>' +
@@ -808,5 +810,10 @@ document.addEventListener('keydown', function(e) {
 });
 
 document.addEventListener('DOMContentLoaded', loadStats);
+
+function onSessionUpdate(data) {
+    loadActiveClustersRefresh();
+    loadStats();
+}
 </script>
 {% endblock %}

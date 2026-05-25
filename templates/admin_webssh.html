@@ -220,7 +220,10 @@ async function terminateSession(sessionId) {
 document.addEventListener('DOMContentLoaded', function() {
     loadConfig();
     refreshSessions();
-    setInterval(refreshSessions, 15000);
 });
+
+function onSessionUpdate(data) {
+    refreshSessions();
+}
 </script>
 {% endblock %}

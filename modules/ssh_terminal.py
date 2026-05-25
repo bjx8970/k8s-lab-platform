@@ -256,6 +256,8 @@ class SSHManager:
         self._user_cluster_map = {}
         self._ws_to_session = {}
         self._socketio = socketio
+        self._on_session_terminated = None
+        self._on_owner_disconnect = None
 
         # Configurable limits
         self.global_max = 64
@@ -271,6 +273,12 @@ class SSHManager:
         self._lock = threading.Lock()
         self._cleanup_running = False
         self._cleanup_thread = None
+
+    def set_on_session_terminated(self, callback):
+        self._on_session_terminated = callback
+
+    def set_on_owner_disconnect(self, callback):
+        self._on_owner_disconnect = callback
 
     def init_app(self, socketio):
         self._socketio = socketio
@@ -292,15 +300,17 @@ class SSHManager:
         with self._lock:
             for sid, session in self._sessions.items():
                 if session.status == "terminated":
-                    to_remove.append(sid)
+                    to_remove.append((sid, session.cluster_name, session.owner["user_id"]))
                 elif session.status == "disconnected" and session.disconnected_at:
                     if now - session.disconnected_at > self.retention_time:
-                        to_remove.append(sid)
+                        to_remove.append((sid, session.cluster_name, session.owner["user_id"]))
                 elif session.status == "connected":
                     if now - session.last_input_time > self.idle_timeout:
-                        to_remove.append(sid)
-        for sid in to_remove:
+                        to_remove.append((sid, session.cluster_name, session.owner["user_id"]))
+        for sid, cluster_name, user_id in to_remove:
             self._remove_session(sid)
+            if self._on_session_terminated:
+                self._on_session_terminated(cluster_name, user_id)
 
     def _count_user_sessions(self, user_id, role):
         count = 0
@@ -383,6 +393,8 @@ class SSHManager:
             if session:
                 if session.owner_sid == sid:
                     session.unbind_owner(sid)
+                    if self._on_owner_disconnect:
+                        self._on_owner_disconnect(session.cluster_name, session.owner["user_id"])
                 elif session.takeover_sid == sid:
                     session.unbind_takeover(sid)
                 else:

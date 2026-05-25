@@ -23,11 +23,11 @@ from modules.db import (
 )
 from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
-from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster
+from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster, set_on_task_update
 from modules.pg_client import PGClient, PGError
 from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor, update_vm_status
 
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room
 from modules.ssh_terminal import SSHManager, SSHConnectionError, SessionExistsError, TooManyConnectionsError
 
 app = Flask(__name__)
@@ -1960,6 +1960,7 @@ def webssh_session_create(data):
             "session_id": session.session_id,
             "cluster": cluster_name,
         })
+        _emit_session_update(cluster_name, current_user.id, "created")
     except SessionExistsError as e:
         emit("ssh_error", {"message": str(e)})
     except TooManyConnectionsError as e:
@@ -2013,6 +2014,7 @@ def webssh_session_reconnect(data):
         "session_id": session.session_id,
         "cluster": cluster_name,
     })
+    _emit_session_update(cluster_name, current_user.id, "reconnected")
 
 @socketio.on("session_terminate", namespace="/webssh")
 def webssh_session_terminate(data):
@@ -2028,6 +2030,7 @@ def webssh_session_terminate(data):
     ok = ssh_manager.terminate_by_owner(current_user.id, cluster_name)
     if ok:
         emit("session_terminated", {"cluster": cluster_name})
+        _emit_session_update(cluster_name, current_user.id, "terminated")
     else:
         emit("ssh_error", {"message": "会话不存在或无权终止"})
 
@@ -2080,6 +2083,9 @@ def webssh_takeover_start(data):
         "by": current_user.username,
         "cluster": session.cluster_name,
     }, to=session.owner_sid, namespace="/webssh")
+    _emit_session_update(session.cluster_name, session.owner["user_id"], "takeover_start", {
+        "taker": current_user.username,
+    })
 
 @socketio.on("takeover_stop", namespace="/webssh")
 def webssh_takeover_stop(data):
@@ -2102,6 +2108,7 @@ def webssh_takeover_stop(data):
     emit("takeover_stopped", {"session_id": session_id})
     if session.owner_sid:
         socketio.emit("takeover_released", {}, to=session.owner_sid, namespace="/webssh")
+    _emit_session_update(session.cluster_name, session.owner["user_id"], "takeover_stop")
 
 @socketio.on("view_start", namespace="/webssh")
 def webssh_view_start(data):
@@ -2197,6 +2204,8 @@ def webssh_reconnect_response(data):
             "accepted": accepted,
             "session_id": session_id,
         }, to=session.owner_sid, namespace="/webssh")
+    if accepted:
+        _emit_session_update(session.cluster_name, session.owner["user_id"], "takeover_stop")
 
 @socketio.on("ssh_data", namespace="/webssh")
 def webssh_ssh_data(data):
@@ -2214,6 +2223,47 @@ def webssh_ssh_resize(data):
 def webssh_disconnect():
     ssh_manager.unbind_ws(request.sid)
     _webssh_connect_times.pop(request.sid, None)
+
+
+# ── State Push Namespace ──
+
+@socketio.on("connect", namespace="/state")
+def state_connect():
+    if not current_user.is_authenticated:
+        return False
+    if current_user.role == "admin":
+        join_room("admin")
+    elif current_user.role == "teacher":
+        join_room("teacher")
+    join_room(f"user_{current_user.id}")
+
+
+def _emit_task_update(task_id, status, progress, message, created_by, queue):
+    data = {
+        "task_id": task_id,
+        "status": status,
+        "progress": progress,
+        "message": message,
+        "queue": queue,
+    }
+    if created_by:
+        socketio.emit("task_update", data, to=f"user_{created_by}", namespace="/state")
+    socketio.emit("task_update", data, to="admin", namespace="/state")
+    socketio.emit("task_update", data, to="teacher", namespace="/state")
+
+
+set_on_task_update(_emit_task_update)
+ssh_manager.set_on_session_terminated(lambda cluster_name, user_id: _emit_session_update(cluster_name, user_id, "terminated"))
+ssh_manager.set_on_owner_disconnect(lambda cluster_name, user_id: _emit_session_update(cluster_name, user_id, "disconnected"))
+
+
+def _emit_session_update(cluster_name, user_id, action, extra=None):
+    data = {"cluster_name": cluster_name, "user_id": user_id, "action": action}
+    if extra:
+        data.update(extra)
+    socketio.emit("session_update", data, to=f"user_{user_id}", namespace="/state")
+    socketio.emit("session_update", data, to="admin", namespace="/state")
+    socketio.emit("session_update", data, to="teacher", namespace="/state")
 
 
 # ── WebSSH REST API ──
@@ -2271,8 +2321,11 @@ def api_webssh_config_set():
 @login_required
 @admin_required
 def api_admin_webssh_terminate(session_id):
+    session = ssh_manager.get_session(session_id)
     ok = ssh_manager.terminate_session(session_id)
     if ok:
+        if session:
+            _emit_session_update(session.cluster_name, session.owner["user_id"], "terminated")
         return jsonify({"message": "会话已终止"})
     return jsonify({"error": "会话不存在"}), 404
 
@@ -2290,6 +2343,7 @@ def api_webssh_terminate_session(cluster_name):
     ssh_manager.terminate_by_owner(current_user.id, cluster_name)
     for sid in targets:
         socketio.emit("session_terminated", {"cluster": cluster_name}, to=sid, namespace="/webssh")
+    _emit_session_update(cluster_name, current_user.id, "terminated")
     return jsonify({"message": "会话已终止"})
 
 
