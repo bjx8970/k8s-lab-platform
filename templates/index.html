@@ -627,11 +627,7 @@ function initTeacherSocket() {
 
     terminalSocket.on('log_replay', function(data) {
         if (terminal && data.lines) {
-            terminal.reset();
-            var padLines = Math.min(terminal.rows, 50);
-            terminal.write('\n'.repeat(padLines));
             terminal.write(data.lines);
-            terminal.write('\r\n');
         }
     });
 
