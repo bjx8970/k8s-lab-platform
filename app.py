@@ -2210,7 +2210,7 @@ def webssh_reconnect_response(data):
 @socketio.on("ssh_data", namespace="/webssh")
 def webssh_ssh_data(data):
     raw = data.get("data", "")
-    if raw and len(raw) <= 4096:
+    if raw:
         ssh_manager.write(request.sid, raw)
 
 @socketio.on("ssh_resize", namespace="/webssh")

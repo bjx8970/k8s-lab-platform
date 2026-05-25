@@ -564,11 +564,11 @@ function initTerminal() {
             terminalSocket.emit('ssh_data', {data: e.key});
         }
     });
-    terminal.element.addEventListener('paste', function(e) {
+    terminal.textarea.addEventListener('paste', function(e) {
         e.preventDefault();
         var text = (e.clipboardData || window.clipboardData).getData('text');
-        if (terminalSocket && terminalSocket.connected) {
-            terminalSocket.emit('ssh_data', {data: text});
+        if (terminalSocket && terminalSocket.connected && text) {
+            terminalSocket.emit('ssh_data', {data: '\x1b[200~' + text + '\x1b[201~'});
         }
     });
     terminal.onResize(function(size) {
@@ -598,6 +598,15 @@ function initTeacherSocket() {
         document.getElementById('terminal-status').textContent = '接管中';
         document.getElementById('terminal-status').style.color = '#faad14';
         document.getElementById('takeover-indicator').style.display = '';
+        setTimeout(function() {
+            if (fitAddon && terminal) {
+                fitAddon.fit();
+                var dims = fitAddon.proposeDimensions();
+                if (dims && terminalSocket && terminalSocket.connected) {
+                    terminalSocket.emit('ssh_resize', {cols: dims.cols, rows: dims.rows});
+                }
+            }
+        }, 200);
     });
 
     terminalSocket.on('view_started', function(data) {
@@ -605,11 +614,24 @@ function initTeacherSocket() {
         document.getElementById('terminal-status').textContent = '查看中';
         document.getElementById('terminal-status').style.color = '#13c2c2';
         document.getElementById('takeover-indicator').style.display = 'none';
+        setTimeout(function() {
+            if (fitAddon && terminal) {
+                fitAddon.fit();
+                var dims = fitAddon.proposeDimensions();
+                if (dims && terminalSocket && terminalSocket.connected) {
+                    terminalSocket.emit('ssh_resize', {cols: dims.cols, rows: dims.rows});
+                }
+            }
+        }, 200);
     });
 
     terminalSocket.on('log_replay', function(data) {
         if (terminal && data.lines) {
+            terminal.reset();
+            var padLines = Math.min(terminal.rows, 50);
+            terminal.write('\n'.repeat(padLines));
             terminal.write(data.lines);
+            terminal.write('\r\n');
         }
     });
 

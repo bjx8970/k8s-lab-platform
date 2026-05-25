@@ -372,12 +372,24 @@ function initSocket() {
         }
     });
 
+    function syncTerminalSize() {
+        setTimeout(function() {
+            if (!fitAddon || !terminal) return;
+            fitAddon.fit();
+            var dims = fitAddon.proposeDimensions();
+            if (dims && terminalSocket && terminalSocket.connected) {
+                terminalSocket.emit('ssh_resize', {cols: dims.cols, rows: dims.rows});
+            }
+        }, 200);
+    }
+
     terminalSocket.on('session_created', function(data) {
         currentSessionId = data.session_id;
         terminalConnected = true;
         document.getElementById('terminal-status').textContent = '已连接';
         document.getElementById('terminal-status').style.color = '#52c41a';
         terminal.writeln('\x1b[32m已连接到 ' + data.cluster + '\x1b[0m\r\n');
+        syncTerminalSize();
     });
 
     terminalSocket.on('session_reconnected', function(data) {
@@ -385,11 +397,16 @@ function initSocket() {
         terminalConnected = true;
         document.getElementById('terminal-status').textContent = '已连接';
         document.getElementById('terminal-status').style.color = '#52c41a';
+        syncTerminalSize();
     });
 
     terminalSocket.on('log_replay', function(data) {
         if (terminal && data.lines) {
+            terminal.reset();
+            var padLines = Math.min(terminal.rows, 50);
+            terminal.write('\n'.repeat(padLines));
             terminal.write(data.lines);
+            terminal.write('\r\n');
         }
     });
 
@@ -514,11 +531,11 @@ function initTerminal() {
             terminalSocket.emit('ssh_data', {data: e.key});
         }
     });
-    terminal.element.addEventListener('paste', function(e) {
+    terminal.textarea.addEventListener('paste', function(e) {
         e.preventDefault();
         var text = (e.clipboardData || window.clipboardData).getData('text');
-        if (terminalSocket && terminalSocket.connected) {
-            terminalSocket.emit('ssh_data', {data: text});
+        if (terminalSocket && terminalSocket.connected && text) {
+            terminalSocket.emit('ssh_data', {data: '\x1b[200~' + text + '\x1b[201~'});
         }
     });
     terminal.onResize(function(size) {

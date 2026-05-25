@@ -148,7 +148,15 @@ class SSHSession:
         self.last_activity = time.time()
         self.last_input_time = time.time()
         try:
-            self.channel.send(data)
+            # Chunk large data to avoid PTY buffer issues
+            chunk_size = 4096
+            if len(data) <= chunk_size:
+                self.channel.send(data)
+            else:
+                for i in range(0, len(data), chunk_size):
+                    chunk = data[i:i + chunk_size]
+                    self.channel.send(chunk)
+                    time.sleep(0.01)
             return True
         except Exception:
             return False
