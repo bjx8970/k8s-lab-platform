@@ -233,30 +233,19 @@ function renderCards(clusters) {
 
 function renderSessionButtons(clusterName, clusterData) {
     var session = clusterSessionStates[clusterName];
-    if (!session) {
+    if (!session || session.status === 'terminated') {
         return '<button class="ssh-btn" onclick="createSession(\'' + esc(clusterName) + '\')">连接</button>';
     }
+
+    var buttons = '<button class="ssh-btn-reconnect" onclick="reconnectSession(\'' + esc(clusterName) + '\')">打开终端</button>';
 
     if (session.takeover_active) {
-        return '<button class="ssh-btn-reconnect" onclick="reconnectSession(\'' + esc(clusterName) + '\')">重新连接</button>' +
-               '<span class="ssh-takeover-notice">教师 ' + esc(session.takeover_by ? session.takeover_by.username : '') + ' 正在操作</span>';
+        var taker = session.takeover_by ? session.takeover_by.username : '';
+        buttons += '<span class="ssh-takeover-notice">教师 ' + esc(taker) + ' 正在操作</span>';
     }
 
-    if (session.status === 'terminated') {
-        return '<button class="ssh-btn" onclick="createSession(\'' + esc(clusterName) + '\')">连接</button>';
-    }
-
-    if (session.status === 'disconnected') {
-        return '<button class="ssh-btn-reconnect" onclick="reconnectSession(\'' + esc(clusterName) + '\')">重新连接</button>' +
-               '<button class="ssh-btn-terminate" onclick="terminateSession(\'' + esc(clusterName) + '\')">终止会话</button>';
-    }
-
-    if (session.status === 'connected') {
-        return '<button class="ssh-btn-reconnect" onclick="reconnectSession(\'' + esc(clusterName) + '\')">打开终端</button>' +
-               '<button class="ssh-btn-terminate" onclick="terminateSession(\'' + esc(clusterName) + '\')">终止会话</button>';
-    }
-
-    return '';
+    buttons += '<button class="ssh-btn-terminate" onclick="terminateSession(\'' + esc(clusterName) + '\')">终止会话</button>';
+    return buttons;
 }
 
 function toggleSshInfo(clusterName) {
