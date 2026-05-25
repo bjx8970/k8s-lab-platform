@@ -20,6 +20,28 @@
     </div>
 </div>
 
+<div class="modal-overlay" id="shutdown-vote-modal" style="z-index:10000">
+    <div style="max-width:480px;width:90%;background:#fff;border-radius:10px;padding:28px 32px;box-shadow:0 8px 32px rgba(0,0,0,0.25);text-align:center">
+        <h3 id="shutdown-vote-title" style="margin:0 0 16px;font-size:18px">关机确认</h3>
+        <p id="shutdown-vote-message" style="font-size:14px;color:#555;line-height:1.7;margin-bottom:8px"></p>
+        <div id="shutdown-vote-countdown" style="font-size:36px;font-weight:700;color:#1890ff;margin:16px 0">30s</div>
+        <div id="shutdown-vote-bar" style="height:4px;background:#e8eaed;border-radius:2px;margin:0 0 16px;overflow:hidden">
+            <div id="shutdown-vote-bar-fill" style="height:100%;width:100%;background:#1890ff;border-radius:2px;transition:width 1s linear"></div>
+        </div>
+        <div id="shutdown-vote-actions" style="display:flex;gap:12px;justify-content:center;margin-top:8px">
+            <button class="btn btn-primary" onclick="castShutdownVote(true)" style="min-width:100px">同意关机</button>
+            <button class="btn" onclick="castShutdownVote(false)" style="min-width:100px;border-color:#ff4d4f;color:#ff4d4f">拒绝</button>
+        </div>
+        <div id="shutdown-vote-pending" style="display:none;margin-top:8px">
+            <p style="color:#888;margin-bottom:12px">正在等待其他同学确认...</p>
+            <button class="btn" onclick="cancelShutdownVote()" style="border-color:#999;color:#666">取消操作</button>
+        </div>
+        <div id="shutdown-vote-waiting" style="display:none;margin-top:8px">
+            <p style="color:#888">已投票，等待其他同学...</p>
+        </div>
+    </div>
+</div>
+
 <style>
 .mycluster-item{border:1px solid #f0f0f0;border-radius:8px;padding:14px 16px;margin-bottom:8px}
 .mycluster-item .mycluster-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
@@ -75,12 +97,16 @@ var countdownTimer = null;
 var studentCountdownTimer = null;
 var clusterSessionStates = {};
 
+var shutdownVoteId = null;
+var shutdownVoteTimer = null;
+var shutdownVoteInitiated = false;
+
 function esc(s) {
     if (!s) return '';
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-async function vmAction(node, vmid, action) {
+async function _doVmAction(node, vmid, action) {
     try {
         var r = await fetch('/api/pve/vms/' + encodeURIComponent(node) + '/' + vmid + '/' + action, {
             method: 'POST',
@@ -99,6 +125,56 @@ async function vmAction(node, vmid, action) {
     } catch (e) {
         showToast('操作失败: ' + e.message, 'error');
     }
+}
+
+async function vmAction(node, vmid, action, clusterName) {
+    if (action === 'stop' && clusterName) {
+        stateSocket.emit('vm_shutdown_initiate', {
+            node: node,
+            vmid: vmid,
+            cluster_name: clusterName,
+        });
+        return;
+    }
+    return _doVmAction(node, vmid, action);
+}
+
+function showShutdownModal(title, msg, showActions, showPending, showWaiting) {
+    document.getElementById('shutdown-vote-title').textContent = title || '关机确认';
+    document.getElementById('shutdown-vote-message').innerHTML = msg || '';
+    document.getElementById('shutdown-vote-actions').style.display = showActions ? 'flex' : 'none';
+    document.getElementById('shutdown-vote-pending').style.display = showPending ? 'block' : 'none';
+    document.getElementById('shutdown-vote-waiting').style.display = showWaiting ? 'block' : 'none';
+    document.getElementById('shutdown-vote-modal').className = 'modal-overlay show';
+}
+
+function hideShutdownModal() {
+    document.getElementById('shutdown-vote-modal').className = 'modal-overlay';
+    shutdownVoteId = null;
+    if (shutdownVoteTimer) { clearInterval(shutdownVoteTimer); shutdownVoteTimer = null; }
+}
+
+function updateShutdownCountdown(remaining) {
+    var cd = document.getElementById('shutdown-vote-countdown');
+    if (cd) cd.textContent = remaining + 's';
+    var fill = document.getElementById('shutdown-vote-bar-fill');
+    if (fill) fill.style.width = Math.max(0, (remaining / 30) * 100) + '%';
+}
+
+function castShutdownVote(agree) {
+    if (!shutdownVoteId) return;
+    stateSocket.emit('vm_shutdown_vote', {vote_id: shutdownVoteId, agree: agree});
+    hideShutdownModal();
+    if (agree) {
+        showToast('已同意关机，等待其他同学...', 'info');
+    }
+}
+
+function cancelShutdownVote() {
+    if (!shutdownVoteId) return;
+    stateSocket.emit('vm_shutdown_cancel', {vote_id: shutdownVoteId});
+    hideShutdownModal();
+    showToast('已取消关机操作', 'info');
 }
 
 async function refreshVmStatuses(clusters) {
@@ -207,7 +283,7 @@ function renderCards(clusters) {
                     vmsHtml += '<span class="vm-tag' + _extra + '" id="vm-' + esc(cname) + '-' + v.vmid + '">' +
                         esc(vn) + ' (' + v.role + ')' +
                         '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'start\')">&#9654;</button>' +
-                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'stop\')">&#9209;</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'stop\',\'' + esc(cname) + '\')">&#9209;</button>' +
                         '</span>';
                 }
             }
@@ -572,5 +648,79 @@ document.addEventListener('DOMContentLoaded', loadMyClusters);
 function onSessionUpdate(data) {
     loadMyClusters();
 }
+
+// ── VM Shutdown Vote event listeners ──
+(function() {
+    if (typeof stateSocket === 'undefined' || !stateSocket) {
+        setTimeout(arguments.callee, 500);
+        return;
+    }
+    stateSocket.on('vm_shutdown_request', function(data) {
+        shutdownVoteId = data.vote_id;
+        showShutdownModal(
+            '关机确认',
+            '用户 <strong>' + esc(data.initiator_name) + '</strong> 正在尝试关闭集群 <strong>' + esc(data.cluster_name) + '</strong> 的虚拟机。<br>请投票：',
+            true, false, false
+        );
+        updateShutdownCountdown(data.remaining || 30);
+        if (shutdownVoteTimer) clearInterval(shutdownVoteTimer);
+        var remaining = data.remaining || 30;
+        shutdownVoteTimer = setInterval(function() {
+            remaining--;
+            updateShutdownCountdown(Math.max(0, remaining));
+            if (remaining <= 0) { clearInterval(shutdownVoteTimer); shutdownVoteTimer = null; }
+        }, 1000);
+    });
+    stateSocket.on('vm_shutdown_pending', function(data) {
+        shutdownVoteId = data.vote_id;
+        showShutdownModal(
+            '等待确认',
+            '正在等待其他同学确认关机操作...<br>已同意: <strong>' + data.agreed + '</strong>/' + data.total_voters,
+            false, true, false
+        );
+        updateShutdownCountdown(data.remaining || 30);
+        if (shutdownVoteTimer) clearInterval(shutdownVoteTimer);
+        var remaining = data.remaining || 30;
+        shutdownVoteTimer = setInterval(function() {
+            remaining--;
+            updateShutdownCountdown(Math.max(0, remaining));
+            if (remaining <= 0) { clearInterval(shutdownVoteTimer); shutdownVoteTimer = null; }
+        }, 1000);
+    });
+    stateSocket.on('vm_shutdown_countdown', function(data) {
+        if (data.vote_id === shutdownVoteId) {
+            updateShutdownCountdown(data.remaining);
+        }
+    });
+    stateSocket.on('vm_shutdown_proceed', function(data) {
+        hideShutdownModal();
+        showToast('所有同学已同意，正在关机', 'success');
+        var _key = data.node + '_' + data.vmid;
+        vmStatusCache[_key] = 'stopped';
+        document.querySelectorAll('[id$="-' + data.vmid + '"]').forEach(function(_el) {
+            if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag vm-stopped';
+        });
+    });
+    stateSocket.on('vm_shutdown_cancelled', function(data) {
+        hideShutdownModal();
+        showToast(data.reason || '关机已取消', 'info');
+    });
+    stateSocket.on('vm_shutdown_allowed', function(data) {
+        hideShutdownModal();
+        var _key = data.node + '_' + data.vmid;
+        vmStatusCache[_key] = 'stopped';
+        document.querySelectorAll('[id$="-' + data.vmid + '"]').forEach(function(_el) {
+            if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag vm-stopped';
+        });
+        showToast('已停止', 'success');
+    });
+    stateSocket.on('vm_shutdown_error', function(data) {
+        hideShutdownModal();
+        showToast(data.message || '操作失败', 'error');
+    });
+    stateSocket.on('vm_shutdown_voted', function(data) {
+        showShutdownModal('已投票', '等待其他同学确认...', false, false, true);
+    });
+})();
 </script>
 {% endblock %}

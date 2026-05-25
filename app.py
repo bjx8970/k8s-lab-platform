@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 from functools import wraps
 
 from flask import Flask, render_template, request, jsonify, redirect, g, make_response, session
@@ -55,6 +56,37 @@ def _update_online_user(sid):
 
 def is_user_online(user_id):
     return user_id in _online_users
+
+# ── VM 关机投票 (内存) ──
+_vm_shutdown_votes = {}
+_vm_shutdown_pending_vms = {}
+_vm_shutdown_lock = threading.RLock()
+_vm_shutdown_vote_seq = 0
+
+def _gen_vote_id():
+    global _vm_shutdown_vote_seq
+    _vm_shutdown_vote_seq += 1
+    return f"sd_{int(time.time())}_{_vm_shutdown_vote_seq}"
+
+def _get_online_students_in_group(group_id):
+    members = list_group_members(group_id)
+    return [m for m in members if is_user_online(m["id"])]
+
+def _do_shutdown_vm(node, vmid, pve_server_id):
+    client = get_pve_client(pve_server_id)
+    result = client.stop_vm(node, vmid)
+    update_vm_status(node, vmid, "stopped")
+    return result
+
+def _cleanup_stale_votes():
+    now = time.time()
+    with _vm_shutdown_lock:
+        stale = [vid for vid, v in list(_vm_shutdown_votes.items())
+                 if v["completed"] and now - v["started_at"] > 300]
+        for vid in stale:
+            v = _vm_shutdown_votes.pop(vid, None)
+            if v:
+                _vm_shutdown_pending_vms.pop(f"{v['node']}_{v['vmid']}", None)
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
@@ -2292,6 +2324,221 @@ def state_disconnect():
 def state_heartbeat(*args):
     if current_user.is_authenticated:
         _update_online_user(request.sid)
+
+
+# ── VM 关机投票 SocketIO 事件 ──
+
+def _broadcast_countdown(vote_id):
+    with _vm_shutdown_lock:
+        vote = _vm_shutdown_votes.get(vote_id)
+        if not vote or vote["completed"]:
+            return
+        remaining = max(0, 30 - int(time.time() - vote["started_at"]))
+    if remaining > 0:
+        socketio.emit("vm_shutdown_countdown", {
+            "vote_id": vote_id,
+            "remaining": remaining,
+        }, namespace="/state")
+        threading.Timer(1, _broadcast_countdown, args=[vote_id]).start()
+
+
+def _on_vote_timeout(vote_id):
+    with _vm_shutdown_lock:
+        vote = _vm_shutdown_votes.get(vote_id)
+        if not vote or vote["completed"]:
+            return
+        for uid, voter_info in vote["voters"].items():
+            if not voter_info["voted"]:
+                voter_info["voted"] = True
+                voter_info["agree"] = True
+        all_agree = all(v["agree"] for v in vote["voters"].values())
+        vote["completed"] = True
+        vote["cancelled"] = not all_agree
+        _vm_shutdown_pending_vms.pop(f"{vote['node']}_{vote['vmid']}", None)
+        node, vmid, pve_server_id = vote["node"], vote["vmid"], vote["pve_server_id"]
+    if all_agree:
+        try:
+            _do_shutdown_vm(node, vmid, pve_server_id)
+            socketio.emit("vm_shutdown_proceed", {
+                "vote_id": vote_id,
+                "node": node, "vmid": vmid,
+                "cluster_name": vote["cluster_name"],
+            }, namespace="/state")
+        except Exception as e:
+            socketio.emit("vm_shutdown_error", {
+                "vote_id": vote_id,
+                "message": f"关机操作失败: {e}",
+            }, namespace="/state")
+    else:
+        rejectors = [v["name"] for uid, v in vote["voters"].items() if v["voted"] and not v["agree"]]
+        socketio.emit("vm_shutdown_cancelled", {
+            "vote_id": vote_id,
+            "reason": f"用户 {'、'.join(rejectors)} 拒绝关机",
+        }, namespace="/state")
+    _cleanup_stale_votes()
+
+
+@socketio.on("vm_shutdown_initiate", namespace="/state")
+def handle_vm_shutdown_initiate(data):
+    if not current_user.is_authenticated:
+        return
+    node = data.get("node")
+    vmid = data.get("vmid")
+    cluster_name = data.get("cluster_name")
+    if not node or not vmid or not cluster_name:
+        emit("vm_shutdown_error", {"message": "参数不完整"})
+        return
+    if not _check_vm_access(node, vmid):
+        emit("vm_shutdown_error", {"message": "无权操作该虚拟机"})
+        return
+    cluster = get_cluster(cluster_name)
+    if not cluster:
+        emit("vm_shutdown_error", {"message": "集群不存在"})
+        return
+    if current_user.role in ("admin", "teacher"):
+        try:
+            _do_shutdown_vm(node, vmid, cluster.get("pve_server_id"))
+            emit("vm_shutdown_allowed", {"node": node, "vmid": vmid, "cluster_name": cluster_name})
+        except Exception as e:
+            emit("vm_shutdown_error", {"message": f"关机失败: {e}"})
+        return
+    vm_key = f"{node}_{vmid}"
+    with _vm_shutdown_lock:
+        if vm_key in _vm_shutdown_pending_vms:
+            emit("vm_shutdown_error", {"message": "该虚拟机正在等待关机确认"})
+            return
+    group_id = cluster.get("group_id")
+    pve_server_id = cluster.get("pve_server_id")
+    if not group_id:
+        try:
+            _do_shutdown_vm(node, vmid, pve_server_id)
+            emit("vm_shutdown_allowed", {"node": node, "vmid": vmid, "cluster_name": cluster_name})
+        except Exception as e:
+            emit("vm_shutdown_error", {"message": f"关机失败: {e}"})
+        return
+    online_students = _get_online_students_in_group(group_id)
+    if len(online_students) < 2:
+        try:
+            _do_shutdown_vm(node, vmid, pve_server_id)
+            emit("vm_shutdown_allowed", {"node": node, "vmid": vmid, "cluster_name": cluster_name})
+        except Exception as e:
+            emit("vm_shutdown_error", {"message": f"关机失败: {e}"})
+        return
+    vote_id = _gen_vote_id()
+    initiator_info = {"id": current_user.id, "username": current_user.username, "name": current_user.name or current_user.username}
+    voter_map = {}
+    for s in online_students:
+        voter_map[s["id"]] = {
+            "name": s.get("name") or s.get("username", str(s["id"])),
+            "username": s.get("username", ""),
+            "voted": False, "agree": None,
+        }
+    voter_map[current_user.id]["voted"] = True
+    voter_map[current_user.id]["agree"] = True
+    vote = {
+        "id": vote_id, "node": node, "vmid": vmid,
+        "cluster_name": cluster_name, "group_id": group_id,
+        "pve_server_id": pve_server_id,
+        "initiator": initiator_info, "voters": voter_map,
+        "started_at": time.time(), "timeout": 30,
+        "completed": False, "cancelled": False,
+        "timer": None,
+    }
+    with _vm_shutdown_lock:
+        _vm_shutdown_votes[vote_id] = vote
+        _vm_shutdown_pending_vms[vm_key] = vote_id
+    for s in online_students:
+        if s["id"] == current_user.id:
+            continue
+        socketio.emit("vm_shutdown_request", {
+            "vote_id": vote_id, "node": node, "vmid": vmid,
+            "cluster_name": cluster_name,
+            "initiator_name": current_user.name or current_user.username,
+            "remaining": 30,
+        }, to=f"user_{s['id']}", namespace="/state")
+    emit("vm_shutdown_pending", {
+        "vote_id": vote_id, "remaining": 30,
+        "total_voters": len(voter_map), "agreed": 1,
+    })
+    timer = threading.Timer(30, _on_vote_timeout, args=[vote_id])
+    timer.daemon = True
+    with _vm_shutdown_lock:
+        vote["timer"] = timer
+    timer.start()
+    _broadcast_countdown(vote_id)
+
+
+@socketio.on("vm_shutdown_vote", namespace="/state")
+def handle_vm_shutdown_vote(data):
+    if not current_user.is_authenticated:
+        return
+    vote_id = data.get("vote_id")
+    agree = data.get("agree", True)
+    all_agree = False
+    node = vmid = pve_server_id = cluster_name = None
+    with _vm_shutdown_lock:
+        vote = _vm_shutdown_votes.get(vote_id)
+        if not vote:
+            emit("vm_shutdown_error", {"message": "投票不存在"}); return
+        if vote["completed"]:
+            emit("vm_shutdown_error", {"message": "投票已结束"}); return
+        if current_user.id not in vote["voters"]:
+            emit("vm_shutdown_error", {"message": "无需投票"}); return
+        if vote["voters"][current_user.id]["voted"]:
+            emit("vm_shutdown_error", {"message": "已投过票"}); return
+        vote["voters"][current_user.id]["voted"] = True
+        vote["voters"][current_user.id]["agree"] = agree
+        all_voted = all(v["voted"] for v in vote["voters"].values())
+        if all_voted:
+            all_agree = all(v["agree"] for v in vote["voters"].values())
+            vote["completed"] = True
+            if vote["timer"]:
+                vote["timer"].cancel()
+            _vm_shutdown_pending_vms.pop(f"{vote['node']}_{vote['vmid']}", None)
+            node, vmid, pve_server_id, cluster_name = vote["node"], vote["vmid"], vote["pve_server_id"], vote["cluster_name"]
+    if not all_voted:
+        emit("vm_shutdown_voted", {"vote_id": vote_id, "agree": agree})
+        return
+    if all_agree:
+        try:
+            _do_shutdown_vm(node, vmid, pve_server_id)
+            socketio.emit("vm_shutdown_proceed", {
+                "vote_id": vote_id, "node": node, "vmid": vmid,
+                "cluster_name": cluster_name,
+            }, namespace="/state")
+        except Exception as e:
+            socketio.emit("vm_shutdown_error", {
+                "vote_id": vote_id, "message": f"关机操作失败: {e}",
+            }, namespace="/state")
+    else:
+        rejectors = [v["name"] for uid, v in vote["voters"].items() if v["voted"] and not v["agree"]]
+        socketio.emit("vm_shutdown_cancelled", {
+            "vote_id": vote_id,
+            "reason": f"用户 {'、'.join(rejectors)} 拒绝关机",
+        }, namespace="/state")
+    _cleanup_stale_votes()
+
+
+@socketio.on("vm_shutdown_cancel", namespace="/state")
+def handle_vm_shutdown_cancel(data):
+    if not current_user.is_authenticated:
+        return
+    vote_id = data.get("vote_id")
+    with _vm_shutdown_lock:
+        vote = _vm_shutdown_votes.get(vote_id)
+        if not vote or vote["completed"]:
+            emit("vm_shutdown_error", {"message": "投票已结束"}); return
+        if vote["initiator"]["id"] != current_user.id:
+            emit("vm_shutdown_error", {"message": "只有发起人可以取消"}); return
+        vote["completed"] = True
+        vote["cancelled"] = True
+        if vote["timer"]:
+            vote["timer"].cancel()
+        _vm_shutdown_pending_vms.pop(f"{vote['node']}_{vote['vmid']}", None)
+    socketio.emit("vm_shutdown_cancelled", {
+        "vote_id": vote_id, "reason": "发起人已取消关机",
+    }, namespace="/state")
+    _cleanup_stale_votes()
 
 
 def _emit_task_update(task_id, status, progress, message, created_by, queue):
