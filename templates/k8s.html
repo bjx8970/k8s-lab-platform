@@ -30,23 +30,32 @@
 </div>
 
 <div class="modal-overlay" id="shutdown-vote-modal" style="z-index:10000">
-    <div style="max-width:480px;width:90%;background:#fff;border-radius:10px;padding:28px 32px;box-shadow:0 8px 32px rgba(0,0,0,0.25);text-align:center">
-        <h3 id="shutdown-vote-title" style="margin:0 0 16px;font-size:18px">关机确认</h3>
-        <p id="shutdown-vote-message" style="font-size:14px;color:#555;line-height:1.7;margin-bottom:8px"></p>
-        <div id="shutdown-vote-countdown" style="font-size:36px;font-weight:700;color:#1890ff;margin:16px 0">30s</div>
-        <div id="shutdown-vote-bar" style="height:4px;background:#e8eaed;border-radius:2px;margin:0 0 16px;overflow:hidden">
-            <div id="shutdown-vote-bar-fill" style="height:100%;width:100%;background:#1890ff;border-radius:2px;transition:width 1s linear"></div>
+    <div style="max-width:520px;width:90%;background:#fff;border-radius:12px;padding:32px 36px;box-shadow:0 12px 48px rgba(0,0,0,0.25)">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+            <span id="shutdown-vote-icon" style="font-size:24px">&#9888;&#65039;</span>
+            <h3 id="shutdown-vote-title" style="margin:0;font-size:20px;font-weight:600">关机确认</h3>
         </div>
-        <div id="shutdown-vote-actions" style="display:flex;gap:12px;justify-content:center;margin-top:8px">
-            <button class="btn btn-primary" onclick="castShutdownVote(true)" style="min-width:100px">同意关机</button>
-            <button class="btn" onclick="castShutdownVote(false)" style="min-width:100px;border-color:#ff4d4f;color:#ff4d4f">拒绝</button>
+        <p id="shutdown-vote-message" style="font-size:14px;color:#555;line-height:1.7;margin:0 0 16px"></p>
+        <div id="shutdown-vote-vm-section" style="background:#f6f8fa;border:1px solid #e8eaed;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;display:none"></div>
+        <div id="shutdown-vote-cluster-warning" style="background:#fff2f0;border:1px solid #ffccc7;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;color:#cf1322;display:none">
+            <strong>&#9888;&#65039; 集群关机提醒：</strong>此操作将关闭该集群的<b>全部节点</b>，请确认
         </div>
-        <div id="shutdown-vote-pending" style="display:none;margin-top:8px">
-            <p style="color:#888;margin-bottom:12px">正在等待其他同学确认...</p>
-            <button class="btn" onclick="cancelShutdownVote()" style="border-color:#999;color:#666">取消操作</button>
+        <div style="text-align:center">
+            <div id="shutdown-vote-countdown" style="font-size:36px;font-weight:700;color:#1890ff;margin:12px 0 8px">30s</div>
+            <div id="shutdown-vote-bar" style="height:4px;background:#e8eaed;border-radius:2px;margin:0 0 16px;overflow:hidden">
+                <div id="shutdown-vote-bar-fill" style="height:100%;width:100%;background:#1890ff;border-radius:2px;transition:width 1s linear"></div>
+            </div>
         </div>
-        <div id="shutdown-vote-waiting" style="display:none;margin-top:8px">
-            <p style="color:#888">已投票，等待其他同学...</p>
+        <div id="shutdown-vote-actions" style="display:none;gap:12px;justify-content:center;margin-top:8px">
+            <button class="btn btn-primary" onclick="castShutdownVote(true)" style="min-width:120px;padding:10px 24px;font-size:15px">&#10003; 同意关机</button>
+            <button class="btn btn-danger" onclick="castShutdownVote(false)" style="min-width:120px;padding:10px 24px;font-size:15px">&#10007; 拒绝</button>
+        </div>
+        <div id="shutdown-vote-pending" style="display:none;margin-top:8px;text-align:center">
+            <p style="color:#888;margin-bottom:12px;font-size:14px">等待中... 已同意: <strong id="shutdown-vote-agreed-count" style="color:#1890ff">1</strong>/<span id="shutdown-vote-total-count">0</span></p>
+            <button class="btn" onclick="cancelShutdownVote()" style="border-color:#999;color:#666;padding:8px 20px">取消操作</button>
+        </div>
+        <div id="shutdown-vote-waiting" style="display:none;margin-top:8px;text-align:center">
+            <p style="color:#888;font-size:14px">已投票，等待其他同学...</p>
         </div>
     </div>
 </div>
@@ -300,6 +309,12 @@ function closeCreateForm() {
 }
 
 async function clusterVmAction(name, action) {
+    if (action === 'stop' && USER_ROLE === 'student') {
+        stateSocket.emit('vm_shutdown_cluster_initiate', {
+            cluster_name: name,
+        });
+        return;
+    }
     const msg = action === 'start' ? '启动' : '停止';
     if (!await showConfirm('确定' + msg + '集群 ' + name + ' 的所有虚拟机？')) return;
     try {
@@ -390,12 +405,36 @@ async function vmAction(node, vmid, action, clusterName) {
     return _doVmAction(node, vmid, action);
 }
 
-function showShutdownModal(title, msg, showActions, showPending, showWaiting) {
+function showShutdownModal(title, msg, showActions, showPending, showWaiting, voteType, vmName, vmList) {
     document.getElementById('shutdown-vote-title').textContent = title || '关机确认';
     document.getElementById('shutdown-vote-message').innerHTML = msg || '';
     document.getElementById('shutdown-vote-actions').style.display = showActions ? 'flex' : 'none';
     document.getElementById('shutdown-vote-pending').style.display = showPending ? 'block' : 'none';
     document.getElementById('shutdown-vote-waiting').style.display = showWaiting ? 'block' : 'none';
+    document.getElementById('shutdown-vote-icon').textContent = voteType === 'cluster' ? '\u{1F6A8}' : '\u26A0\uFE0F';
+    var vmSection = document.getElementById('shutdown-vote-vm-section');
+    var clusterWarn = document.getElementById('shutdown-vote-cluster-warning');
+    if (voteType === 'cluster') {
+        vmSection.style.display = 'block';
+        vmSection.style.borderColor = '#ffccc7';
+        vmSection.style.background = '#fff2f0';
+        var vmHtml = '<div style="font-weight:500;color:#cf1322;margin-bottom:8px">\u26A1 以下 ' + (vmList ? vmList.length : 0) + ' 个节点将被关闭：</div>';
+        if (vmList && vmList.length) {
+            vmHtml += '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+            for (var vi = 0; vi < vmList.length; vi++) {
+                vmHtml += '<span style="background:#fff;border:1px solid #ffccc7;border-radius:4px;padding:4px 10px;font-size:12px;color:#555">' + esc(vmList[vi]) + '</span>';
+            }
+            vmHtml += '</div>';
+        }
+        vmSection.innerHTML = vmHtml;
+        clusterWarn.style.display = 'block';
+    } else {
+        vmSection.style.display = 'block';
+        vmSection.style.borderColor = '#91d5ff';
+        vmSection.style.background = '#e6f7ff';
+        vmSection.innerHTML = '<span style="font-weight:500;color:#1890ff">\uD83D\uDCBB ' + esc(vmName || '虚拟机') + '</span>';
+        clusterWarn.style.display = 'none';
+    }
     document.getElementById('shutdown-vote-modal').className = 'modal-overlay show';
 }
 
@@ -511,13 +550,19 @@ document.addEventListener('DOMContentLoaded', async function() {
         setTimeout(arguments.callee, 500);
         return;
     }
+
     stateSocket.on('vm_shutdown_request', function(data) {
         shutdownVoteId = data.vote_id;
-        showShutdownModal(
-            '关机确认',
-            '用户 <strong>' + esc(data.initiator_name) + '</strong> 正在尝试关闭集群 <strong>' + esc(data.cluster_name) + '</strong> 的虚拟机。<br>请投票：',
-            true, false, false
-        );
+        var vtype = data.type || 'single';
+        var title, msg;
+        if (vtype === 'cluster') {
+            title = '\u{1F6A8} 集群关机确认';
+            msg = '用户 <strong>' + esc(data.initiator_name) + '</strong> 正在尝试关闭集群 <strong>' + esc(data.cluster_name) + '</strong> 的全部节点。<br>请投票：';
+        } else {
+            title = '\u26A0\uFE0F 关机确认';
+            msg = '用户 <strong>' + esc(data.initiator_name) + '</strong> 正在尝试关机：';
+        }
+        showShutdownModal(title, msg, true, false, false, vtype, data.vm_name, data.vm_list);
         updateShutdownCountdown(data.remaining || 30);
         if (shutdownVoteTimer) clearInterval(shutdownVoteTimer);
         var remaining = data.remaining || 30;
@@ -529,11 +574,20 @@ document.addEventListener('DOMContentLoaded', async function() {
     });
     stateSocket.on('vm_shutdown_pending', function(data) {
         shutdownVoteId = data.vote_id;
-        showShutdownModal(
-            '等待确认',
-            '正在等待其他同学确认关机操作...<br>已同意: <strong>' + data.agreed + '</strong>/' + data.total_voters,
-            false, true, false
-        );
+        var vtype = data.type || 'single';
+        var title, msg;
+        if (vtype === 'cluster') {
+            title = '\u{1F6A8} 等待确认';
+            msg = '正在等待其他同学确认关闭集群 <strong>' + esc(data.cluster_name) + '</strong> 的全部节点...';
+        } else {
+            title = '\u23F3 等待确认';
+            msg = '正在等待其他同学确认关机操作...';
+        }
+        var agreedEl = document.getElementById('shutdown-vote-agreed-count');
+        var totalEl = document.getElementById('shutdown-vote-total-count');
+        if (agreedEl) agreedEl.textContent = data.agreed || 1;
+        if (totalEl) totalEl.textContent = data.total_voters || 0;
+        showShutdownModal(title, msg, false, true, false, vtype, data.vm_name, data.vm_list);
         updateShutdownCountdown(data.remaining || 30);
         if (shutdownVoteTimer) clearInterval(shutdownVoteTimer);
         var remaining = data.remaining || 30;
@@ -550,12 +604,17 @@ document.addEventListener('DOMContentLoaded', async function() {
     });
     stateSocket.on('vm_shutdown_proceed', function(data) {
         hideShutdownModal();
-        showToast('所有同学已同意，正在关机', 'success');
-        var _key = data.node + '_' + data.vmid;
-        vmStatusCache[_key] = 'stopped';
-        document.querySelectorAll('[id$="-' + data.vmid + '"]').forEach(function(_el) {
-            if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag vm-stopped';
-        });
+        if (data.type === 'cluster') {
+            showToast('所有同学已同意，正在关闭集群全部节点', 'success');
+            loadClusters();
+        } else {
+            showToast('所有同学已同意，正在关机', 'success');
+            var _key = data.node + '_' + data.vmid;
+            vmStatusCache[_key] = 'stopped';
+            document.querySelectorAll('[id$="-' + data.vmid + '"]').forEach(function(_el) {
+                if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag vm-stopped';
+            });
+        }
     });
     stateSocket.on('vm_shutdown_cancelled', function(data) {
         hideShutdownModal();
@@ -563,19 +622,24 @@ document.addEventListener('DOMContentLoaded', async function() {
     });
     stateSocket.on('vm_shutdown_allowed', function(data) {
         hideShutdownModal();
-        var _key = data.node + '_' + data.vmid;
-        vmStatusCache[_key] = 'stopped';
-        document.querySelectorAll('[id$="-' + data.vmid + '"]').forEach(function(_el) {
-            if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag vm-stopped';
-        });
-        showToast('已停止', 'success');
+        if (data.type === 'cluster') {
+            showToast('集群全部节点已停止', 'success');
+            loadClusters();
+        } else {
+            var _key = data.node + '_' + data.vmid;
+            vmStatusCache[_key] = 'stopped';
+            document.querySelectorAll('[id$="-' + data.vmid + '"]').forEach(function(_el) {
+                if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag vm-stopped';
+            });
+            showToast('已停止', 'success');
+        }
     });
     stateSocket.on('vm_shutdown_error', function(data) {
         hideShutdownModal();
         showToast(data.message || '操作失败', 'error');
     });
     stateSocket.on('vm_shutdown_voted', function(data) {
-        showShutdownModal('已投票', '等待其他同学确认...', false, false, true);
+        showShutdownModal('\u2713 已投票', '等待其他同学确认...', false, false, true);
     });
 })();
 </script>
