@@ -1,5 +1,8 @@
 {% extends "base.html" %}
 {% block page_heading %}K8s集群管理{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="/static/css/pages/k8s.css">
+{% endblock %}
 {% block content %}
 
 {% if current_user.role in ('admin', 'teacher') %}
@@ -57,25 +60,7 @@
     </div>
 </div>
 
-<style>
-.checkbox-group{border:1px solid #d9d9d9;border-radius:4px;padding:8px 12px;max-height:180px;overflow-y:auto;background:#fff}
-.checkbox-group label{display:flex;align-items:center;gap:6px;margin-bottom:4px;cursor:pointer;font-weight:400;font-size:13px}
-.checkbox-group label:last-child{margin-bottom:0}
-.cluster-item{border:1px solid #f0f0f0;border-radius:10px;padding:14px 16px;margin-bottom:10px;border-left:4px solid var(--border);box-shadow:var(--card-shadow);transition:box-shadow .2s}
-.cluster-item:hover{box-shadow:var(--shadow-lg)}
-.cluster-header{display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap}
-.cluster-vms{display:flex;gap:6px;flex-wrap:wrap}
-.vm-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#f5f5f5;border:1px solid #d9d9d9;border-radius:5px;font-size:12px;color:#999}
-.vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
-.vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
-.vm-btn{padding:1px 6px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
-.vm-btn:hover{background:#1890ff;color:#fff}
-.k8s-badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500}
-.k8s-pending{background:#fff7e6;border:1px solid #ffd591;color:#d46b08}
-.k8s-installing{background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff}
-.k8s-installed{background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a}
-.k8s-failed{background:#fff2f0;border:1px solid #ffccc7;color:#ff4d4f}
-</style>
+
 
 <script>
 const API = '/api/k8s';

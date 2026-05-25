@@ -1,5 +1,8 @@
 {% extends "base.html" %}
 {% block page_heading %}我的集群{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="/static/css/pages/student.css">
+{% endblock %}
 {% block content %}
 
 <div id="student-clusters-section"></div>
@@ -20,11 +23,7 @@
     </div>
 </div>
 
-<style>
-.ssh-btn-request{padding:4px 12px;border:1px solid #faad14;border-radius:4px;background:#fff7e6;color:#d46b08;font-size:12px;cursor:pointer;font-weight:500}
-.ssh-btn-request:hover{background:#faad14;color:#fff}
-.ssh-takeover-notice{font-size:12px;color:#faad14;margin-left:8px}
-</style>
+
 
 <script src="/static/vendor/socket.io/socket.io.min.js"></script>
 <link rel="stylesheet" href="/static/vendor/xterm/xterm.min.css">
@@ -215,7 +214,7 @@ function renderCards(clusters) {
             var k8sBadge = '<span class="k8s-badge" style="' + badgeStyle + '">' + k8sLabel + '</span>';
 
             html += '<div class="cluster-item">' +
-                '<div class="cluster-header">' +
+                '<div class="cluster-header cluster-header--space-between">' +
                     '<span class="cluster-name">' + esc(label) + '</span>' +
                     k8sBadge +
                 '</div>' +

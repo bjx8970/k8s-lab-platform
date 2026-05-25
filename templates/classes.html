@@ -1,5 +1,8 @@
 {% extends "base.html" %}
 {% block page_heading %}课程管理{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="/static/css/pages/classes.css">
+{% endblock %}
 {% block content %}
 
 <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap">
@@ -49,18 +52,7 @@
   </div>
 </div>
 
-<style>
-.class-card{border:1px solid #f0f0f0;border-radius:10px;padding:14px 16px;margin-bottom:10px;box-shadow:var(--card-shadow);border-left:4px solid var(--primary)}
-.class-card .class-header{display:flex;align-items:center;justify-content:space-between;cursor:pointer}
-.class-card .class-header .name{font-size:15px;font-weight:600;color:#333}
-.class-card .class-header .meta{font-size:12px;color:#999}
-.class-card .class-body{padding-top:10px;margin-top:10px;border-top:1px solid #f0f0f0}
-.group-item{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:#fafafa;border-radius:6px;margin-bottom:6px;font-size:13px;transition:background .15s}
-.group-item:hover{background:#f0f5ff}
-.group-item .group-name{font-weight:500}
-.group-item .group-actions{display:flex;gap:6px}
-.badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;background:#e6f7ff;color:#1890ff}
-</style>
+
 
 <script>
 let _editingClassId = null;

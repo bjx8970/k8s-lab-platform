@@ -1,5 +1,8 @@
 {% extends "base.html" %}
 {% block page_heading %}PVE连接管理{% endblock %}
+{% block extra_head %}
+<link rel="stylesheet" href="/static/css/pages/pve.css">
+{% endblock %}
 {% block content %}
 
 <div style="margin-bottom:16px">
@@ -63,18 +66,7 @@
     </div>
 </div>
 
-<style>
-.server-card{border:1px solid #f0f0f0;border-radius:10px;padding:16px;margin-bottom:10px;max-width:720px;border-left:4px solid var(--primary);box-shadow:var(--card-shadow)}
-.server-card .row{display:flex;align-items:center;justify-content:space-between}
-.server-card .info{flex:1}
-.server-card .name{font-size:15px;font-weight:600;color:#333}
-.server-card .meta{font-size:12px;color:#999;margin-top:4px}
-.server-card .meta span{margin-right:16px}
-.server-card .actions{display:flex;gap:6px;flex-shrink:0}
-.server-card .actions .btn{padding:4px 12px;font-size:12px}
-.conn-ok{color:#52c41a;font-size:12px;margin-top:4px}
-.conn-err{color:#ff4d4f;font-size:12px;margin-top:4px}
-</style>
+
 
 <script>
 const API = '/api/pve';

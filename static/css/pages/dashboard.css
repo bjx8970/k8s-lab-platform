@@ -1,0 +1,15 @@
+.takeover-btn{padding:4px 12px;border:1px solid #722ed1;border-radius:4px;background:#f9f0ff;color:#722ed1;font-size:12px;cursor:pointer;font-weight:500}
+.takeover-btn:hover{background:#722ed1;color:#fff}
+.view-btn{padding:4px 12px;border:1px solid #13c2c2;border-radius:4px;background:#e6fffb;color:#13c2c2;font-size:12px;cursor:pointer;font-weight:500}
+.view-btn:hover{background:#13c2c2;color:#fff}
+.active-cluster-row{padding:10px 14px;border-bottom:1px solid #f0f0f0}
+.active-cluster-row:last-child{border-bottom:none}
+.active-cluster-row-flex{display:flex;align-items:center;padding:10px 14px;border-bottom:1px solid #f0f0f0;gap:12px}
+.active-cluster-row-flex:last-child{border-bottom:none}
+.collapsible-header{cursor:pointer;user-select:none;display:flex;align-items:center;gap:8px;padding:10px 14px;font-size:14px;font-weight:600}
+.collapsible-header:hover{background:#f5f5f5}
+.collapsible-body{overflow:hidden;transition:max-height 0.25s ease}
+.role-badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:11px;font-weight:500}
+.role-student{background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff}
+.role-teacher{background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a}
+.role-admin{background:#fff7e6;border:1px solid #ffd591;color:#d46b08}
