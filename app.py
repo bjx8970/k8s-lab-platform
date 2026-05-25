@@ -27,8 +27,30 @@ from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s
 from modules.pg_client import PGClient, PGError
 from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor, update_vm_status
 
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from modules.ssh_terminal import SSHManager, SSHConnectionError, SessionExistsError, TooManyConnectionsError
+
+# ── 用户在线追踪 (内存) ──
+_online_users = {}  # user_id → {"sids": set(), "online_since": timestamp}
+
+def _add_online_user(user_id, sid):
+    if user_id not in _online_users:
+        _online_users[user_id] = {"sids": set(), "online_since": time.time()}
+    _online_users[user_id]["sids"].add(sid)
+
+def _remove_online_user(sid):
+    for uid, info in list(_online_users.items()):
+        info["sids"].discard(sid)
+        if not info["sids"]:
+            del _online_users[uid]
+
+def _update_online_user(sid):
+    for uid, info in _online_users.items():
+        if sid in info["sids"]:
+            info["online_since"] = time.time()
+
+def is_user_online(user_id):
+    return user_id in _online_users
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
@@ -293,6 +315,23 @@ def api_users_me():
     return jsonify(result)
 
 
+@app.route("/api/users/me/password", methods=["POST"])
+@login_required
+@csrf.exempt
+def api_change_my_password():
+    data = request.get_json(force=True) or {}
+    old_pw = data.get("old_password", "")
+    new_pw = data.get("new_password", "")
+    if not old_pw or not new_pw:
+        return jsonify({"error": "密码不能为空"}), 400
+    if len(new_pw) < 6:
+        return jsonify({"error": "新密码至少 6 位"}), 400
+    if not check_password_hash(current_user.password_hash, old_pw):
+        return jsonify({"error": "原密码错误"}), 403
+    update_user(current_user.id, {"password_hash": generate_password_hash(new_pw)})
+    return jsonify({"message": "密码修改成功"})
+
+
 @app.route("/api/users", methods=["GET"])
 @login_required
 def api_list_users():
@@ -303,6 +342,8 @@ def api_list_users():
         users = list_users(role="student")
     else:
         return jsonify({"error": "权限不足"}), 403
+    for u in users:
+        u["online"] = is_user_online(u["id"])
     return jsonify(users)
 
 
@@ -2231,11 +2272,22 @@ def webssh_disconnect():
 def state_connect():
     if not current_user.is_authenticated:
         return False
+    _add_online_user(current_user.id, request.sid)
     if current_user.role == "admin":
         join_room("admin")
     elif current_user.role == "teacher":
         join_room("teacher")
     join_room(f"user_{current_user.id}")
+
+@socketio.on("disconnect", namespace="/state")
+def state_disconnect():
+    if current_user.is_authenticated:
+        _remove_online_user(request.sid)
+
+@socketio.on("heartbeat", namespace="/state")
+def state_heartbeat():
+    if current_user.is_authenticated:
+        _update_online_user(request.sid)
 
 
 def _emit_task_update(task_id, status, progress, message, created_by, queue):

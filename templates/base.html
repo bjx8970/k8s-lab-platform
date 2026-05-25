@@ -211,7 +211,9 @@
                 </div>
                 {% endif %}
                 <div class="user-info" style="display:flex;align-items:center;gap:12px">
+                    <span id="self-online-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#52c41a;margin-right:2px"></span>
                     <span>{{ current_user.username if current_user.role == 'admin' else (current_user.name or current_user.username) }}@k8s-lab ({{ {'admin':'管理员','teacher':'教师','student':'学生'}.get(current_user.role, current_user.role) }})</span>
+                    <button onclick="showChangePasswordModal()" style="padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">修改密码</button>
                     <button onclick="logout()" style="padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">退出</button>
                 </div>
             </div>
@@ -230,6 +232,21 @@
             </div>
         </div>
     </div>
+
+    <div class="modal-overlay" id="change-pwd-modal">
+        <div class="modal-card" style="width:380px">
+            <h3 style="margin-bottom:16px">修改密码</h3>
+            <div class="form-group"><label>原密码</label><input id="cp-old" class="form-control" type="password"></div>
+            <div class="form-group"><label>新密码</label><input id="cp-new" class="form-control" type="password"></div>
+            <div class="form-group"><label>确认新密码</label><input id="cp-confirm" class="form-control" type="password"></div>
+            <div id="cp-error" style="color:#ff4d4f;font-size:13px;margin-top:8px;display:none"></div>
+            <div style="margin-top:14px;display:flex;gap:8px">
+                <button class="btn btn-primary" id="cp-btn" onclick="changePassword()">确认修改</button>
+                <button class="btn" onclick="closeChangePasswordModal()">取消</button>
+            </div>
+        </div>
+    </div>
+
     <script src="/static/vendor/socket.io/socket.io.min.js"></script>
     <script>
     (function() {
@@ -251,6 +268,44 @@
         await fetch('/api/logout', { method: 'POST' });
         window.location.href = '/login';
     }
+
+    function showChangePasswordModal() {
+        document.getElementById('cp-old').value = '';
+        document.getElementById('cp-new').value = '';
+        document.getElementById('cp-confirm').value = '';
+        document.getElementById('cp-error').style.display = 'none';
+        document.getElementById('cp-btn').disabled = false;
+        document.getElementById('change-pwd-modal').style.display = 'flex';
+    }
+    function closeChangePasswordModal() {
+        document.getElementById('change-pwd-modal').style.display = 'none';
+    }
+    async function changePassword() {
+        var old = document.getElementById('cp-old').value;
+        var pwd = document.getElementById('cp-new').value;
+        var confirm = document.getElementById('cp-confirm').value;
+        var err = document.getElementById('cp-error');
+        if (!old || !pwd) { err.textContent = '密码不能为空'; err.style.display = 'block'; return; }
+        if (pwd.length < 6) { err.textContent = '新密码至少 6 位'; err.style.display = 'block'; return; }
+        if (pwd !== confirm) { err.textContent = '两次密码输入不一致'; err.style.display = 'block'; return; }
+        document.getElementById('cp-btn').disabled = true;
+        try {
+            var r = await fetch('/api/users/me/password', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({old_password: old, new_password: pwd})
+            });
+            var d = await r.json();
+            if (!r.ok) throw new Error(d.error);
+            closeChangePasswordModal();
+            showToast('密码修改成功', 'success');
+        } catch (e) {
+            err.textContent = e.message;
+            err.style.display = 'block';
+        } finally {
+            document.getElementById('cp-btn').disabled = false;
+        }
+    }
     </script>
 
     <script>
@@ -260,6 +315,12 @@
             reconnection: true,
             reconnectionAttempts: 5,
             reconnectionDelay: 2000,
+        });
+
+        stateSocket.on('connect', function() {
+            setInterval(function() {
+                if (stateSocket && stateSocket.connected) stateSocket.emit('heartbeat', {});
+            }, 15000);
         });
 
         stateSocket.on('task_update', function(data) {
