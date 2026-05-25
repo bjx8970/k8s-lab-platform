@@ -61,13 +61,6 @@
 </div>
 
 <style>
-.vm-tag{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;background:#f5f5f5;border:1px solid #d9d9d9;border-radius:5px;font-size:12px;color:#999}
-.vm-tag.vm-running{background:#e6f7ff;border-color:#1890ff;color:#1890ff}
-.vm-tag.vm-stopped{background:#fff2f0;border-color:#ff4d4f;color:#ff4d4f}
-.vm-btn{padding:1px 5px;border:1px solid #91d5ff;border-radius:3px;background:#fff;color:#1890ff;font-size:11px;cursor:pointer;line-height:1.2}
-.vm-btn:hover{background:#1890ff;color:#fff}
-.webssh-btn{padding:4px 12px;border:1px solid #52c41a;border-radius:4px;background:#f6ffed;color:#52c41a;font-size:12px;cursor:pointer;font-weight:500}
-.webssh-btn:hover{background:#52c41a;color:#fff}
 .takeover-btn{padding:4px 12px;border:1px solid #722ed1;border-radius:4px;background:#f9f0ff;color:#722ed1;font-size:12px;cursor:pointer;font-weight:500}
 .takeover-btn:hover{background:#722ed1;color:#fff}
 .view-btn{padding:4px 12px;border:1px solid #13c2c2;border-radius:4px;background:#e6fffb;color:#13c2c2;font-size:12px;cursor:pointer;font-weight:500}
@@ -83,15 +76,6 @@
 .role-student{background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff}
 .role-teacher{background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a}
 .role-admin{background:#fff7e6;border:1px solid #ffd591;color:#d46b08}
-
-#terminal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center}
-#terminal-container{width:90%;height:85%;background:#1e1e1e;border-radius:8px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.4)}
-#terminal-container.fullscreen{width:100%;height:100%;border-radius:0}
-#terminal-header{display:flex;align-items:center;padding:8px 16px;background:#2d2d2d;border-bottom:1px solid #3d3d3d;color:#ccc;font-size:14px;user-select:none}
-#terminal-header button{background:none;border:none;color:#ccc;font-size:16px;cursor:pointer;padding:4px 8px;border-radius:3px;margin-left:4px}
-#terminal-header button:hover{background:#444;color:#fff}
-#terminal-body{flex:1;overflow:hidden;position:relative}
-#terminal-body .xterm{padding:8px;height:100%}
 </style>
 
 <script src="/static/vendor/socket.io/socket.io.min.js"></script>
@@ -114,7 +98,7 @@ var reconnectPopupSessionId = null;
 var reconnectCountdownTimer = null;
 var reconnectCountdownSeconds = 10;
 
-function escStats(s) {
+function esc(s) {
     if (!s) return '';
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -141,6 +125,7 @@ async function loadStats() {
         document.getElementById('stat-clusters').textContent = Object.keys(clusters).length;
         if (USER_ROLE === 'teacher') {
             await loadStudentSessions();
+            await loadTeacherSessions(clusters);
             renderClassCards(clusters);
             refreshVmStatuses(clusters);
             renderActiveClustersTeacher(clusters);
@@ -161,6 +146,20 @@ var _badgeStyles = {
 var _labelMap = {'pending':'未部署','installing':'部署中','installed':'已部署','failed':'部署失败'};
 
 var studentSessions = {};
+var teacherSessions = {};
+
+async function loadTeacherSessions(clusters) {
+    teacherSessions = {};
+    for (var name in clusters) {
+        try {
+            var r = await fetch('/api/webssh/cluster/' + encodeURIComponent(name));
+            var d = await r.json();
+            if (d.has_session) {
+                teacherSessions[name] = d.session;
+            }
+        } catch(e) {}
+    }
+}
 
 async function loadStudentSessions() {
     try {
@@ -234,7 +233,7 @@ function renderClassCards(clusters) {
         var clsName = classOrder[ci];
         var items = grouped[clsName];
         html += '<div class="card" style="margin-bottom:16px">' +
-            '<h3 style="margin-bottom:12px;font-size:16px">&#128218; ' + escStats(clsName) + ' (' + items.length + ' 个集群)</h3>';
+            '<h3 style="margin-bottom:12px;font-size:16px">&#128218; ' + esc(clsName) + ' (' + items.length + ' 个集群)</h3>';
         for (var ii = 0; ii < items.length; ii++) {
             var item = items[ii];
             var c = item.data;
@@ -243,7 +242,7 @@ function renderClassCards(clusters) {
             var k8s = c.k8s_status || 'pending';
             var k8sLabel = _labelMap[k8s] || k8s;
             var badgeStyle = _badgeStyles[k8s] || _badgeStyles['pending'];
-            var sshInfo = 'SSH: <code>' + escStats('{{ (get_config("openwrt") or {}).get("host", "") }}') + ':' + (c.ssh_port || '') + '</code> 用户: <code>k8s</code> 密码: <code>' + escStats(c.password || 'k8s.1234') + '</code>';
+            var sshHost = esc('{{ (get_config("openwrt") or {}).get("host", "") }}') + ':' + (c.ssh_port || '');
             var vmsHtml = '';
             if (c.vms) {
                 for (var vn in c.vms) {
@@ -252,27 +251,33 @@ function renderClassCards(clusters) {
                     var _cached = vmStatusCache[_key];
                     var _extra = _cached === 'running' ? ' vm-running' : (_cached === 'stopped' ? ' vm-stopped' : '');
                     vmsHtml += '<span class="vm-tag' + _extra + '" id="vm-' + name + '-' + v.vmid + '">' +
-                        escStats(vn) + ' (' + v.role + ')' +
-                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'start\')">&#9654;</button>' +
-                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + escStats(v.node) + '\',' + v.vmid + ',\'stop\')">&#9209;</button>' +
+                        esc(vn) + ' (' + v.role + ')' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'start\')">&#9654;</button>' +
+                        '<button class="vm-btn" onclick="event.stopPropagation();vmAction(\'' + esc(v.node) + '\',' + v.vmid + ',\'stop\')">&#9209;</button>' +
                         '</span>';
                 }
             }
 
             var actionBtns = renderTeacherActionButtons(name, c);
 
-            html += '<div style="border:1px solid #f0f0f0;border-radius:8px;padding:14px 16px;margin-bottom:8px">' +
-                '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">' +
-                    '<strong style="font-size:15px">' + escStats(label) + '</strong>' +
-                    '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
-                        actionBtns +
-                        '<button onclick="clusterVmAction(\'' + name + '\',\'start\')" style="padding:3px 10px;border:1px solid #91d5ff;border-radius:4px;background:#fff;color:#1890ff;font-size:12px;cursor:pointer">&#9654; 启动全部</button>' +
-                        '<button onclick="clusterVmAction(\'' + name + '\',\'stop\')" style="padding:3px 10px;border:1px solid #ffccc7;border-radius:4px;background:#fff;color:#ff4d4f;font-size:12px;cursor:pointer">&#9209; 停止全部</button>' +
-                        '<span style="display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500;' + badgeStyle + '">' + k8sLabel + '</span>' +
-                    '</div>' +
+            html += '<div class="cluster-item">' +
+                '<div class="cluster-header">' +
+                    '<span class="cluster-name">' + esc(label) + '</span>' +
+                    '<span class="k8s-badge" style="' + badgeStyle + '">' + k8sLabel + '</span>' +
                 '</div>' +
-                '<div style="margin-top:8px;font-size:12px;color:#666">' + sshInfo + '</div>' +
-                (vmsHtml ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' + vmsHtml + '</div>' : '') +
+                '<div class="cluster-action-bar">' +
+                    actionBtns +
+                    renderTeacherSessionButtons(name) +
+                    '<button class="btn btn-sm btn-success" onclick="clusterVmAction(\'' + name + '\',\'start\')">&#9654; 启动全部</button>' +
+                    '<button class="btn btn-sm btn-danger" onclick="clusterVmAction(\'' + name + '\',\'stop\')">&#9209; 停止全部</button>' +
+                    '<button class="view-ssh-btn" onclick="toggleSshInfo(\'' + name + '\')">&#128274; 查看连接信息</button>' +
+                '</div>' +
+                '<div class="cluster-ssh" id="ssh-info-' + name + '">' +
+                    '<span class="ssh-label">地址</span> <code>' + sshHost + '</code><br>' +
+                    '<span class="ssh-label">用户</span> <code>k8s</code><br>' +
+                    '<span class="ssh-label">密码</span> <code>' + esc(c.password || 'k8s.1234') + '</code>' +
+                '</div>' +
+                (vmsHtml ? '<div class="cluster-vms">' + vmsHtml + '</div>' : '') +
             '</div>';
         }
         html += '</div>';
@@ -292,32 +297,99 @@ function renderTeacherActionButtons(clusterName, clusterData) {
     var statusText = '';
     if (session.takeover_active) {
         var taker = session.takeover_by ? session.takeover_by.username : '';
-        statusText = '<span style="font-size:11px;color:#faad14;margin-right:8px">已被 ' + escStats(taker) + ' 接管</span>';
+        statusText = '<span style="font-size:11px;color:#faad14;margin-right:8px">已被 ' + esc(taker) + ' 接管</span>';
     } else if (session.status === 'connected') {
-        statusText = '<span style="font-size:11px;color:#52c41a;margin-right:8px">在线 (' + escStats(ownerName) + ')</span>';
+        statusText = '<span style="font-size:11px;color:#52c41a;margin-right:8px">在线 (' + esc(ownerName) + ')</span>';
     } else if (session.status === 'disconnected') {
-        statusText = '<span style="font-size:11px;color:#999;margin-right:8px">离线 (' + escStats(ownerName) + ')</span>';
+        statusText = '<span style="font-size:11px;color:#999;margin-right:8px">离线 (' + esc(ownerName) + ')</span>';
     }
 
     if (session.takeover_active && session.takeover_by && session.takeover_by.user_id === parseInt('{{ current_user.id }}')) {
-        return statusText + '<button class="takeover-btn" onclick="openTakeoverTerminal(\'' + session.session_id + '\',\'' + escStats(clusterName) + '\')">查看终端</button>';
+        return statusText + '<button class="takeover-btn" onclick="openTakeoverTerminal(\'' + session.session_id + '\',\'' + esc(clusterName) + '\')">查看终端</button>';
     }
 
     return statusText +
-        '<button class="takeover-btn" onclick="takeoverSession(\'' + session.session_id + '\',\'' + escStats(clusterName) + '\')">接管</button>' +
-        '<button class="view-btn" onclick="viewSession(\'' + session.session_id + '\',\'' + escStats(clusterName) + '\')">查看</button>';
+        '<button class="takeover-btn" onclick="takeoverSession(\'' + session.session_id + '\',\'' + esc(clusterName) + '\')">接管</button>' +
+        '<button class="view-btn" onclick="viewSession(\'' + session.session_id + '\',\'' + esc(clusterName) + '\')">查看</button>';
+}
+
+function renderTeacherSessionButtons(clusterName) {
+    var session = teacherSessions[clusterName];
+    if (!session || session.status === 'terminated') {
+        return '<button class="ssh-btn" onclick="createTeacherSession(\'' + clusterName + '\')">连接</button>';
+    }
+    var buttons = '<button class="ssh-btn-reconnect" onclick="reconnectTeacherSession(\'' + clusterName + '\')">打开终端</button>';
+    buttons += '<button class="ssh-btn-terminate" onclick="terminateTeacherSession(\'' + clusterName + '\')">终止会话</button>';
+    return buttons;
+}
+
+function openTeacherTerminal(clusterName, title) {
+    terminalMode = 'owner';
+    currentClusterName = clusterName;
+    document.getElementById('terminal-overlay').style.display = 'flex';
+    document.getElementById('terminal-title').textContent = title || 'Web终端 - ' + clusterName;
+    document.getElementById('terminal-status').textContent = '连接中...';
+    document.getElementById('terminal-status').style.color = '#ffd591';
+    document.getElementById('takeover-indicator').style.display = 'none';
+
+    initTerminal();
+    setTimeout(function() { fitAddon.fit(); }, 100);
+
+    if (!terminalSocket) {
+        initTeacherSocket();
+    }
+}
+
+function createTeacherSession(clusterName) {
+    var session = teacherSessions[clusterName];
+    currentSessionId = session && session.status !== 'terminated' ? session.session_id : null;
+    openTeacherTerminal(clusterName, 'SSH - ' + clusterName);
+    if (currentSessionId) {
+        terminalSocket.emit('session_reconnect', {cluster: clusterName});
+    } else {
+        terminalSocket.emit('session_create', {cluster: clusterName});
+    }
+}
+
+function reconnectTeacherSession(clusterName) {
+    var session = teacherSessions[clusterName];
+    currentSessionId = session ? session.session_id : null;
+    openTeacherTerminal(clusterName, 'Web终端 - ' + clusterName);
+    terminalSocket.emit('session_reconnect', {cluster: clusterName});
+}
+
+async function terminateTeacherSession(clusterName) {
+    if (!await showConfirm('确定终止该会话？SSH 连接将被关闭。')) return;
+    try {
+        var r = await fetch('/api/webssh/sessions/' + encodeURIComponent(clusterName) + '/terminate', {
+            method: 'POST',
+        });
+        var d = await r.json();
+        if (!r.ok) throw new Error(d.error || '终止失败');
+        delete teacherSessions[clusterName];
+        loadStats();
+        showToast('会话已终止', 'success');
+    } catch(e) {
+        showToast('终止失败: ' + e.message, 'error');
+    }
+}
+
+function toggleSshInfo(clusterName) {
+    var el = document.getElementById('ssh-info-' + clusterName);
+    if (!el) return;
+    el.classList.toggle('show');
 }
 
 function renderSessionActionButtons(session) {
     if (session.takeover_active && session.takeover_by && session.takeover_by.user_id === USER_ID) {
-        return '<button class="takeover-btn" onclick="openTakeoverTerminal(\'' + session.session_id + '\',\'' + escStats(session.cluster_name) + '\')">查看终端</button>';
+        return '<button class="takeover-btn" onclick="openTakeoverTerminal(\'' + session.session_id + '\',\'' + esc(session.cluster_name) + '\')">查看终端</button>';
     }
     if (session.takeover_active) {
         var taker = session.takeover_by ? session.takeover_by.username : '';
-        return '<span style="font-size:11px;color:#faad14">已被 ' + escStats(taker) + ' 接管</span>';
+        return '<span style="font-size:11px;color:#faad14">已被 ' + esc(taker) + ' 接管</span>';
     }
-    return '<button class="takeover-btn" onclick="takeoverSession(\'' + session.session_id + '\',\'' + escStats(session.cluster_name) + '\')">接管</button>' +
-           '<button class="view-btn" onclick="viewSession(\'' + session.session_id + '\',\'' + escStats(session.cluster_name) + '\')">查看</button>';
+    return '<button class="takeover-btn" onclick="takeoverSession(\'' + session.session_id + '\',\'' + esc(session.cluster_name) + '\')">接管</button>' +
+           '<button class="view-btn" onclick="viewSession(\'' + session.session_id + '\',\'' + esc(session.cluster_name) + '\')">查看</button>';
 }
 
 function renderActiveClustersAdmin(sessions, clusters) {
@@ -356,8 +428,8 @@ function renderActiveClustersAdmin(sessions, clusters) {
     for (var ei = 0; ei < entries.length; ei++) {
         var entry = entries[ei];
         var clsLabel = entry.cluster.class_name || '—';
-        var grpLabel = entry.cluster.group_name || '演示集群';
-        var classGrp = escStats(clsLabel) + ' / ' + escStats(grpLabel);
+        var grpLabel = entry.cluster.group_name || '集群';
+        var classGrp = esc(clsLabel) + ' / ' + esc(grpLabel);
 
         for (var si = 0; si < entry.sessions.length; si++) {
             var s = entry.sessions[si];
@@ -369,7 +441,7 @@ function renderActiveClustersAdmin(sessions, clusters) {
             var statusHtml = '';
             if (s.takeover_active) {
                 var taker = s.takeover_by ? s.takeover_by.username : '';
-                statusHtml = '<span style="color:#faad14">被 ' + escStats(taker) + ' 接管</span>';
+                statusHtml = '<span style="color:#faad14">被 ' + esc(taker) + ' 接管</span>';
             } else if (s.status === 'connected') {
                 statusHtml = '<span style="color:#52c41a">● 在线</span>';
             } else {
@@ -379,9 +451,9 @@ function renderActiveClustersAdmin(sessions, clusters) {
             var btns = renderSessionActionButtons(s);
 
             html += '<tr class="active-cluster-row">' +
-                '<td style="padding:10px 14px;font-weight:500">' + escStats(entry.name) + '</td>' +
+                '<td style="padding:10px 14px;font-weight:500">' + esc(entry.name) + '</td>' +
                 '<td style="padding:10px 14px">' + classGrp + '</td>' +
-                '<td style="padding:10px 14px">' + escStats(ownerName) + ' ' + roleBadge + '</td>' +
+                '<td style="padding:10px 14px">' + esc(ownerName) + ' ' + roleBadge + '</td>' +
                 '<td style="padding:10px 14px">' + statusHtml + '</td>' +
                 '<td style="padding:10px 14px">' + btns + '</td>' +
                 '</tr>';
@@ -428,7 +500,7 @@ function renderActiveClustersTeacher(clusters) {
         html += '<div style="border:1px solid #f0f0f0;border-radius:8px;margin-bottom:8px;overflow:hidden">' +
             '<div class="collapsible-header" onclick="toggleCollapsible(this)" data-target="' + uid + '">' +
                 '<span class="collapse-arrow" style="display:inline-block;width:16px;text-align:center;transition:transform 0.2s">&#9660;</span>' +
-                escStats(clsName) + ' <span style="color:#999;font-weight:400;font-size:12px">(' + items.length + ')</span>' +
+                esc(clsName) + ' <span style="color:#999;font-weight:400;font-size:12px">(' + items.length + ')</span>' +
             '</div>' +
             '<div class="collapsible-body" id="' + uid + '">';
 
@@ -441,7 +513,7 @@ function renderActiveClustersTeacher(clusters) {
             var statusHtml = '';
             if (s.takeover_active) {
                 var taker = s.takeover_by ? s.takeover_by.username : '';
-                statusHtml = '<span style="color:#faad14">被 ' + escStats(taker) + ' 接管</span>';
+                statusHtml = '<span style="color:#faad14">被 ' + esc(taker) + ' 接管</span>';
             } else if (s.status === 'connected') {
                 statusHtml = '<span style="color:#52c41a">● 在线</span>';
             } else {
@@ -456,8 +528,8 @@ function renderActiveClustersTeacher(clusters) {
             var btns = renderSessionActionButtons(s);
 
             html += '<div class="active-cluster-row-flex" style="padding-left:32px">' +
-                '<span style="font-weight:500;min-width:80px">' + escStats(grpLabel) + '</span>' +
-                '<span style="color:#999;font-size:12px;min-width:60px">' + escStats(ownerName) + '</span>' +
+                '<span style="font-weight:500;min-width:80px">' + esc(grpLabel) + '</span>' +
+                '<span style="color:#999;font-size:12px;min-width:60px">' + esc(ownerName) + '</span>' +
                 '<span style="font-size:12px">' + statusHtml + '</span>' +
                 k8sBadge +
                 '<span style="flex:1"></span>' +
@@ -590,6 +662,12 @@ function initTeacherSocket() {
             terminalSocket.emit('takeover_start', {session_id: currentSessionId});
         } else if (currentSessionId && terminalMode === 'viewer') {
             terminalSocket.emit('view_start', {session_id: currentSessionId});
+        } else if (terminalMode === 'owner' && currentClusterName) {
+            if (currentSessionId) {
+                terminalSocket.emit('session_reconnect', {cluster: currentClusterName});
+            } else {
+                terminalSocket.emit('session_create', {cluster: currentClusterName});
+            }
         }
     });
 
@@ -623,6 +701,58 @@ function initTeacherSocket() {
                 }
             }
         }, 200);
+    });
+
+    terminalSocket.on('session_created', function(data) {
+        currentSessionId = data.session_id;
+        terminalConnected = true;
+        document.getElementById('terminal-status').textContent = '已连接';
+        document.getElementById('terminal-status').style.color = '#52c41a';
+        if (terminal) terminal.writeln('\x1b[32m已连接到 ' + data.cluster + '\x1b[0m\r\n');
+        setTimeout(function() {
+            if (fitAddon && terminal) {
+                fitAddon.fit();
+                var dims = fitAddon.proposeDimensions();
+                if (dims && terminalSocket && terminalSocket.connected) {
+                    terminalSocket.emit('ssh_resize', {cols: dims.cols, rows: dims.rows});
+                }
+            }
+        }, 200);
+    });
+
+    terminalSocket.on('session_reconnected', function(data) {
+        currentSessionId = data.session_id;
+        terminalConnected = true;
+        document.getElementById('terminal-status').textContent = '已连接';
+        document.getElementById('terminal-status').style.color = '#52c41a';
+        setTimeout(function() {
+            if (fitAddon && terminal) {
+                fitAddon.fit();
+                var dims = fitAddon.proposeDimensions();
+                if (dims && terminalSocket && terminalSocket.connected) {
+                    terminalSocket.emit('ssh_resize', {cols: dims.cols, rows: dims.rows});
+                }
+            }
+        }, 200);
+    });
+
+    terminalSocket.on('session_terminated', function(data) {
+        if (data.cluster === currentClusterName) {
+            if (terminal) terminal.writeln('\r\n\x1b[33m会话已终止\x1b[0m\r\n');
+            document.getElementById('terminal-status').textContent = '已终止';
+            document.getElementById('terminal-status').style.color = '#ff4d4f';
+        }
+        delete teacherSessions[data.cluster];
+        loadStats();
+    });
+
+    terminalSocket.on('takeover_notify', function(data) {
+        document.getElementById('takeover-indicator').style.display = '';
+        document.getElementById('takeover-indicator').textContent = (data.by || '管理员') + ' 正在操作';
+    });
+
+    terminalSocket.on('takeover_released', function() {
+        document.getElementById('takeover-indicator').style.display = 'none';
     });
 
     terminalSocket.on('log_replay', function(data) {
@@ -735,14 +865,12 @@ function loadActiveClustersRefresh() {
 }
 
 function closeTerminal() {
-    if (terminalSocket && currentSessionId) {
+    if (terminalSocket) {
         if (terminalMode === 'takeover') {
             terminalSocket.emit('takeover_stop', {session_id: currentSessionId});
         } else if (terminalMode === 'viewer') {
             terminalSocket.emit('view_stop', {session_id: currentSessionId});
         }
-    }
-    if (terminalSocket) {
         terminalSocket.disconnect();
         terminalSocket = null;
     }
@@ -756,7 +884,6 @@ function closeTerminal() {
         terminal = null;
         fitAddon = null;
     }
-    loadStudentSessions();
     loadStats();
     loadActiveClustersRefresh();
 }

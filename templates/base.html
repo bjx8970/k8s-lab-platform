@@ -115,6 +115,8 @@
         .btn-sm { padding: 3px 12px; font-size: 12px; border-radius: 4px; }
         .btn-danger { color: var(--danger); border-color: var(--danger); }
         .btn-danger:hover { background: var(--danger); color: #fff; }
+        .btn-success { color: var(--success); border-color: var(--success); }
+        .btn-success:hover { background: var(--success); color: #fff; }
         .btn-active { background: var(--primary); border-color: var(--primary); color: #fff; }
         .form-group { margin-bottom: 14px; }
         .form-group label { display: block; font-size: 13px; color: var(--text); margin-bottom: 5px; font-weight: 500; }
@@ -166,6 +168,65 @@
         .badge-red { background: var(--danger-bg); color: var(--danger); }
         .page-title { font-size: 20px; font-weight: 600; color: var(--text); margin-bottom: 16px; }
         .card p { color: var(--text-secondary); font-size: 14px; }
+
+        /* ── Shared VM Tags / Buttons ── */
+        .vm-tag{background:#f5f5f5;border:1px solid #d9d9d9;color:var(--text-muted);border-radius:6px;font-size:12px;padding:4px 10px;display:inline-flex;align-items:center;gap:4px;transition:all .2s}
+        .vm-tag.vm-running{background:var(--success-bg);border-color:var(--success);color:var(--success)}
+        .vm-tag.vm-stopped{background:var(--danger-bg);border-color:var(--danger);color:var(--danger)}
+        .vm-btn{padding:1px 6px;border:1px solid #91d5ff;border-radius:4px;background:transparent;color:var(--primary);font-size:11px;cursor:pointer;line-height:1.3;transition:all .2s}
+        .vm-btn:hover{background:var(--primary);color:#fff;border-color:var(--primary)}
+        .vm-btn.vm-btn-green{border-color:var(--success);color:var(--success)}
+        .vm-btn.vm-btn-green:hover{background:var(--success);color:#fff}
+        .vm-btn.vm-btn-red{border-color:var(--danger);color:var(--danger)}
+        .vm-btn.vm-btn-red:hover{background:var(--danger);color:#fff}
+
+        /* ── Terminal Overlay ── */
+        #terminal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center}
+        #terminal-container{width:90%;height:85%;background:#1e1e1e;border-radius:10px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,0.5)}
+        #terminal-container.fullscreen{width:100%;height:100%;border-radius:0}
+        #terminal-header{display:flex;align-items:center;padding:8px 16px;background:#2d2d2d;border-bottom:1px solid #3d3d3d;color:#ccc;font-size:14px;user-select:none}
+        #terminal-header button{background:none;border:none;color:#ccc;font-size:16px;cursor:pointer;padding:4px 8px;border-radius:4px;margin-left:4px;transition:all .2s}
+        #terminal-header button:hover{background:#444;color:#fff}
+        #terminal-body{flex:1;overflow:hidden;position:relative}
+        #terminal-body .xterm{padding:8px;height:100%}
+
+        /* ── SSH Session Buttons (shared teacher/student) ── */
+        .ssh-btn{padding:8px 24px;border:2px solid #52c41a;border-radius:6px;background:#52c41a;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
+        .ssh-btn:hover{background:#73d13d;border-color:#73d13d}
+        .ssh-btn-reconnect{padding:8px 20px;border:2px solid #1890ff;border-radius:6px;background:#1890ff;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
+        .ssh-btn-reconnect:hover{background:#40a9ff;border-color:#40a9ff}
+        .ssh-btn-terminate{padding:8px 16px;border:2px solid #ff4d4f;border-radius:6px;background:#fff2f0;color:#ff4d4f;font-size:13px;cursor:pointer;font-weight:600}
+        .ssh-btn-terminate:hover{background:#ff4d4f;color:#fff}
+
+        /* ── Shared Cluster Card Styles ── */
+        .cluster-item{border:1px solid #f0f0f0;border-radius:8px;padding:14px 16px;margin-bottom:8px}
+        .cluster-header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px}
+        .cluster-name{font-size:15px;font-weight:600}
+        .cluster-action-bar{display:flex;align-items:center;gap:12px;margin-top:12px;padding-top:12px;border-top:1px solid #f0f0f0;flex-wrap:wrap}
+        .cluster-ssh{background:#f6f8fa;border:1px solid #e8eaed;border-radius:6px;padding:10px 14px;margin-top:8px;font-size:13px;line-height:1.8;display:none}
+        .cluster-ssh.show{display:block}
+        .cluster-ssh .ssh-label{color:#666;display:inline-block;min-width:56px}
+        .cluster-ssh code{background:#e8eaed;padding:2px 8px;border-radius:4px;font-family:SFMono-Regular,Consolas,monospace;font-size:13px;color:#d63384}
+        .view-ssh-btn{padding:4px 12px;border:1px solid #1890ff;border-radius:4px;background:#e6f7ff;color:#1890ff;font-size:12px;cursor:pointer;font-weight:500}
+        .view-ssh-btn:hover{background:#1890ff;color:#fff}
+        .cluster-vms{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+        .k8s-badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500;white-space:nowrap}
+
+        /* ── Utility Classes ── */
+        .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+        .form-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+        .card-center{text-align:center;padding:60px}
+        .header-btn{padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:var(--text-secondary);font-size:12px;cursor:pointer}
+        .online-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--success);margin-right:2px}
+        .header-btn:hover{border-color:var(--primary);color:var(--primary)}
+        .text-primary{color:var(--primary)}
+        .text-success{color:var(--success)}
+        .text-danger{color:var(--danger)}
+        .text-warning{color:var(--warning)}
+        .text-muted{color:var(--text-muted)}
+        .text-secondary{color:var(--text-secondary)}
+        .task-panel{display:none;position:absolute;right:0;top:100%;width:400px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg);z-index:1001;max-height:480px;overflow-y:auto;margin-top:4px}
+        .task-panel-header{padding:12px 16px;font-size:14px;font-weight:600;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
         @keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
     </style>
 </head>
@@ -195,26 +256,26 @@
     <div class="main">
         <div class="header">
             <h2>{% block page_heading %}仪表盘{% endblock %}</h2>
-            <div style="display:flex;align-items:center;gap:12px">
+            <div class="toolbar">
                 {% if current_user.role in ('admin', 'teacher') %}
                 <div id="task-list-widget" style="position:relative">
-                    <button id="task-list-btn" onclick="toggleTaskPanel()" style="padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">
-                        任务列表 <span id="task-badge" style="display:none;background:#ff4d4f;color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px">0</span>
+                    <button id="task-list-btn" class="header-btn" onclick="toggleTaskPanel()">
+                        任务列表 <span id="task-badge" style="display:none;background:var(--danger);color:#fff;border-radius:10px;padding:1px 6px;font-size:11px;margin-left:4px">0</span>
                     </button>
-                    <div id="task-panel" style="display:none;position:absolute;right:0;top:100%;width:400px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg);z-index:1001;max-height:480px;overflow-y:auto;margin-top:4px">
-                        <div style="padding:12px 16px;font-size:14px;font-weight:600;border-bottom:1px solid #f0f0f0;display:flex;justify-content:space-between;align-items:center">
+                    <div id="task-panel" class="task-panel">
+                        <div class="task-panel-header">
                             <span>📋 任务队列</span>
-                            <button onclick="toggleTaskPanel()" style="border:none;background:none;cursor:pointer;font-size:18px;color:#999;padding:0;line-height:1">&times;</button>
+                            <button onclick="toggleTaskPanel()" style="border:none;background:none;cursor:pointer;font-size:18px;color:var(--text-muted);padding:0;line-height:1">&times;</button>
                         </div>
                         <div id="task-list-queues" style="padding:4px 0"></div>
                     </div>
                 </div>
                 {% endif %}
-                <div class="user-info" style="display:flex;align-items:center;gap:12px">
-                    <span id="self-online-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#52c41a;margin-right:2px"></span>
+                <div class="user-info toolbar">
+                    <span id="self-online-dot" class="online-dot"></span>
                     <span>{{ current_user.username if current_user.role == 'admin' else (current_user.name or current_user.username) }}@k8s-lab ({{ {'admin':'管理员','teacher':'教师','student':'学生'}.get(current_user.role, current_user.role) }})</span>
-                    <button onclick="showChangePasswordModal()" style="padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">修改密码</button>
-                    <button onclick="logout()" style="padding:3px 10px;border:1px solid #d9d9d9;border-radius:4px;background:#fff;color:#666;font-size:12px;cursor:pointer">退出</button>
+                    <button class="header-btn" onclick="showChangePasswordModal()">修改密码</button>
+                    <button class="header-btn" onclick="logout()">退出</button>
                 </div>
             </div>
         </div>
@@ -224,9 +285,9 @@
     </div>
     <div id="global-toast-container" style="position:fixed;top:70px;right:20px;z-index:2000;display:flex;flex-direction:column;gap:8px"></div>
     <div class="modal-overlay" id="shared-modal">
-        <div class="modal-card" style="width:420px;text-align:center">
-            <p id="shared-modal-message" style="font-size:15px;margin:16px 0 24px;color:#333;line-height:1.6"></p>
-            <div id="shared-modal-buttons" style="display:flex;gap:10px;justify-content:center">
+        <div class="modal-card text-center">
+            <p id="shared-modal-message" style="font-size:15px;margin:16px 0 24px;color:var(--text);line-height:1.6"></p>
+            <div class="toolbar" style="justify-content:center">
                 <button class="btn btn-primary" id="shared-modal-ok-btn">确定</button>
                 <button class="btn" id="shared-modal-cancel-btn" style="display:none">取消</button>
             </div>
@@ -239,8 +300,8 @@
             <div class="form-group"><label>原密码</label><input id="cp-old" class="form-control" type="password"></div>
             <div class="form-group"><label>新密码</label><input id="cp-new" class="form-control" type="password"></div>
             <div class="form-group"><label>确认新密码</label><input id="cp-confirm" class="form-control" type="password"></div>
-            <div id="cp-error" style="color:#ff4d4f;font-size:13px;margin-top:8px;display:none"></div>
-            <div style="margin-top:14px;display:flex;gap:8px">
+            <div id="cp-error" class="text-danger" style="font-size:13px;margin-top:8px;display:none"></div>
+            <div class="toolbar" style="margin-top:14px">
                 <button class="btn btn-primary" id="cp-btn" onclick="changePassword()">确认修改</button>
                 <button class="btn" onclick="closeChangePasswordModal()">取消</button>
             </div>
