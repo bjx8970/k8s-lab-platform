@@ -1149,10 +1149,10 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
         master_ips[m] for m in masters
     ))
     _tmpl = _tmpl.replace("{{master_server}}", "\n".join(
-        f"{master_ips[m]} k8s_nodename='master-{i:02d}'" for i, m in enumerate(masters, 1)
+        f"{master_ips[m]} k8s_nodename='{m}'" for m in masters
     ))
     _tmpl = _tmpl.replace("{{node_server}}", "\n".join(
-        f"{node_ips[n]} k8s_nodename='worker-{i:02d}'" for i, n in enumerate(nodes, 1)
+        f"{node_ips[n]} k8s_nodename='{n}'" for n in nodes
     ))
 
     _log("写入 hosts 文件")
