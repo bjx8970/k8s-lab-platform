@@ -150,15 +150,16 @@ var teacherSessions = {};
 
 async function loadTeacherSessions(clusters) {
     teacherSessions = {};
-    for (var name in clusters) {
-        try {
-            var r = await fetch('/api/webssh/cluster/' + encodeURIComponent(name));
-            var d = await r.json();
-            if (d.has_session) {
-                teacherSessions[name] = d.session;
+    try {
+        var r = await fetch('/api/webssh/my-sessions');
+        var d = await r.json();
+        for (var i = 0; i < (d.sessions || []).length; i++) {
+            var s = d.sessions[i];
+            if (s.cluster_name && s.status !== 'terminated') {
+                teacherSessions[s.cluster_name] = s;
             }
-        } catch(e) {}
-    }
+        }
+    } catch(e) {}
 }
 
 async function loadStudentSessions() {

@@ -1807,8 +1807,6 @@ def k8s_cluster_vm_action_all(name):
     cluster = get_cluster(name)
     if not cluster:
         return jsonify({"error": "集群不存在"}), 404
-    if current_user.role == "student":
-        return jsonify({"error": "无权操作"}), 403
     data = request.get_json() or {}
     action = data.get("action", "")
     if action not in ("start", "stop"):
@@ -2348,6 +2346,12 @@ def api_webssh_sessions():
         sessions = ssh_manager.list_sessions(filter_role="student")
     else:
         sessions = ssh_manager.list_sessions(filter_user_id=current_user.id)
+    return jsonify({"sessions": sessions})
+
+@app.route("/api/webssh/my-sessions", methods=["GET"])
+@login_required
+def api_webssh_my_sessions():
+    sessions = ssh_manager.list_sessions(filter_user_id=current_user.id)
     return jsonify({"sessions": sessions})
 
 @app.route("/api/webssh/cluster/<name>", methods=["GET"])
