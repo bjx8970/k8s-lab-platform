@@ -206,6 +206,7 @@ class SSHSession:
         self.takeover_active = False
         self.takeover_by = None
         self.takeover_sid = None
+        self.clear_reconnect_request()
 
     def request_reconnect(self, user_info):
         self.reconnect_requestor = user_info
@@ -266,6 +267,7 @@ class SSHManager:
         self._socketio = socketio
         self._on_session_terminated = None
         self._on_owner_disconnect = None
+        self._on_takeover_released = None
 
         # Configurable limits
         self.global_max = 64
@@ -287,6 +289,9 @@ class SSHManager:
 
     def set_on_owner_disconnect(self, callback):
         self._on_owner_disconnect = callback
+
+    def set_on_takeover_released(self, callback):
+        self._on_takeover_released = callback
 
     def init_app(self, socketio):
         self._socketio = socketio
@@ -405,6 +410,8 @@ class SSHManager:
                         self._on_owner_disconnect(session.cluster_name, session.owner["user_id"])
                 elif session.takeover_sid == sid:
                     session.unbind_takeover(sid)
+                    if self._on_takeover_released:
+                        self._on_takeover_released(session)
                 else:
                     session.unbind_viewer(sid)
 

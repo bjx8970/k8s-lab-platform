@@ -2266,6 +2266,15 @@ def _emit_session_update(cluster_name, user_id, action, extra=None):
     socketio.emit("session_update", data, to="teacher", namespace="/state")
 
 
+def _on_takeover_released(session):
+    if session.owner_sid:
+        socketio.emit("takeover_released", {}, to=session.owner_sid, namespace="/webssh")
+    _emit_session_update(session.cluster_name, session.owner["user_id"], "takeover_released")
+
+
+ssh_manager.set_on_takeover_released(_on_takeover_released)
+
+
 # ── WebSSH REST API ──
 
 @app.route("/admin/webssh")
