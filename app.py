@@ -36,6 +36,8 @@ _online_users = {}  # user_id → {"sids": set(), "online_since": timestamp}
 def _add_online_user(user_id, sid):
     if user_id not in _online_users:
         _online_users[user_id] = {"sids": set(), "online_since": time.time()}
+        socketio.emit("user_online", {"user_id": user_id}, to="admin", namespace="/state")
+        socketio.emit("user_online", {"user_id": user_id}, to="teacher", namespace="/state")
     _online_users[user_id]["sids"].add(sid)
 
 def _remove_online_user(sid):
@@ -43,6 +45,8 @@ def _remove_online_user(sid):
         info["sids"].discard(sid)
         if not info["sids"]:
             del _online_users[uid]
+            socketio.emit("user_offline", {"user_id": uid}, to="admin", namespace="/state")
+            socketio.emit("user_offline", {"user_id": uid}, to="teacher", namespace="/state")
 
 def _update_online_user(sid):
     for uid, info in _online_users.items():
@@ -2285,7 +2289,7 @@ def state_disconnect():
         _remove_online_user(request.sid)
 
 @socketio.on("heartbeat", namespace="/state")
-def state_heartbeat():
+def state_heartbeat(*args):
     if current_user.is_authenticated:
         _update_online_user(request.sid)
 

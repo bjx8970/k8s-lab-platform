@@ -82,7 +82,7 @@ async function loadUsers() {
         '<td>' + esc(u.name || '') + '</td>' +
         '<td>' + roleLabel + '</td>' +
         '<td>' + (u.is_active ? '<span style="color:#52c41a">正常</span>' : '<span style="color:#ff4d4f">禁用</span>') + '</td>' +
-        '<td>' + (u.online ? '<span style="color:#52c41a">● 在线</span>' : '<span style="color:#ccc">○ 离线</span>') + '</td>' +
+        '<td class="os-' + u.id + '">' + (u.online ? '<span style="color:#52c41a">● 在线</span>' : '<span style="color:#ccc">○ 离线</span>') + '</td>' +
         '<td style="color:#999;font-size:12px">' + (u.created_at || '').slice(0, 10) + '</td>' +
         '<td>' +
           '<button class="btn btn-sm" onclick="openEdit(' + u.id + ')">编辑</button> ' +
@@ -180,6 +180,18 @@ async function importUsers(input) {
   input.value = '';
 }
 
-document.addEventListener('DOMContentLoaded', loadUsers);
+document.addEventListener('DOMContentLoaded', function() {
+    loadUsers();
+    if (typeof stateSocket !== 'undefined' && stateSocket) {
+        stateSocket.on('user_online', function(data) {
+            var cell = document.querySelector('.os-' + data.user_id);
+            if (cell) cell.innerHTML = '<span style="color:#52c41a">● 在线</span>';
+        });
+        stateSocket.on('user_offline', function(data) {
+            var cell = document.querySelector('.os-' + data.user_id);
+            if (cell) cell.innerHTML = '<span style="color:#ccc">○ 离线</span>';
+        });
+    }
+});
 </script>
 {% endblock %}
