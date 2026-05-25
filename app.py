@@ -2014,6 +2014,7 @@ def webssh_session_reconnect(data):
         "session_id": session.session_id,
         "cluster": cluster_name,
     })
+    _emit_session_update(cluster_name, current_user.id, "reconnected")
 
 @socketio.on("session_terminate", namespace="/webssh")
 def webssh_session_terminate(data):
