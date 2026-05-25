@@ -6,5 +6,6 @@
 .server-card .meta span{margin-right:16px}
 .server-card .actions{display:flex;gap:6px;flex-shrink:0}
 .server-card .actions .btn{padding:4px 12px;font-size:12px}
+.pve-node-row{padding:6px 0;border-bottom:1px solid #f0f0f0}
 .conn-ok{color:#52c41a;font-size:12px;margin-top:4px}
 .conn-err{color:#ff4d4f;font-size:12px;margin-top:4px}

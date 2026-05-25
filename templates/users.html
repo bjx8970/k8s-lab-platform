@@ -73,7 +73,7 @@ async function loadUsers() {
   try {
     let users = await apiReq('GET', '?role=' + _roleFilter);
     if (IS_TEACHER) users = users.filter(u => u.created_by === CURRENT_USER_ID);
-    if (!users.length) { el.innerHTML = '<p style="color:#999;margin-top:12px">暂无用户</p>'; return; }
+    if (!users.length) { el.innerHTML = '<p class="text-gray mt-3">暂无用户</p>'; return; }
     let html = '<table><tr><th>用户名</th><th>姓名</th><th>角色</th><th>状态</th><th>在线</th><th>创建时间</th><th>操作</th></tr>';
     users.forEach(u => {
       const roleLabel = {'admin':'管理员','teacher':'教师','student':'学生'}[u.role] || u.role;
@@ -81,9 +81,9 @@ async function loadUsers() {
         '<td><strong>' + esc(u.username) + '</strong></td>' +
         '<td>' + esc(u.name || '') + '</td>' +
         '<td>' + roleLabel + '</td>' +
-        '<td>' + (u.is_active ? '<span style="color:#52c41a">正常</span>' : '<span style="color:#ff4d4f">禁用</span>') + '</td>' +
-        '<td class="os-' + u.id + '">' + (u.online ? '<span style="color:#52c41a">● 在线</span>' : '<span style="color:#ccc">○ 离线</span>') + '</td>' +
-        '<td style="color:#999;font-size:12px">' + (u.created_at || '').slice(0, 10) + '</td>' +
+        '<td>' + (u.is_active ? '<span class="text-success">正常</span>' : '<span class="text-danger">禁用</span>') + '</td>' +
+        '<td class="os-' + u.id + '">' + (u.online ? '<span class="text-success">● 在线</span>' : '<span class="text-gray">○ 离线</span>') + '</td>' +
+        '<td class="text-gray fs-12">' + (u.created_at || '').slice(0, 10) + '</td>' +
         '<td>' +
           '<button class="btn btn-sm" onclick="openEdit(' + u.id + ')">编辑</button> ' +
           '<button class="btn btn-sm btn-danger" onclick="deleteUser(' + u.id + ')">删除</button>' +
@@ -91,7 +91,7 @@ async function loadUsers() {
     });
     el.innerHTML = html;
   } catch (e) {
-    el.innerHTML = '<p style="color:#ff4d4f">加载失败: ' + e.message + '</p>';
+    el.innerHTML = '<p class="text-danger">加载失败: ' + e.message + '</p>';
   }
 }
 
@@ -185,11 +185,11 @@ document.addEventListener('DOMContentLoaded', function() {
     if (typeof stateSocket !== 'undefined' && stateSocket) {
         stateSocket.on('user_online', function(data) {
             var cell = document.querySelector('.os-' + data.user_id);
-            if (cell) cell.innerHTML = '<span style="color:#52c41a">● 在线</span>';
+            if (cell) cell.innerHTML = '<span class="text-success">● 在线</span>';
         });
         stateSocket.on('user_offline', function(data) {
             var cell = document.querySelector('.os-' + data.user_id);
-            if (cell) cell.innerHTML = '<span style="color:#ccc">○ 离线</span>';
+            if (cell) cell.innerHTML = '<span class="text-gray">○ 离线</span>';
         });
     }
 });

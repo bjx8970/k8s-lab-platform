@@ -43,25 +43,25 @@ function getConfig() {
 async function saveConfig() {
     const el = $('conn-result');
     el.innerHTML = '保存中...';
-    el.style.color = '#666';
+    el.className = 'text-medium';
     try {
         const cfg = getConfig();
         if (!cfg.host || !cfg.username || !cfg.password) throw new Error('host、username、password 均为必填项');
         await api('POST', '/config', cfg);
         el.innerHTML = '✅ 配置已保存';
-        el.style.color = '#52c41a';
-    } catch (e) { el.innerHTML = '❌ ' + e.message; el.style.color = '#ff4d4f'; }
+        el.className = 'text-success';
+    } catch (e) { el.innerHTML = '❌ ' + e.message; el.className = 'text-danger'; }
 }
 
 async function testConnection() {
     const el = $('conn-result');
     el.innerHTML = '测试中...';
-    el.style.color = '#666';
+    el.className = 'text-medium';
     try {
         const data = await api('POST', '/test', getConfig());
         el.innerHTML = '✅ ' + data.message;
-        el.style.color = '#52c41a';
-    } catch (e) { el.innerHTML = '❌ ' + e.message; el.style.color = '#ff4d4f'; }
+        el.className = 'text-success';
+    } catch (e) { el.innerHTML = '❌ ' + e.message; el.className = 'text-danger'; }
 }
 </script>
 {% endblock %}

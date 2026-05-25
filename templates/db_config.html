@@ -93,10 +93,10 @@ async function saveConfig() {
         if (!r.ok) throw new Error(data.error || '保存失败');
         $('form-error').style.display = 'none';
         var el = $('save-result');
-        el.style.color = '#52c41a';
+        el.className = 'text-success';
         el.textContent = data.message;
-        el.style.display = 'block';
-        setTimeout(function(){ el.style.display = 'none'; }, 3000);
+        el.classList.remove('d-none');
+        setTimeout(function(){ el.classList.add('d-none'); }, 3000);
         load();
     } catch(e) {
         $('form-error').textContent = e.message;
@@ -106,7 +106,7 @@ async function saveConfig() {
 
 async function testConnection() {
     var el = $('test-result');
-    el.style.color = '#666';
+    el.className = 'text-medium';
     el.textContent = '测试中...';
     try {
         var r = await fetch(API + '/test', {
@@ -122,10 +122,10 @@ async function testConnection() {
         });
         var data = await r.json();
         if (!r.ok) throw new Error(data.error || '失败');
-        el.style.color = '#52c41a';
+        el.className = 'text-success';
         el.textContent = '连接成功，版本: ' + data.version;
     } catch(e) {
-        el.style.color = '#ff4d4f';
+        el.className = 'text-danger';
         el.textContent = '' + e.message;
     }
 }

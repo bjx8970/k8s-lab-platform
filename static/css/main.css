@@ -174,6 +174,7 @@ tr:hover td { background: #f8f9fb; }
 
 /* ── Terminal Overlay ── */
 #terminal-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center}
+#terminal-overlay.d-none{display:none}
 #terminal-container{width:90%;height:85%;background:#1e1e1e;border-radius:10px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,0.5)}
 #terminal-container.fullscreen{width:100%;height:100%;border-radius:0}
 #terminal-header{display:flex;align-items:center;padding:8px 16px;background:#2d2d2d;border-bottom:1px solid #3d3d3d;color:#ccc;font-size:14px;user-select:none}
@@ -181,6 +182,14 @@ tr:hover td { background: #f8f9fb; }
 #terminal-header button:hover{background:#444;color:#fff}
 #terminal-body{flex:1;overflow:hidden;position:relative}
 #terminal-body .xterm{padding:8px;height:100%}
+#terminal-status{margin-left:12px;font-size:12px;color:#aaa}
+#takeover-indicator{margin-left:12px;font-size:12px;color:#faad14}
+
+.terminal-status-connecting{color:#ffd591}
+.terminal-status-connected{color:#52c41a}
+.terminal-status-error{color:#ff4d4f}
+.terminal-status-viewing{color:#13c2c2}
+.terminal-status-reconnecting{color:#faad14}
 
 /* ── SSH Session Buttons (shared teacher/student) ── */
 .ssh-btn{padding:8px 24px;border:2px solid #52c41a;border-radius:6px;background:#52c41a;color:#fff;font-size:14px;cursor:pointer;font-weight:600}
@@ -206,6 +215,20 @@ tr:hover td { background: #f8f9fb; }
 .cluster-vms{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .k8s-badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:500;white-space:nowrap}
 
+/* ── Task Row (JS template) ── */
+.task-row{display:flex;align-items:center;gap:8px;padding:8px 16px;cursor:pointer;border-bottom:1px solid #f5f5f5;transition:background .15s}
+.task-row:hover{background:#f8f9fb}
+.task-icon{font-size:14px;flex-shrink:0}
+.task-body{flex:1;min-width:0}
+.task-title{font-size:13px;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.task-desc{font-size:11px;color:#999;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.task-progress-wrapper{margin-top:4px;height:4px;background:#f0f0f0;border-radius:2px;overflow:hidden}
+.task-progress-bar{height:100%;background:#1890ff;border-radius:2px;transition:width .5s}
+.task-cancel-btn{border:none;background:none;color:#ff4d4f;cursor:pointer;font-size:12px;padding:2px 6px;white-space:nowrap}
+.task-section-header{padding:8px 16px 4px;font-size:12px;font-weight:600;color:#666}
+.task-section-header-bordered{padding:8px 16px 4px;font-size:12px;font-weight:600;color:#666;border-top:1px solid #f0f0f0}
+.task-section-empty{padding:4px 16px 8px;font-size:12px;color:#ccc}
+
 /* ── Utility Classes ── */
 .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .form-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
@@ -222,3 +245,35 @@ tr:hover td { background: #f8f9fb; }
 .task-panel{display:none;position:absolute;right:0;top:100%;width:400px;background:#fff;border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow-lg);z-index:1001;max-height:480px;overflow-y:auto;margin-top:4px}
 .task-panel-header{padding:12px 16px;font-size:14px;font-weight:600;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
 @keyframes fadeIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+
+/* ── K8s Status Badges (shared across pages) ── */
+.k8s-pending{background:#fff7e6;border:1px solid #ffd591;color:#d46b08}
+.k8s-installing{background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff}
+.k8s-installed{background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a}
+.k8s-failed{background:#fff2f0;border:1px solid #ffccc7;color:#ff4d4f}
+
+/* ── Spacing Utilities (4px base) ── */
+.mt-1{margin-top:4px}.mt-2{margin-top:8px}.mt-3{margin-top:12px}.mt-4{margin-top:16px}.mt-5{margin-top:20px}.mt-6{margin-top:24px}
+.mb-1{margin-bottom:4px}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mb-4{margin-bottom:16px}.mb-5{margin-bottom:20px}.mb-6{margin-bottom:24px}
+.ml-1{margin-left:4px}.ml-2{margin-left:8px}.ml-3{margin-left:12px}.ml-a{margin-left:auto}
+.mr-2{margin-right:8px}.mr-3{margin-right:12px}
+.pl-8{padding-left:32px}
+
+/* ── Flex Utilities ── */
+.flex-1{flex:1}.flex-shrink-0{flex-shrink:0}
+
+/* ── Font Size Utilities ── */
+.fs-12{font-size:12px}.fs-13{font-size:13px}.fs-14{font-size:14px}.fs-15{font-size:15px}.fs-16{font-size:16px}
+.fw-400{font-weight:400}.fw-500{font-weight:500}
+
+/* ── Text Color Utilities ── */
+.text-dark{color:#333}.text-medium{color:#666}.text-gray{color:#999}
+
+/* ── Text Alignment ── */
+.text-center{text-align:center}.text-left{text-align:left}.text-nowrap{white-space:nowrap}
+
+/* ── Display Utilities ── */
+.d-none{display:none}.d-flex{display:flex}.d-block{display:block}.d-inline-block{display:inline-block}
+
+/* ── Cursor ── */
+.cursor-pointer{cursor:pointer}

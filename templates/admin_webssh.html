@@ -5,11 +5,11 @@
 {% endblock %}
 {% block content %}
 
-<div style="display:flex;gap:16px;margin-bottom:20px">
-    <div class="card" style="flex:1">
-        <h3 style="margin-bottom:16px;font-size:15px">&#9881; 连接限制设置</h3>
+<div class="d-flex gap-4 mb-5">
+    <div class="card flex-1">
+        <h3 class="mb-4 fs-15">&#9881; 连接限制设置</h3>
         <div id="config-form">
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="form-grid-2">
                 <div class="form-group">
                     <label>全局最大连接数</label>
                     <input type="number" id="cfg-global_max" class="form-control" min="1" max="200">
@@ -31,14 +31,14 @@
                     <input type="number" id="cfg-retention_time" class="form-control" min="60" step="60">
                 </div>
             </div>
-            <div style="margin-top:12px">
+            <div class="mt-3">
                 <button onclick="saveConfig()" class="btn btn-primary">保存配置</button>
             </div>
         </div>
     </div>
-    <div class="card" style="flex:1">
-        <h3 style="margin-bottom:16px;font-size:15px">&#128200; 当前状态</h3>
-        <div id="stats-display" style="font-size:14px;line-height:2">
+    <div class="card flex-1">
+        <h3 class="mb-4 fs-15">&#128200; 当前状态</h3>
+        <div id="stats-display" class="fs-14" style="line-height:2">
             <div>活跃连接: <strong id="stat-active">0</strong></div>
             <div>断开保留: <strong id="stat-disconnected">0</strong></div>
             <div>被接管: <strong id="stat-takenover">0</strong></div>
@@ -47,8 +47,8 @@
 </div>
 
 <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-        <h3 style="margin:0;font-size:15px">&#128187; 会话列表</h3>
+    <div class="d-flex" style="justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h3 class="fs-15" style="margin:0">&#128187; 会话列表</h3>
         <button onclick="refreshSessions()" class="btn" id="refresh-btn">刷新</button>
     </div>
 
@@ -67,7 +67,7 @@
             </tr>
         </thead>
         <tbody id="session-table">
-            <tr><td colspan="9" style="text-align:center;color:#999;padding:40px 0">加载中...</td></tr>
+            <tr><td colspan="9" class="text-center text-gray" style="padding:40px 0">加载中...</td></tr>
         </tbody>
     </table>
 </div>
@@ -126,7 +126,7 @@ async function refreshSessions() {
         renderSessions(sessions);
         updateStats(sessions);
     } catch(e) {
-        document.getElementById('session-table').innerHTML = '<tr><td colspan="9" style="text-align:center;color:#ff4d4f;padding:20px">' + esc(e.message) + '</td></tr>';
+        document.getElementById('session-table').innerHTML = '<tr><td colspan="9" class="text-center text-danger" style="padding:20px">' + esc(e.message) + '</td></tr>';
     } finally {
         btn.disabled = false;
         btn.textContent = '刷新';
@@ -170,7 +170,7 @@ function updateStats(sessions) {
 
 function renderSessions(sessions) {
     if (sessions.length === 0) {
-        document.getElementById('session-table').innerHTML = '<tr><td colspan="9" style="text-align:center;color:#999;padding:40px 0">暂无会话</td></tr>';
+        document.getElementById('session-table').innerHTML = '<tr><td colspan="9" class="text-center text-gray" style="padding:40px 0">暂无会话</td></tr>';
         return;
     }
 
@@ -195,8 +195,8 @@ function renderSessions(sessions) {
             '<td><span class="' + statusClass + '">' + statusLabel + '</span></td>' +
             '<td>' + takeoverHtml + '</td>' +
             '<td>' + viewerHtml + '</td>' +
-            '<td style="font-size:12px">' + formatTime(s.created_at) + '</td>' +
-            '<td style="font-size:12px">' + formatDuration(idleTime) + ' 前</td>' +
+            '<td class="fs-12">' + formatTime(s.created_at) + '</td>' +
+            '<td class="fs-12">' + formatDuration(idleTime) + ' 前</td>' +
             '<td>' + actionBtns + '</td>' +
             '</tr>';
     }

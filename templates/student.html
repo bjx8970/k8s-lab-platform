@@ -7,14 +7,14 @@
 
 <div id="student-clusters-section"></div>
 
-<div id="terminal-overlay" style="display:none">
+<div id="terminal-overlay" class="d-none">
     <div id="terminal-container">
         <div id="terminal-header">
             <span id="terminal-title">Web终端</span>
-            <span id="terminal-status" style="margin-left:12px;font-size:12px;color:#aaa"></span>
-            <span id="takeover-indicator" style="margin-left:12px;font-size:12px;color:#faad14;display:none">教师正在操作</span>
-            <button id="request-reconnect-btn" onclick="requestReconnectFromTerminal()" style="display:none;padding:4px 12px;border:1px solid #faad14;border-radius:4px;background:#fff7e6;color:#d46b08;font-size:12px;cursor:pointer;font-weight:500;margin-left:8px">请求恢复</button>
-            <span id="student-reconnect-countdown" style="display:none;margin-left:8px;font-size:12px;color:#faad14"></span>
+            <span id="terminal-status"></span>
+            <span id="takeover-indicator" class="d-none">教师正在操作</span>
+            <button id="request-reconnect-btn" class="ssh-btn-request d-none" onclick="requestReconnectFromTerminal()">请求恢复</button>
+            <span id="student-reconnect-countdown" class="d-none"></span>
             <span style="flex:1"></span>
             <button id="terminal-fullscreen" onclick="toggleTerminalFullscreen()" title="全屏">&#9974;</button>
             <button id="terminal-close" onclick="closeTerminal()" title="断开">&#10005;</button>
@@ -42,17 +42,18 @@ var isTakenOver = false;
 var countdownTimer = null;
 var studentCountdownTimer = null;
 var clusterSessionStates = {};
-var _badgeStyles = {
-    'pending': 'background:#fff7e6;border:1px solid #ffd591;color:#d46b08',
-    'installing': 'background:#e6f7ff;border:1px solid #91d5ff;color:#1890ff',
-    'installed': 'background:#f6ffed;border:1px solid #b7eb8f;color:#52c41a',
-    'failed': 'background:#fff2f0;border:1px solid #ffccc7;color:#ff4d4f',
-};
 var _labelMap = {'pending':'未部署','installing':'部署中','installed':'已部署','failed':'部署失败'};
 
 function esc(s) {
     if (!s) return '';
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function setTerminalStatus(cls) {
+  var el = document.getElementById('terminal-status');
+  if (el._ls) el.classList.remove(el._ls);
+  if (cls) el.classList.add(cls);
+  el._ls = cls;
 }
 
 async function vmAction(node, vmid, action) {
@@ -137,7 +138,7 @@ async function loadMyClusters() {
         renderCards(clusters);
         refreshVmStatuses(clusters);
     } catch (e) {
-        document.getElementById('student-clusters-section').innerHTML = '<div class="card"><p style="color:#ff4d4f">加载失败: ' + esc(e.message) + '</p></div>';
+        document.getElementById('student-clusters-section').innerHTML = '<div class="card"><p class="text-danger">加载失败: ' + esc(e.message) + '</p></div>';
     }
 }
 
@@ -158,7 +159,7 @@ async function loadSessionStates(clusters) {
 function renderCards(clusters) {
     var keys = Object.keys(clusters);
     if (keys.length === 0) {
-        document.getElementById('student-clusters-section').innerHTML = '<div class="card"><p style="text-align:center;color:#999;padding:40px 0">暂无集群</p></div>';
+        document.getElementById('student-clusters-section').innerHTML = '<div class="card"><p class="text-center text-gray" style="padding:40px 0">暂无集群</p></div>';
         return;
     }
 
@@ -176,8 +177,8 @@ function renderCards(clusters) {
     for (var ci = 0; ci < classOrder.length; ci++) {
         var clsName = classOrder[ci];
         var items = grouped[clsName];
-        html += '<div class="card" style="margin-bottom:16px">' +
-            '<h3 style="margin-bottom:12px;font-size:16px">&#128218; ' + esc(clsName) + ' (' + items.length + ' 个集群)</h3>';
+        html += '<div class="card mb-4">' +
+            '<h3 class="mb-3 fs-16">&#128218; ' + esc(clsName) + ' (' + items.length + ' 个集群)</h3>';
 
         for (var ii = 0; ii < items.length; ii++) {
             var c = items[ii].data;
@@ -210,8 +211,7 @@ function renderCards(clusters) {
 
             var k8s = c.k8s_status || 'pending';
             var k8sLabel = _labelMap[k8s] || k8s;
-            var badgeStyle = _badgeStyles[k8s] || _badgeStyles['pending'];
-            var k8sBadge = '<span class="k8s-badge" style="' + badgeStyle + '">' + k8sLabel + '</span>';
+            var k8sBadge = '<span class="k8s-badge k8s-' + k8s + '">' + k8sLabel + '</span>';
 
             html += '<div class="cluster-item">' +
                 '<div class="cluster-header cluster-header--space-between">' +
@@ -259,11 +259,11 @@ function toggleSshInfo(clusterName) {
 async function createSession(clusterName) {
     initTerminal();
     currentClusterName = clusterName;
-    document.getElementById('terminal-overlay').style.display = 'flex';
+    document.getElementById('terminal-overlay').classList.remove('d-none');
     document.getElementById('terminal-title').textContent = 'Web终端 - ' + clusterName;
     document.getElementById('terminal-status').textContent = '连接中...';
-    document.getElementById('terminal-status').style.color = '#ffd591';
-    document.getElementById('takeover-indicator').style.display = 'none';
+    setTerminalStatus('terminal-status-connecting');
+    document.getElementById('takeover-indicator').classList.add('d-none');
     isTakenOver = false;
     setTimeout(function() { fitAddon.fit(); }, 100);
 
@@ -277,11 +277,11 @@ async function createSession(clusterName) {
 async function reconnectSession(clusterName) {
     initTerminal();
     currentClusterName = clusterName;
-    document.getElementById('terminal-overlay').style.display = 'flex';
+    document.getElementById('terminal-overlay').classList.remove('d-none');
     document.getElementById('terminal-title').textContent = 'Web终端 - ' + clusterName;
     document.getElementById('terminal-status').textContent = '重新连接中...';
-    document.getElementById('terminal-status').style.color = '#ffd591';
-    document.getElementById('takeover-indicator').style.display = 'none';
+    setTerminalStatus('terminal-status-connecting');
+    document.getElementById('takeover-indicator').classList.add('d-none');
     isTakenOver = false;
     setTimeout(function() { fitAddon.fit(); }, 100);
 
@@ -325,10 +325,10 @@ function showStudentReconnectCountdown() {
     var countdownEl = document.getElementById('student-reconnect-countdown');
     var btn = document.getElementById('request-reconnect-btn');
     if (!countdownEl) return;
-    if (btn) btn.style.display = 'none';
+    if (btn) btn.classList.add('d-none');
     var seconds = 10;
     countdownEl.textContent = '正在请求恢复 (' + seconds + '秒)';
-    countdownEl.style.display = '';
+    countdownEl.classList.remove('d-none');
     if (studentCountdownTimer) clearInterval(studentCountdownTimer);
     studentCountdownTimer = setInterval(function() {
         seconds--;
@@ -346,7 +346,7 @@ function showStudentReconnectCountdown() {
 
 function hideStudentReconnectCountdown() {
     var countdownEl = document.getElementById('student-reconnect-countdown');
-    if (countdownEl) countdownEl.style.display = 'none';
+    if (countdownEl) countdownEl.classList.add('d-none');
     if (studentCountdownTimer) { clearInterval(studentCountdownTimer); studentCountdownTimer = null; }
 }
 
@@ -378,7 +378,7 @@ function initSocket() {
         currentSessionId = data.session_id;
         terminalConnected = true;
         document.getElementById('terminal-status').textContent = '已连接';
-        document.getElementById('terminal-status').style.color = '#52c41a';
+        setTerminalStatus('terminal-status-connected');
         terminal.writeln('\x1b[32m已连接到 ' + data.cluster + '\x1b[0m\r\n');
         syncTerminalSize();
     });
@@ -387,7 +387,7 @@ function initSocket() {
         currentSessionId = data.session_id;
         terminalConnected = true;
         document.getElementById('terminal-status').textContent = '已连接';
-        document.getElementById('terminal-status').style.color = '#52c41a';
+        setTerminalStatus('terminal-status-connected');
         syncTerminalSize();
     });
 
@@ -402,7 +402,7 @@ function initSocket() {
         if (data.cluster === currentClusterName) {
             terminal.writeln('\r\n\x1b[33m会话已终止\x1b[0m\r\n');
             document.getElementById('terminal-status').textContent = '已终止';
-            document.getElementById('terminal-status').style.color = '#ff4d4f';
+            setTerminalStatus('terminal-status-error');
         }
         loadMyClusters();
     });
@@ -414,29 +414,29 @@ function initSocket() {
     terminalSocket.on('ssh_error', function(data) {
         terminalConnected = false;
         document.getElementById('terminal-status').textContent = '错误';
-        document.getElementById('terminal-status').style.color = '#ff4d4f';
+        setTerminalStatus('terminal-status-error');
         if (terminal) terminal.writeln('\x1b[31m' + (data.message || '连接失败') + '\x1b[0m\r\n');
     });
 
     terminalSocket.on('ssh_disconnected', function(data) {
         terminalConnected = false;
         document.getElementById('terminal-status').textContent = '已断开';
-        document.getElementById('terminal-status').style.color = '#ff4d4f';
+        setTerminalStatus('terminal-status-error');
         if (terminal) terminal.writeln('\r\n\x1b[33m' + (data.reason || '连接已断开') + '\x1b[0m\r\n');
     });
 
     terminalSocket.on('takeover_notify', function(data) {
         isTakenOver = true;
-        document.getElementById('takeover-indicator').style.display = '';
-        document.getElementById('request-reconnect-btn').style.display = '';
+        document.getElementById('takeover-indicator').classList.remove('d-none');
+        document.getElementById('request-reconnect-btn').classList.remove('d-none');
         document.getElementById('takeover-indicator').textContent = '教师 ' + (data.by || '') + ' 正在操作';
         showToast('教师 ' + (data.by || '') + ' 正在操作您的终端', 'warning');
     });
 
     terminalSocket.on('takeover_released', function() {
         isTakenOver = false;
-        document.getElementById('takeover-indicator').style.display = 'none';
-        document.getElementById('request-reconnect-btn').style.display = 'none';
+        document.getElementById('takeover-indicator').classList.add('d-none');
+        document.getElementById('request-reconnect-btn').classList.add('d-none');
         hideStudentReconnectCountdown();
         showToast('教师已释放终端', 'success');
     });
@@ -452,8 +452,8 @@ function initSocket() {
         hideStudentReconnectCountdown();
         if (data.accepted) {
             isTakenOver = false;
-            document.getElementById('takeover-indicator').style.display = 'none';
-            document.getElementById('request-reconnect-btn').style.display = 'none';
+            document.getElementById('takeover-indicator').classList.add('d-none');
+            document.getElementById('request-reconnect-btn').classList.add('d-none');
             showToast('已恢复终端控制', 'success');
             if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
         } else {
@@ -465,12 +465,12 @@ function initSocket() {
     terminalSocket.on('disconnect', function() {
         terminalConnected = false;
         document.getElementById('terminal-status').textContent = '连接断开';
-        document.getElementById('terminal-status').style.color = '#ff4d4f';
+        setTerminalStatus('terminal-status-error');
     });
 
     terminalSocket.on('connect_error', function() {
         document.getElementById('terminal-status').textContent = '连接服务器失败';
-        document.getElementById('terminal-status').style.color = '#ff4d4f';
+        setTerminalStatus('terminal-status-error');
     });
 }
 
@@ -536,7 +536,7 @@ function closeTerminal() {
     if (terminalSocket) {
         terminalSocket.disconnect();
     }
-    document.getElementById('terminal-overlay').style.display = 'none';
+    document.getElementById('terminal-overlay').classList.add('d-none');
     terminalConnected = false;
     currentClusterName = null;
     currentSessionId = null;
@@ -563,7 +563,7 @@ function toggleTerminalFullscreen() {
 document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') {
         var overlay = document.getElementById('terminal-overlay');
-        if (overlay && overlay.style.display !== 'none') {
+        if (overlay && !overlay.classList.contains('d-none')) {
             closeTerminal();
         }
     }
