@@ -6,7 +6,7 @@ from datetime import datetime
 
 from flask_login import UserMixin
 from sqlalchemy import (
-    Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Text, text, UniqueConstraint,
     create_engine, func,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, selectinload
@@ -117,6 +117,10 @@ class PVEServer(Base):
     token_value = Column(String(256), nullable=False)
     node = Column(String(64), default="")
     template_vmid = Column(Integer, default=9000)
+    ow_host = Column(String(128), default="")
+    ow_port = Column(Integer, default=22)
+    ow_username = Column(String(64), default="")
+    ow_password = Column(String(256), default="")
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -205,8 +209,8 @@ def delete_config(key):
 
 def migrate_pve_config():
     with session_scope(commit=True) as session:
-        existing = session.query(PVEServer).first()
-        if existing:
+        result = session.execute(text("SELECT 1 FROM pve_servers LIMIT 1"))
+        if result.fetchone():
             return
         cfg = get_config("pve")
         if not cfg:
@@ -237,6 +241,10 @@ def list_pve_servers():
             "token_value": "****",
             "node": s.node,
             "template_vmid": s.template_vmid,
+            "ow_host": s.ow_host,
+            "ow_port": s.ow_port,
+            "ow_username": s.ow_username,
+            "ow_password": "****",
         } for s in servers]
 
 def get_pve_server(server_id):
@@ -254,6 +262,10 @@ def get_pve_server(server_id):
             "token_value": s.token_value,
             "node": s.node,
             "template_vmid": s.template_vmid,
+            "ow_host": s.ow_host,
+            "ow_port": s.ow_port,
+            "ow_username": s.ow_username,
+            "ow_password": s.ow_password,
         }
 
 
@@ -268,6 +280,10 @@ def create_pve_server(data):
             token_value=data["token_value"],
             node=data.get("node", ""),
             template_vmid=int(data.get("template_vmid", 9000)),
+            ow_host=data.get("ow_host", ""),
+            ow_port=int(data.get("ow_port", 22)),
+            ow_username=data.get("ow_username", ""),
+            ow_password=data.get("ow_password", ""),
         )
         session.add(s)
         return s.id
@@ -287,6 +303,11 @@ def update_pve_server(server_id, data):
             s.token_value = data["token_value"]
         if "node" in data: s.node = data["node"]
         if "template_vmid" in data: s.template_vmid = int(data["template_vmid"])
+        if "ow_host" in data: s.ow_host = data["ow_host"]
+        if "ow_port" in data: s.ow_port = int(data["ow_port"])
+        if "ow_username" in data: s.ow_username = data["ow_username"]
+        if "ow_password" in data and data["ow_password"] and data["ow_password"] != "****":
+            s.ow_password = data["ow_password"]
         return s.id
 
 
@@ -305,7 +326,9 @@ def init_db():
     _ensure_db_indexes()
     _migrate_user_name()
     _migrate_pve_template_vmid()
+    _migrate_pve_ow_fields()
     migrate_pve_config()
+    _migrate_openwrt_to_pve_servers()
 
 
 @contextmanager
@@ -395,6 +418,44 @@ def _migrate_pve_template_vmid():
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE pve_servers ADD COLUMN template_vmid INTEGER DEFAULT 9000"))
             conn.commit()
+    except Exception:
+        pass
+
+
+def _migrate_pve_ow_fields():
+    if engine is None:
+        return
+    cols = [
+        ("ow_host", "VARCHAR(128) DEFAULT ''"),
+        ("ow_port", "INTEGER DEFAULT 22"),
+        ("ow_username", "VARCHAR(64) DEFAULT ''"),
+        ("ow_password", "VARCHAR(256) DEFAULT ''"),
+    ]
+    for col_name, col_type in cols:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(f"ALTER TABLE pve_servers ADD COLUMN {col_name} {col_type}"))
+                conn.commit()
+        except Exception:
+            pass
+
+
+def _migrate_openwrt_to_pve_servers():
+    if engine is None:
+        return
+    ow_cfg = get_config("openwrt")
+    if not ow_cfg:
+        return
+    try:
+        with session_scope(commit=True) as session:
+            servers = session.query(PVEServer).filter(PVEServer.ow_host == "").all()
+            if not servers:
+                return
+            for s in servers:
+                s.ow_host = ow_cfg.get("host", "")
+                s.ow_port = int(ow_cfg.get("port", 22))
+                s.ow_username = ow_cfg.get("username", "")
+                s.ow_password = ow_cfg.get("password", "")
     except Exception:
         pass
 

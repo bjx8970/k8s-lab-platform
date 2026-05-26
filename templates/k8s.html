@@ -96,7 +96,7 @@
 <script>
 const API = '/api/k8s';
 const USER_ROLE = '{{ current_user.role }}';
-const OPENWRT_HOST = '{{ (get_config("openwrt") or {}).get("host", "") }}';
+
 
 let _forceDeleteName = '';
 var vmStatusCache = {};
@@ -155,9 +155,8 @@ async function loadClusters() {
                     '</span>';
                 }
             }
-            let sshLine = 'SSH: <code>' + esc(OPENWRT_HOST) + ':' + (c.ssh_port || '') + '</code> &nbsp;|&nbsp; 用户: <code>k8s</code> &nbsp;|&nbsp; 密码: <code>' + esc(c.password || 'k8s.1234') + '</code>';
             if (isStudent) {
-                sshLine += '&nbsp;|&nbsp; <button class="btn btn-sm" onclick="showSshKey(\'' + esc(name) + '\')">查看 SSH 密钥</button>';
+                headerBtns += '<button class="btn btn-sm" onclick="showSshKey(\'' + esc(name) + '\')">查看 SSH 密钥</button>';
             }
             html += '<div class="cluster-item">' +
                 '<div class="cluster-header">' +
@@ -167,7 +166,6 @@ async function loadClusters() {
                     headerBtns +
                 '</div>' +
                 '<div class="cluster-vms">' + vmsHtml + '</div>' +
-                '<div style="margin-top:8px;font-size:12px;color:#666">' + sshLine + '</div>' +
             '</div>';
         }
         el.innerHTML = html;

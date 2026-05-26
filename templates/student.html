@@ -295,13 +295,7 @@ function renderCards(clusters) {
             var c = items[ii].data;
             var cname = items[ii].name;
             var label = c.group_name || '集群';
-            var host = esc('{{ (get_config("openwrt") or {}).get("host", "") }}') + ':' + (c.ssh_port || '');
-            var pw = esc(c.password || 'k8s.1234');
-            var sshInfo = '<div class="cluster-ssh" id="ssh-info-' + esc(cname) + '">' +
-                '<span class="ssh-label">地址</span> <code>' + host + '</code><br>' +
-                '<span class="ssh-label">用户</span> <code>k8s</code><br>' +
-                '<span class="ssh-label">密码</span> <code>' + pw + '</code>' +
-                '</div>';
+            var sshInfo = '<div class="cluster-ssh" id="ssh-info-' + esc(cname) + '"></div>';
 
             var vmsHtml = '';
             if (c.vms) {

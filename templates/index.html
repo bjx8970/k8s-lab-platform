@@ -230,7 +230,6 @@ function renderClassCards(clusters) {
             var label = c.group_name || '演示集群';
             var k8s = c.k8s_status || 'pending';
             var k8sLabel = _labelMap[k8s] || k8s;
-            var sshHost = esc('{{ (get_config("openwrt") or {}).get("host", "") }}') + ':' + (c.ssh_port || '');
             var vmsHtml = '';
             if (c.vms) {
                 for (var vn in c.vms) {
@@ -260,11 +259,7 @@ function renderClassCards(clusters) {
                     '<button class="btn btn-sm btn-danger" onclick="clusterVmAction(\'' + name + '\',\'stop\')">&#9209; 停止全部</button>' +
                     '<button class="view-ssh-btn" onclick="toggleSshInfo(\'' + name + '\')">&#128274; 查看连接信息</button>' +
                 '</div>' +
-                '<div class="cluster-ssh" id="ssh-info-' + name + '">' +
-                    '<span class="ssh-label">地址</span> <code>' + sshHost + '</code><br>' +
-                    '<span class="ssh-label">用户</span> <code>k8s</code><br>' +
-                    '<span class="ssh-label">密码</span> <code>' + esc(c.password || 'k8s.1234') + '</code>' +
-                '</div>' +
+                    '<div class="cluster-ssh" id="ssh-info-' + name + '"></div>' +
                 (vmsHtml ? '<div class="cluster-vms">' + vmsHtml + '</div>' : '') +
             '</div>';
         }

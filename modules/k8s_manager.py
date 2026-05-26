@@ -128,9 +128,13 @@ def list_tasks(created_by=None):
         return result
 
 
-def _openwrt_lock():
-    cfg = get_config("openwrt")
-    host = cfg.get("host", "_default_") if cfg else "_default_"
+def _openwrt_lock(server_id=None):
+    if server_id:
+        cfg = get_pve_server(server_id)
+        host = cfg.get("ow_host", "_default_") if cfg else "_default_"
+    else:
+        cfg = get_config("openwrt")
+        host = cfg.get("host", "_default_") if cfg else "_default_"
     with _openwrt_locks_lock:
         if host not in _openwrt_locks:
             _openwrt_locks[host] = threading.Lock()
@@ -297,18 +301,32 @@ def _wait_for_ssh(host, port, username, private_key, timeout=120):
     raise K8sError(f"SSH 连接失败 ({host}:{port}): {last_error}")
 
 
-def _openwrt_client():
-    cfg = get_config("openwrt")
-    if not cfg:
-        raise K8sError(f"OpenWrt 未配置，请先在页面中保存配置")
-    missing = [k for k in ("host", "username", "password") if not cfg.get(k)]
+def _openwrt_client(server_id=None):
+    if server_id:
+        cfg = get_pve_server(server_id)
+        if not cfg:
+            raise K8sError(f"PVE 服务器 (ID={server_id}) 不存在")
+        ow_host = cfg.get("ow_host", "")
+        ow_username = cfg.get("ow_username", "")
+        ow_password = cfg.get("ow_password", "")
+    else:
+        cfg = get_config("openwrt")
+        if not cfg:
+            raise K8sError(f"OpenWrt 未配置，请先在页面中保存配置")
+        ow_host = cfg.get("host", "")
+        ow_username = cfg.get("username", "")
+        ow_password = cfg.get("password", "")
+    missing = []
+    if not ow_host: missing.append("host")
+    if not ow_username: missing.append("username")
+    if not ow_password: missing.append("password")
     if missing:
         raise K8sError(f"OpenWrt 配置不完整: {', '.join(missing)}")
     return OpenWrtClient(
-        host=cfg["host"],
-        username=cfg["username"],
-        password=cfg["password"],
-        port=int(cfg.get("port", 22)),
+        host=ow_host,
+        username=ow_username,
+        password=ow_password,
+        port=int(cfg.get("ow_port", 22) if server_id else cfg.get("port", 22)),
     )
 
 
@@ -371,12 +389,13 @@ def delete_cluster(name, status_callback=None, log_callback=None):
     except Exception:
         pass
 
+    _pve_server_id = cluster.get("pve_server_id")
     report(40, "正在清理 OpenWrt 配置...")
-    ow_lock = _openwrt_lock()
+    ow_lock = _openwrt_lock(server_id=_pve_server_id)
     if not ow_lock.acquire(timeout=30):
         raise K8sError("OpenWrt 操作超时，系统繁忙，请稍后重试")
     try:
-        ow = _openwrt_client()
+        ow = _openwrt_client(server_id=_pve_server_id)
         ow.connect()
         try:
             report(45, "删除路由转发")
@@ -566,11 +585,11 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         try: ow.exec("/etc/init.d/network restart", tolerant=True)
         except Exception: pass
 
-    ow_lock = _openwrt_lock()
+    ow_lock = _openwrt_lock(server_id=pve_server_id if pve_server_id else None)
     if not ow_lock.acquire(timeout=30):
         raise K8sError("OpenWrt 操作超时，系统繁忙，请稍后重试")
     try:
-        ow = _openwrt_client()
+        ow = _openwrt_client(server_id=pve_server_id if pve_server_id else None)
 
         try:
             if cancel_event and cancel_event.is_set():
@@ -706,11 +725,11 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
         _log("批量写入 DHCP 静态绑定和端口转发...")
         try:
-            _dhcp_lock = _openwrt_lock()
+            _dhcp_lock = _openwrt_lock(server_id=pve_server_id if pve_server_id else None)
             if not _dhcp_lock.acquire(timeout=30):
                 raise K8sError("OpenWrt 操作超时，系统繁忙，请稍后重试")
             try:
-                _ow_dhcp = _openwrt_client()
+                _ow_dhcp = _openwrt_client(server_id=pve_server_id if pve_server_id else None)
                 _ow_dhcp.connect()
                 try:
                     for _vm_name, _vi in vms.items():
@@ -752,8 +771,12 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         report(96, "正在等待 client VM 就绪并配置 SSH...")
         client_vm = next((item for item in created_vms if item[0].startswith("client-")), None)
         if client_vm:
-            _ow_cfg = get_config("openwrt")
-            _ssh_host = _ow_cfg["host"]
+            if pve_server_id:
+                _ow_host_cfg = get_pve_server(pve_server_id) or {}
+                _ssh_host = _ow_host_cfg.get("ow_host", "")
+            else:
+                _ow_cfg = get_config("openwrt")
+                _ssh_host = _ow_cfg["host"] if _ow_cfg else ""
             _ssh_port = 50000 + num
             _log(f"Client VM {client_vm[0]}: 等待 SSH 就绪 ({_ssh_host}:{_ssh_port}, 120s 超时)")
             try:
@@ -932,8 +955,13 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     _log(f"开始部署 K8s: 集群 {name}")
 
-    _ow_cfg = get_config("openwrt")
-    _ssh_host = _ow_cfg["host"]
+    _pve_sid = cluster.get("pve_server_id")
+    if _pve_sid:
+        _ow_cfg = get_pve_server(_pve_sid) or {}
+        _ssh_host = _ow_cfg.get("ow_host", "")
+    else:
+        _ow_cfg = get_config("openwrt") or {}
+        _ssh_host = _ow_cfg.get("host", "")
     _ssh_port = cluster.get("ssh_port") or 50000 + int(name.split("_")[1])
     _priv_key = cluster.get("ssh_private_key", "")
     _pub_key = cluster.get("ssh_public_key", "")

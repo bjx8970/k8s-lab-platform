@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block page_heading %}PVE连接管理{% endblock %}
+{% block page_heading %}宿主机管理{% endblock %}
 {% block extra_head %}
 <link rel="stylesheet" href="/static/css/pages/pve.css">
 {% endblock %}
@@ -13,7 +13,7 @@
 
 <div class="modal-overlay" id="modal-overlay">
     <div class="modal-card">
-        <h3 id="modal-title" class="mb-4">新增 PVE 服务器</h3>
+        <h3 id="modal-title" class="mb-4">新增宿主机</h3>
         <div class="form-grid-2">
             <div class="form-group">
                 <label>命名 *</label>
@@ -46,6 +46,22 @@
             <div class="form-group">
                 <label>模板 VMID</label>
                 <input id="f-template-vmid" class="form-control" type="number" value="9000">
+            </div>
+            <div class="form-group">
+                <label>OpenWrt IP</label>
+                <input id="f-ow-host" class="form-control" placeholder="192.168.1.1">
+            </div>
+            <div class="form-group">
+                <label>OpenWrt 端口</label>
+                <input id="f-ow-port" class="form-control" type="number" value="22">
+            </div>
+            <div class="form-group">
+                <label>OpenWrt 用户</label>
+                <input id="f-ow-username" class="form-control" placeholder="root">
+            </div>
+            <div class="form-group">
+                <label>OpenWrt 密码</label>
+                <input id="f-ow-password" class="form-control" type="password" placeholder="password">
             </div>
         </div>
         <div id="form-error" class="text-danger fs-13 mt-2 d-none"></div>
@@ -92,7 +108,7 @@ async function loadServers() {
     try {
         const servers = await api('GET', '/servers');
         if (!servers.length) {
-            el.innerHTML = '<p class="text-gray fs-14">暂无 PVE 服务器，请点击上方按钮添加</p>';
+            el.innerHTML = '<p class="text-gray fs-14">暂无宿主机，请点击上方按钮添加</p>';
             return;
         }
         el.innerHTML = servers.map(s => renderCard(s)).join('');
@@ -112,11 +128,14 @@ function renderCard(s) {
                     '<span>用户: ' + esc(s.user) + '</span>' +
                     '<span>Token: ' + esc(s.token_name) + '</span>' +
                     '<span>节点: ' + esc(s.node) + '</span>' +
+                    (s.ow_host ? '<span>OpenWrt: ' + esc(s.ow_host) + '</span>' : '') +
                 '</div>' +
                 '<div id="status-' + s.id + '"></div>' +
+                '<div id="ow-status-' + s.id + '"></div>' +
             '</div>' +
             '<div class="actions">' +
-                '<button class="btn btn-sm" onclick="testServer(' + s.id + ')">测试连接</button>' +
+                '<button class="btn btn-sm" onclick="testServer(' + s.id + ')">测试PVE</button>' +
+                (s.ow_host ? '<button class="btn btn-sm" onclick="testOpenWrt(' + s.id + ')">测试OpenWrt</button>' : '') +
                 '<button class="btn btn-sm" onclick="viewNodes(' + s.id + ')">查看节点</button>' +
                 '<button class="btn btn-sm" onclick="openEditModal(' + s.id + ')">编辑</button>' +
                 '<button class="btn btn-sm btn-danger" onclick="deleteServer(' + s.id + ')">删除</button>' +
@@ -134,6 +153,20 @@ async function testServer(id) {
     try {
         const data = await api('POST', '/servers/' + id + '/test');
         el.innerHTML = '✅ ' + (data.version ? '版本: ' + (data.version.version || JSON.stringify(data.version)) : data.message);
+        el.className = 'conn-ok';
+    } catch (e) {
+        el.innerHTML = '❌ ' + e.message;
+        el.className = 'conn-err';
+    }
+}
+
+async function testOpenWrt(id) {
+    const el = $('ow-status-' + id);
+    el.innerHTML = '测试中...';
+    el.className = '';
+    try {
+        const data = await api('POST', '/servers/' + id + '/test-openwrt');
+        el.innerHTML = '✅ ' + (data.version ? (data.version.version || JSON.stringify(data.version)) : data.message);
         el.className = 'conn-ok';
     } catch (e) {
         el.innerHTML = '❌ ' + e.message;
@@ -169,7 +202,7 @@ function closeNodeModal() { hide('node-modal-overlay'); }
 
 function openAddModal() {
     _editingId = null;
-    $('modal-title').textContent = '新增 PVE 服务器';
+    $('modal-title').textContent = '新增宿主机';
     $('f-name').value = '';
     $('f-host').value = '';
     $('f-port').value = '8006';
@@ -178,6 +211,10 @@ function openAddModal() {
     $('f-token-value').value = '';
     $('f-node').value = '';
     $('f-template-vmid').value = '9000';
+    $('f-ow-host').value = '';
+    $('f-ow-port').value = '22';
+    $('f-ow-username').value = '';
+    $('f-ow-password').value = '';
     $('form-error').style.display = 'none';
     $('btn-save').textContent = '保存';
     show('modal-overlay');
@@ -185,7 +222,7 @@ function openAddModal() {
 
 async function openEditModal(id) {
     _editingId = id;
-    $('modal-title').textContent = '编辑 PVE 服务器';
+    $('modal-title').textContent = '编辑宿主机';
     $('btn-save').textContent = '保存';
     $('form-error').style.display = 'none';
     show('modal-overlay');
@@ -197,6 +234,10 @@ async function openEditModal(id) {
     $('f-token-value').value = '';
     $('f-node').value = '';
     $('f-template-vmid').value = '9000';
+    $('f-ow-host').value = '';
+    $('f-ow-port').value = '22';
+    $('f-ow-username').value = '';
+    $('f-ow-password').value = '';
     try {
         const servers = await api('GET', '/servers');
         const s = servers.find(x => x.id === id);
@@ -209,6 +250,10 @@ async function openEditModal(id) {
         $('f-token-value').value = '****';
         $('f-node').value = s.node;
         $('f-template-vmid').value = s.template_vmid || 9000;
+        $('f-ow-host').value = s.ow_host || '';
+        $('f-ow-port').value = s.ow_port || 22;
+        $('f-ow-username').value = s.ow_username || '';
+        $('f-ow-password').value = s.ow_password && s.ow_password !== '****' ? s.ow_password : '****';
     } catch (e) {
         $('form-error').textContent = '加载失败: ' + e.message;
         $('form-error').style.display = 'block';
@@ -227,6 +272,10 @@ function getFormData() {
         token_value: $('f-token-value').value,
         node: $('f-node').value.trim(),
         template_vmid: parseInt($('f-template-vmid').value) || 9000,
+        ow_host: $('f-ow-host').value.trim(),
+        ow_port: parseInt($('f-ow-port').value) || 22,
+        ow_username: $('f-ow-username').value.trim(),
+        ow_password: $('f-ow-password').value,
     };
 }
 
@@ -241,6 +290,9 @@ async function saveServer() {
     if (!data.token_name) missing.push('API Name');
     if (!data.token_value || data.token_value === '****') missing.push('API Token');
     if (!data.node) missing.push('节点名');
+    if (!data.ow_host) missing.push('OpenWrt IP');
+    if (!data.ow_username) missing.push('OpenWrt 用户');
+    if (!data.ow_password || data.ow_password === '****') missing.push('OpenWrt 密码');
     if (missing.length) {
         errEl.textContent = '请填写必填项: ' + missing.join(', ');
         errEl.style.display = 'block';
@@ -264,7 +316,7 @@ async function saveServer() {
 }
 
 async function deleteServer(id) {
-    if (!await showConfirm('确定删除此 PVE 服务器？')) return;
+    if (!await showConfirm('确定删除此宿主机？关联的 OpenWrt 配置也将一并删除。')) return;
     try {
         await api('DELETE', '/servers/' + id);
         loadServers();

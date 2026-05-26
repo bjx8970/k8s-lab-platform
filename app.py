@@ -1024,6 +1024,29 @@ def pve_test_server(sid):
     return jsonify({"message": "连接成功", "version": version})
 
 
+@app.route("/api/pve/servers/<int:sid>/test-openwrt", methods=["POST"])
+@login_required
+@admin_required
+@api_error_handler
+def pve_test_openwrt_server(sid):
+    cfg = get_pve_server(sid)
+    if not cfg:
+        return jsonify({"error": "服务器不存在"}), 404
+    if not cfg.get("ow_host"):
+        return jsonify({"error": "未配置 OpenWrt 连接信息"}), 400
+    client = OpenWrtClient(
+        host=cfg["ow_host"],
+        username=cfg["ow_username"],
+        password=cfg["ow_password"],
+        port=int(cfg.get("ow_port", 22)),
+    )
+    try:
+        version = client.connect()
+        return jsonify({"message": "OpenWrt 连接成功", "version": version})
+    finally:
+        client.close()
+
+
 @app.route("/api/pve/servers/<int:sid>/nodes", methods=["GET"])
 @login_required
 @api_error_handler
@@ -1230,22 +1253,37 @@ def pve_release_vm(node, vmid):
 @login_required
 @admin_required
 def openwrt():
-    cfg = get_config("openwrt") or {}
-    return render_template("openwrt.html", config=cfg)
+    return redirect("/pve")
 
 
-def get_openwrt_client():
-    cfg = get_config("openwrt")
-    if not cfg:
-        raise OpenWrtError("OpenWrt 未配置，请先在页面中保存配置")
-    missing = [k for k in ("host", "username", "password") if not cfg.get(k)]
+def get_openwrt_client(server_id=None):
+    if server_id:
+        cfg = get_pve_server(server_id)
+        if not cfg:
+            raise OpenWrtError(f"PVE 服务器 (ID={server_id}) 不存在")
+        ow_host = cfg.get("ow_host", "")
+        ow_username = cfg.get("ow_username", "")
+        ow_password = cfg.get("ow_password", "")
+        ow_port = int(cfg.get("ow_port", 22))
+    else:
+        cfg = get_config("openwrt")
+        if not cfg:
+            raise OpenWrtError("OpenWrt 未配置，请先在页面中保存配置")
+        ow_host = cfg.get("host", "")
+        ow_username = cfg.get("username", "")
+        ow_password = cfg.get("password", "")
+        ow_port = int(cfg.get("port", 22))
+    missing = []
+    if not ow_host: missing.append("host")
+    if not ow_username: missing.append("username")
+    if not ow_password: missing.append("password")
     if missing:
         raise OpenWrtError(f"OpenWrt 配置不完整: {', '.join(missing)}")
     return OpenWrtClient(
-        host=cfg["host"],
-        username=cfg["username"],
-        password=cfg["password"],
-        port=int(cfg.get("port", 22)),
+        host=ow_host,
+        username=ow_username,
+        password=ow_password,
+        port=ow_port,
     )
 
 
@@ -2039,8 +2077,13 @@ def webssh_session_create(data):
         return
     _webssh_connect_times[sid] = now
 
-    openwrt_cfg = get_config("openwrt") or {}
-    host = openwrt_cfg.get("host", "")
+    _pve_sid = cluster.get("pve_server_id")
+    if _pve_sid:
+        _ow_host_cfg = get_pve_server(_pve_sid) or {}
+        host = _ow_host_cfg.get("ow_host", "")
+    else:
+        openwrt_cfg = get_config("openwrt") or {}
+        host = openwrt_cfg.get("host", "")
     port = cluster.get("ssh_port", 22)
     username = "k8s"
     password = cluster.get("password", "k8s.1234")
