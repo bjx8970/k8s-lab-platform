@@ -5,11 +5,13 @@
 ## 架构
 
 ```
-用户浏览器 → Flask Web (app.py)
-                ├── PVE API (proxmoxer)      → Proxmox VE 虚拟化 (支持多服务器)
-                ├── OpenWrt SSH (paramiko)   → OpenWrt 路由器 (UCI)
-                ├── SQLite / PostgreSQL      → 集群数据持久化 (sqlalchemy)
-                └── pg_client (pg8000)       → PostgreSQL 连接测试
+用户浏览器 → Flask Web + SocketIO (app.py)
+                ├── PVE API (proxmoxer)           → Proxmox VE 虚拟化 (支持多服务器)
+                ├── OpenWrt SSH (paramiko)        → OpenWrt 路由器 (UCI 配置)
+                ├── SQLite / PostgreSQL           → 集群数据持久化 (SQLAlchemy)
+                ├── WebSSH (xterm.js + SocketIO)  → 浏览器终端 SSH 到 client VM
+                ├── VM 状态缓存 (status_cache)     → 后台定时轮询 PVE VM 状态
+                └── 异步任务队列 (task_queue)      → 创建/删除/部署异步执行
 ```
 
 ## 功能
@@ -27,8 +29,11 @@
   - OpenWrt 端口转发 (WAN:N+50000 → client:22)
   - OpenWrt 静态 DHCP 绑定
 - **K8s 部署** — 基于 kubeasz 在 client VM 内自动部署 Kubernetes 集群
-- **异步任务** — 创建/删除/部署均异步执行，前端实时显示进度条 + 详细日志页面
-- **集群删除** — 释放所有虚拟机并清理 OpenWrt 配置
+- **异步任务** — 创建/删除/部署均异步执行，前端实时显示进度条 + 详细日志页面，支持取消运行中的任务
+- **集群删除** — 释放所有虚拟机并清理 OpenWrt 配置，支持强制删除异常集群
+- **浏览器 WebSSH** — 基于 xterm.js + SocketIO + paramiko 的浏览器终端，教师/管理员可接管或查看学生会话
+- **用户在线追踪** — 通过 SocketIO 实时追踪用户在线状态
+- **VM 关机投票** — 学生组成员可投票决定是否关闭共享集群的 VM
 - **数据库切换** — 支持 SQLite ↔ PostgreSQL 在线切换和数据迁移
 
 ## 前置条件
@@ -93,13 +98,18 @@ PVE 和 OpenWrt 配置保存在数据库的 `config` 表或 `pve_servers` 表。
 ## 启动
 
 ```bash
-# 开发模式
+# 开发模式 (Flask dev server)
 python app.py
 
-# 生产模式
-pip install waitress
+# 生产模式 (flask-socketio threading + Werkzeug)
+# 自动生成 .secret_key 文件，或设置环境变量
 set FLASK_SECRET_KEY=your-secret-key   # Windows
 export FLASK_SECRET_KEY=your-secret-key  # Linux/Mac
+python run.py
+
+# 生产模式 (waitress，无 WebSocket 传输)
+pip install waitress
+set FLASK_SECRET_KEY=your-secret-key
 waitress-serve --host 0.0.0.0 --port 5000 app:app
 ```
 
@@ -141,10 +151,10 @@ waitress-serve --host 0.0.0.0 --port 5000 app:app
 ### 5. 角色说明
 
 | 角色 | 权限 |
-|---|---|
-| admin | 所有功能，包括 PVE/OpenWrt/数据库配置、用户管理 |
-| teacher | 创建课程、组、学生账号，管理自己创建的集群 |
-| student | 查看自己被分配的集群，启动/停止虚拟机 |
+|---|---|---|
+| admin | 所有功能，包括 PVE/OpenWrt/数据库配置、用户管理、WebSSH 管理面板 |
+| teacher | 创建课程、组、学生账号，管理自己创建的集群，接管/查看学生会话 |
+| student | 查看自己被分配的集群，启动/停止虚拟机，WebSSH 连接 client VM |
 
 ## 集群命名与网络规划
 
@@ -165,29 +175,37 @@ waitress-serve --host 0.0.0.0 --port 5000 app:app
 ## 文件结构
 
 ```
-├── app.py                      # Flask 主程序与路由
-├── .db_config.json             # 数据库切换配置（SQLite / PostgreSQL）
+├── app.py                      # Flask 主程序与路由 (~2774 行)
+├── run.py                      # 生产模式入口（自动生成 .secret_key）
+├── .db_config.json             # 数据库切换配置（SQLite / PostgreSQL，含密码，gitignore）
+├── .secret_key                 # 生产模式自动生成的密钥（gitignore）
 ├── modules/
 │   ├── __init__.py
 │   ├── db.py                   # SQLAlchemy 模型与数据库操作
 │   ├── pve_client.py           # PVE API 封装 (proxmoxer)
 │   ├── openwrt_client.py       # OpenWrt SSH/UCI 封装 (paramiko)
-│   ├── k8s_manager.py          # 集群编排 + 异步任务 + K8s 部署
+│   ├── k8s_manager.py          # 集群编排 + K8s 部署
+│   ├── task_queue.py           # 异步任务队列（create/delete/deploy）
+│   ├── ssh_terminal.py         # WebSSH 会话池管理 (paramiko)
+│   ├── status_cache.py         # VM 状态后台缓存
 │   └── pg_client.py            # PostgreSQL 连接测试 (pg8000)
 ├── templates/
 │   ├── base.html               # 布局模板
-│   ├── index.html              # 首页
-│   ├── k8s.html                # K8s 管理页面
-│   ├── k8s_logs.html           # 执行日志查看页面
-│   ├── pve.html                # PVE 多服务器配置页面
-│   ├── openwrt.html            # OpenWrt 配置页面
-│   ├── db_config.html          # 数据库切换页面
+│   ├── index.html              # 首页（admin/teacher）
+│   ├── student.html            # 学生首页
+│   ├── k8s.html                # K8s 集群管理
+│   ├── k8s_logs.html           # 异步任务日志
+│   ├── pve.html                # PVE 多服务器配置
+│   ├── openwrt.html            # OpenWrt 配置
+│   ├── db_config.html          # 数据库切换管理
 │   ├── db_setup.html           # 首次启动数据库配置向导
 │   ├── setup.html              # 初始管理员设置
-│   ├── users.html              # 用户管理页面
-│   ├── classes.html            # 课程与组管理页面
-│   ├── login.html              # 登录页面
-│   └── 403.html                # 权限不足页面
+│   ├── users.html              # 用户管理
+│   ├── classes.html            # 课程与组管理
+│   ├── login.html              # 登录
+│   ├── 403.html                # 权限不足
+│   ├── admin_webssh.html       # WebSSH 管理面板
+│   └── _standalone_base.html   # 独立页面布局（登录/设置）
 ├── k8s_lab.db                  # SQLite 数据文件（运行后生成，.gitignore）
 └── requirements.txt            # Python 依赖
 ```
@@ -208,7 +226,8 @@ waitress-serve --host 0.0.0.0 --port 5000 app:app
 ## 依赖
 
 - Python 3.8+
-- flask, proxmoxer, paramiko, sqlalchemy, cryptography, pg8000
+- Flask, Flask-SocketIO, Flask-Login, Flask-WTF
+- proxmoxer, paramiko, sqlalchemy, cryptography, pg8000
 
 详见 `requirements.txt`
 
@@ -218,5 +237,7 @@ waitress-serve --host 0.0.0.0 --port 5000 app:app
 - `k8s` 用户需要在模板中配置 passwordless sudo
 - client VM 第一次启动后需重启才能刷新 DHCP 主机名
 - K8s 部署从 `http://10.11.43.82/download/` 下载离线安装包，需内部网络可达
-- 生产环境必须设置环境变量 `FLASK_SECRET_KEY`，否则使用不安全的默认值
+- 生产环境必须设置环境变量 `FLASK_SECRET_KEY`；使用 `python run.py` 会自动生成 `.secret_key` 文件
+- Flask-SocketIO 使用 threading 模式（非 eventlet/gevent），如需 WebSocket 传输需额外安装 `simple-websocket`
 - OpenWrt VLAN 设备名含小数点，需通过 UCI 索引方式操作
+- WebSSH 连接数可在管理面板 `/admin/webssh` 配置（全局/学生/教师上限、空闲超时）
