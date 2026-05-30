@@ -301,6 +301,28 @@ def _wait_for_ssh(host, port, username, private_key, timeout=120):
     raise K8sError(f"SSH 连接失败 ({host}:{port}): {last_error}")
 
 
+def _wait_for_vms_ssh(ssh, vm_ips, timeout=120, log_callback=None):
+    deadline = _time.time() + timeout
+    pending = dict(vm_ips)
+    while _time.time() < deadline and pending:
+        for name, ip in list(pending.items()):
+            try:
+                ssh.exec(
+                    f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
+                    f"k8s@{ip} 'echo OK'",
+                    timeout=10)
+                if log_callback:
+                    log_callback(f"{name} ({ip}): SSH 就绪")
+                del pending[name]
+            except K8sError:
+                pass
+        if pending:
+            _time.sleep(5)
+    if pending:
+        names = ", ".join(pending.keys())
+        raise K8sError(f"以下节点 SSH 超时未就绪: {names}")
+
+
 def _openwrt_client(server_id=None):
     if server_id:
         cfg = get_pve_server(server_id)
@@ -682,6 +704,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 "name": vm_name,
                 "full": 0,
                 "agent": 1,
+                "protection": 0,
                 "ciuser": "k8s",
                 "cipassword": password,
                 "sshkeys": quote(pub_key.strip(), safe=''),
@@ -1017,6 +1040,14 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     ssh.exec("mkdir -p /tmp/k8s-setup")
     ssh.write_file("/tmp/k8s-setup/cluster.pub", _pub_key)
+
+    vm_ips = [(vm_name, info["ip"])
+              for vm_name, info in cluster.get("vms", {}).items()
+              if info.get("role") != "client" and info.get("ip")]
+    _log("等待所有节点 SSH 就绪...")
+    _wait_for_vms_ssh(ssh, vm_ips, timeout=180, log_callback=_log)
+    _log("所有节点 SSH 已就绪")
+
     for vm_name, vm_info in cluster.get("vms", {}).items():
         if vm_info.get("role") == "client":
             continue
