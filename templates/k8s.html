@@ -74,7 +74,6 @@
             <div class="form-group"><label>主节点内存 (MB)</label><input id="form-master-mem" class="form-control" type="number" value="4096"></div>
             <div class="form-group"><label>子节点 CPU 核心</label><input id="form-node-cores" class="form-control" type="number" value="4"></div>
             <div class="form-group"><label>子节点内存 (MB)</label><input id="form-node-mem" class="form-control" type="number" value="4096"></div>
-            <div class="form-group" style="grid-column:1/-1"><label>client 密码</label><input id="form-password" class="form-control" type="text" value="k8s.1234"></div>
             {% if current_user.role == 'teacher' %}
             <div class="form-group"><label>课程</label><select id="form-class" class="form-control"><option value="">-- 请选择 --</option></select></div>
             <div class="form-group" style="grid-column:1/-1"><label>组（不选 = 演示集群，勾选多个用于批量创建）</label><div id="form-group-container" class="checkbox-group"></div></div>
@@ -82,9 +81,6 @@
         </div>
         <div class="toolbar mt-4">
             <button class="btn btn-primary" id="btn-create" onclick="createCluster()">创建集群</button>
-            {% if current_user.role == 'teacher' %}
-            <button class="btn" id="btn-batch" onclick="batchCreate()">批量创建</button>
-            {% endif %}
             <button class="btn ml-a" onclick="closeCreateForm()">取消</button>
         </div>
         <div id="create-result" class="mt-2 fs-14"></div>
@@ -215,69 +211,42 @@ async function createCluster() {
         const sel = $('form-server');
         const opt = sel.options[sel.selectedIndex];
         const pve_node = (opt && opt.dataset && opt.dataset.node) || '';
-        const body = {
+        if (!pve_node) throw new Error('请选择 PVE 服务器');
+        const base = {
             pve_server_id: parseInt($('form-server').value) || 0,
-            pve_node: pve_node,
+            pve_node,
             master_count: parseInt($('form-master-count').value) || 1,
             node_count: parseInt($('form-node-count').value) || 1,
             master_cores: parseInt($('form-master-cores').value) || 4,
             master_memory: parseInt($('form-master-mem').value) || 4096,
             node_cores: parseInt($('form-node-cores').value) || 4,
             node_memory: parseInt($('form-node-mem').value) || 4096,
-            password: $('form-password').value.trim() || 'k8s.1234',
-            {% if current_user.role == 'teacher' %}
-            group_id: (function(){
-                const c = document.querySelectorAll('#form-group-container input[type=checkbox]:checked');
-                return c.length ? parseInt(c[0].value) : null;
-            })(),
-            class_id: parseInt($('form-class').value) || null,
-            {% endif %}
         };
-        if (!body.pve_node) throw new Error('请选择 PVE 服务器');
-        await api('POST', '/create', body);
+        {% if current_user.role == 'teacher' %}
+        const checked = Array.from(
+            document.querySelectorAll('#form-group-container input[type=checkbox]:checked')
+        );
+        base.class_id = parseInt($('form-class').value) || null;
+        if (checked.length > 1) {
+            const result = await api('POST', '/batch-create', {
+                ...base,
+                group_ids: checked.map(cb => parseInt(cb.value)).filter(x => x),
+            });
+            showToast('✅ 已提交 ' + (result.count || checked.length) + ' 个创建任务，可在右上角查看进度', 'success');
+        } else {
+            base.group_id = checked.length ? parseInt(checked[0].value) : null;
+            await api('POST', '/create', base);
+            showToast('✅ 创建任务已提交，可在右上角查看进度', 'success');
+        }
+        {% else %}
+        await api('POST', '/create', base);
         showToast('✅ 创建任务已提交，可在右上角查看进度', 'success');
+        {% endif %}
         loadClusters();
     } catch (e) {
         showToast('❌ 创建失败: ' + e.message, 'error');
     } finally {
         $('btn-create').disabled = false;
-    }
-}
-
-async function batchCreate() {
-    closeCreateForm();
-    const selected = Array.from(
-        document.querySelectorAll('#form-group-container input[type=checkbox]:checked')
-    ).map(cb => parseInt(cb.value));
-    if (!selected.length) {
-        await showAlert('请至少勾选一个组，或不选组直接点"创建集群"创建演示集群');
-        return;
-    }
-    $('btn-batch').disabled = true;
-    $('create-result').innerHTML = '';
-    try {
-        const sel = $('form-server');
-        const opt = sel.options[sel.selectedIndex];
-        const pve_node = (opt && opt.dataset && opt.dataset.node) || '';
-        const result = await api('POST', '/batch-create', {
-            group_ids: selected.filter(x => x),
-            class_id: parseInt($('form-class').value) || null,
-            pve_server_id: parseInt($('form-server').value) || 0,
-            pve_node: pve_node,
-            master_count: parseInt($('form-master-count').value) || 1,
-            node_count: parseInt($('form-node-count').value) || 1,
-            master_cores: parseInt($('form-master-cores').value) || 4,
-            master_memory: parseInt($('form-master-mem').value) || 4096,
-            node_cores: parseInt($('form-node-cores').value) || 4,
-            node_memory: parseInt($('form-node-mem').value) || 4096,
-            password: $('form-password').value.trim() || 'k8s.1234',
-        });
-        showToast('✅ 已提交 ' + (result.count || selected.length) + ' 个创建任务，可在右上角查看进度', 'success');
-        loadClusters();
-    } catch (e) {
-        showToast('❌ 批量创建失败: ' + e.message, 'error');
-    } finally {
-        $('btn-batch').disabled = false;
     }
 }
 
@@ -288,7 +257,6 @@ function openCreateForm() {
 function closeCreateForm() {
     $('create-form-modal').className = 'modal-overlay';
     $('btn-create').disabled = false;
-    if ($('btn-batch')) $('btn-batch').disabled = false;
 }
 
 async function clusterVmAction(name, action) {

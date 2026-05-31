@@ -295,7 +295,14 @@ function renderCards(clusters) {
             var c = items[ii].data;
             var cname = items[ii].name;
             var label = c.group_name || '集群';
-            var sshInfo = '<div class="cluster-ssh" id="ssh-info-' + esc(cname) + '"></div>';
+            var sshInfo = c.student_username
+                ? '<div class="cluster-ssh show" id="ssh-info-' + esc(cname) + '">' +
+                    '<div><span class="ssh-label">用户名:</span> <code>' + esc(c.student_username) + '</code></div>' +
+                    '<div><span class="ssh-label">主机:</span> <code>' + esc(c.ssh_host) + '</code></div>' +
+                    '<div><span class="ssh-label">端口:</span> <code>' + (c.ssh_port || 22) + '</code></div>' +
+                    '<div><span class="ssh-label">密码:</span> <code>' + esc(c.student_password) + '</code></div>' +
+                  '</div>'
+                : '<div class="cluster-ssh" id="ssh-info-' + esc(cname) + '"></div>';
 
             var vmsHtml = '';
             if (c.vms) {

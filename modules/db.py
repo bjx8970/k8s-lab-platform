@@ -75,6 +75,7 @@ class Cluster(Base):
     client_mac = Column(String(24))
     k8s_status = Column(String(16), default="pending")
     password = Column(String(64), default="k8s.1234")
+    students = Column(Text, default="{}")
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -164,6 +165,7 @@ class Group(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String(128), nullable=False)
     class_id = Column(Integer, ForeignKey("classes.id"), nullable=False, index=True)
+    max_students = Column(Integer, default=0)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     created_at = Column(DateTime, default=func.now())
 
@@ -178,6 +180,7 @@ class GroupMember(Base):
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     class_id = Column(Integer, ForeignKey("classes.id"), nullable=False, index=True)
+    student_number = Column(Integer, nullable=True)
     __table_args__ = (
         UniqueConstraint("user_id", "class_id", name="uq_user_class_group"),
     )
@@ -329,6 +332,9 @@ def init_db():
     _migrate_pve_ow_fields()
     migrate_pve_config()
     _migrate_openwrt_to_pve_servers()
+    _migrate_group_max_students()
+    _migrate_cluster_students()
+    _migrate_group_member_student_number()
 
 
 @contextmanager
@@ -365,6 +371,7 @@ def _cluster_to_dict(cluster):
         "ssh_private_key": cluster.ssh_private_key,
         "ssh_public_key": cluster.ssh_public_key,
         "password": cluster.password,
+        "students": json.loads(cluster.students) if cluster.students else {},
         "pve_node": cluster.pve_node,
         "template_vmid": cluster.template_vmid,
         "pve_server_id": cluster.pve_server_id,
@@ -460,6 +467,39 @@ def _migrate_openwrt_to_pve_servers():
         pass
 
 
+def _migrate_group_member_student_number():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE group_members ADD COLUMN student_number INTEGER"))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _migrate_group_max_students():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE groups ADD COLUMN max_students INTEGER DEFAULT 0"))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _migrate_cluster_students():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE clusters ADD COLUMN students TEXT DEFAULT '{}'"))
+            conn.commit()
+    except Exception:
+        pass
+
+
 def load_clusters():
     with session_scope() as session:
         clusters = session.query(Cluster).options(selectinload(Cluster.vms)).all()
@@ -515,6 +555,7 @@ def save_cluster(name, cluster_data):
         cluster.group_id = cluster_data.get("group_id")
         cluster.class_id = cluster_data.get("class_id")
         cluster.created_by = cluster_data.get("created_by")
+        cluster.students = json.dumps(cluster_data.get("students", {}), ensure_ascii=False)
         cluster.updated_at = func.now()
 
         vms = cluster_data.get("vms", {})
@@ -883,6 +924,7 @@ def create_group(data):
         g = Group(
             name=data["name"],
             class_id=data["class_id"],
+            max_students=data.get("max_students", 0),
             created_by=data["created_by"],
         )
         session.add(g)
@@ -916,6 +958,7 @@ def get_group(group_id):
             "id": g.id,
             "name": g.name,
             "class_id": g.class_id,
+            "max_students": g.max_students,
             "created_by": g.created_by,
             "created_at": g.created_at.isoformat() if g.created_at else None,
         }
@@ -936,6 +979,7 @@ def list_groups(class_id=None, created_by=None):
             "id": g.id,
             "name": g.name,
             "class_id": g.class_id,
+            "max_students": g.max_students,
             "created_by": g.created_by,
             "created_at": g.created_at.isoformat() if g.created_at else None,
         } for g in groups]
@@ -956,6 +1000,7 @@ def list_groups_batch(class_ids):
                 "id": g.id,
                 "name": g.name,
                 "class_id": g.class_id,
+                "max_students": g.max_students,
                 "created_by": g.created_by,
                 "created_at": g.created_at.isoformat() if g.created_at else None,
             })
@@ -971,6 +1016,25 @@ def delete_group(group_id):
         if g:
             session.delete(g)
             session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def update_group(group_id, data):
+    session = get_session()
+    try:
+        g = session.query(Group).filter_by(id=group_id).first()
+        if not g:
+            return None
+        if "name" in data:
+            g.name = data["name"]
+        if "max_students" in data:
+            g.max_students = data["max_students"]
+        session.commit()
+        return g.id
     except Exception:
         session.rollback()
         raise
@@ -1002,7 +1066,10 @@ def add_group_member(group_id, user_id):
         ).first()
         if existing:
             raise ValueError("该学生已在本课程的其他组中")
-        gm = GroupMember(group_id=group_id, user_id=user_id, class_id=group.class_id)
+        max_n = group.max_students or 0
+        used = set(m.student_number for m in group.members if m.student_number is not None)
+        slot = next((n for n in range(1, max_n + 1) if n not in used), None)
+        gm = GroupMember(group_id=group_id, user_id=user_id, class_id=group.class_id, student_number=slot)
         session.add(gm)
         session.commit()
         return gm.id
@@ -1030,6 +1097,33 @@ def remove_group_member(group_id, user_id):
         raise
     finally:
         session.close()
+
+
+def get_group_member(group_id, user_id):
+    with session_scope() as session:
+        gm = session.query(GroupMember).filter_by(
+            group_id=group_id, user_id=user_id
+        ).first()
+        if not gm:
+            return None
+        return {"id": gm.id, "student_number": gm.student_number}
+
+
+def backfill_group_student_numbers(group_id):
+    """为组内 student_number 为空的成员分配最低可用序号"""
+    with session_scope(commit=True) as session:
+        group = session.query(Group).filter_by(id=group_id).first()
+        if not group:
+            return
+        max_n = group.max_students or 0
+        used = set(m.student_number for m in group.members if m.student_number is not None)
+        available = (n for n in range(1, max_n + 1) if n not in used)
+        for m in group.members:
+            if m.student_number is None:
+                slot = next(available, None)
+                if slot is None:
+                    break
+                m.student_number = slot
 
 
 def list_group_members(group_id):
