@@ -1314,6 +1314,16 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
         ssh.exec(f"sudo sed -i {_prefix}{_master0_ip}{_suffix} {f_config} && "
                  f"sudo sed -i '/k8s\\.easzlab\\.io/s/^/#/' {f_config} || true")
 
+    # ── 配置 docker.io 镜像加速指向内网仓库 ──
+    _log("覆写 containerd hosts.toml 模板 → 指向 10.11.43.82:5000")
+    ssh.write_file(
+        "/etc/kubeasz/roles/containerd/templates/docker.io/hosts.toml.j2",
+        'server = "https://docker.io"\n\n[host."http://10.11.43.82:5000"]\n  capabilities = ["pull", "resolve"]\n',
+        sudo=True
+    )
+    _log("追加 10.11.43.82:5000 到 INSECURE_REG")
+    ssh.exec(f"sudo sed -i '/^  - \"http:\\/\\/easzlab\\.io\\.local:5000\"/a\\  - \"http://10.11.43.82:5000\"' {f_config}")
+
     # ── 实际安装 K8s ──
     report(92, "正在检查 K8s 集群安装状态...")
     if not ssh.file_exists(f"{cluster_dir}/kubeconfig"):
