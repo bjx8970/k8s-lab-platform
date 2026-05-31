@@ -1728,6 +1728,23 @@ def k8s_list_clusters():
     safe = {}
     for name, c in data.items():
         entry = {k: v for k, v in c.items() if k != "ssh_private_key"}
+        _pve_sid = c.get("pve_server_id")
+        if _pve_sid:
+            _ow_cfg = get_pve_server(_pve_sid) or {}
+            entry["ssh_host"] = _ow_cfg.get("ow_host", "")
+        else:
+            _ow_cfg = get_config("openwrt") or {}
+            entry["ssh_host"] = _ow_cfg.get("host", "")
+        if current_user.role == "student":
+            group_id = c.get("group_id")
+            if group_id:
+                gm = get_group_member(group_id, current_user.id)
+                if gm and gm.get("student_number"):
+                    student_key = f"student{gm['student_number']}"
+                    students = c.get("students", {})
+                    if student_key in students:
+                        entry["student_username"] = student_key
+                        entry["student_password"] = students[student_key]["password"]
         safe[name] = entry
     return jsonify(safe)
 
