@@ -259,7 +259,13 @@ function renderClassCards(clusters) {
                     '<button class="btn btn-sm btn-danger" onclick="clusterVmAction(\'' + name + '\',\'stop\')">&#9209; 停止全部</button>' +
                     '<button class="view-ssh-btn" onclick="toggleSshInfo(\'' + name + '\')">&#128274; 查看连接信息</button>' +
                 '</div>' +
-                    '<div class="cluster-ssh" id="ssh-info-' + name + '"></div>' +
+                    '<div class="cluster-ssh" id="ssh-info-' + name + '">' +
+                        '<div><span class="ssh-label">主机:</span> <code>' + esc(c.ssh_host) + '</code></div>' +
+                        '<div><span class="ssh-label">端口:</span> <code>' + (c.ssh_port || 22) + '</code></div>' +
+                        (c.password ? '<div><span class="ssh-label">密码:</span> <code>' + esc(c.password) + '</code></div>' : '') +
+                        (c.gateway ? '<div><span class="ssh-label">网关:</span> <code>' + esc(c.gateway) + '</code></div>' : '') +
+                        renderVmIps(c.vms) +
+                    '</div>' +
                 (vmsHtml ? '<div class="cluster-vms">' + vmsHtml + '</div>' : '') +
             '</div>';
         }
@@ -268,6 +274,17 @@ function renderClassCards(clusters) {
     if (html) {
         document.getElementById('class-clusters-section').innerHTML = html;
     }
+}
+
+function renderVmIps(vms) {
+    if (!vms) return '';
+    var html = '<div class="ssh-vm-ips">';
+    for (var vn in vms) {
+        var v = vms[vn];
+        html += '<div><code>' + esc(vn) + '</code> <span class="ssh-label">' + esc(v.role) + '</span> <code>' + esc(v.ip || '-') + '</code></div>';
+    }
+    html += '</div>';
+    return html;
 }
 
 function renderTeacherActionButtons(clusterName, clusterData) {
