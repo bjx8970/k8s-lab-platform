@@ -20,7 +20,7 @@ from modules.db import (
     list_group_members, list_group_members_batch, list_groups, list_groups_batch, list_pve_servers, list_users,
     get_or_create_group, migrate_config_from_json,
     migrate_from_json, reload_db_engine, remove_group_member, save_cluster,
-    set_config, set_db_config, update_class, update_pve_server, update_user,
+    set_config, set_db_config, update_class, update_group, update_pve_server, update_user,
 )
 from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
@@ -787,9 +787,33 @@ def api_create_group():
     gid = create_group({
         "name": name,
         "class_id": class_id,
+        "max_students": data.get("max_students", 0),
         "created_by": current_user.id,
     })
     return jsonify({"id": gid, "message": "组创建成功"}), 201
+
+
+@app.route("/api/groups/<int:gid>", methods=["PUT"])
+@login_required
+@teacher_or_admin_required
+def api_update_group(gid):
+    grp = get_group(gid)
+    if not grp:
+        return jsonify({"error": "组不存在"}), 404
+    if current_user.role == "teacher" and grp.get("created_by") != current_user.id:
+        return jsonify({"error": "只能修改自己创建的组"}), 403
+    data = request.get_json() or {}
+    update_data = {}
+    if "name" in data:
+        name = data["name"].strip()
+        if name:
+            update_data["name"] = name
+    if "max_students" in data:
+        update_data["max_students"] = int(data["max_students"])
+    if not update_data:
+        return jsonify({"error": "没有需要修改的字段"}), 400
+    update_group(gid, update_data)
+    return jsonify({"message": "组已更新"}), 200
 
 
 @app.route("/api/groups/<int:gid>", methods=["DELETE"])
@@ -1775,7 +1799,6 @@ def k8s_create_cluster_async_route():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
     group_id = data.get("group_id")
     class_id = data.get("class_id")
@@ -1792,7 +1815,6 @@ def k8s_create_cluster_async_route():
         master_cores, master_memory,
         node_cores, node_memory,
         pve_node,
-        password=password,
         pve_server_id=pve_server_id,
         group_id=group_id,
         class_id=class_id,
@@ -1817,7 +1839,6 @@ def k8s_batch_create_clusters():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    password = data.get("password", "k8s.1234")
     pve_server_id = int(data.get("pve_server_id", 0))
     class_id = data.get("class_id")
 
@@ -1826,7 +1847,6 @@ def k8s_batch_create_clusters():
         master_cores, master_memory,
         node_cores, node_memory,
         pve_node,
-        password=password,
         pve_server_id=pve_server_id,
         created_by=current_user.id,
         class_id=class_id,
@@ -2085,8 +2105,19 @@ def webssh_session_create(data):
         openwrt_cfg = get_config("openwrt") or {}
         host = openwrt_cfg.get("host", "")
     port = cluster.get("ssh_port", 22)
-    username = "k8s"
-    password = cluster.get("password", "k8s.1234")
+
+    if current_user.role == "student":
+        students = cluster.get("students", {})
+        student_key = f"student{current_user.id}"
+        if student_key in students:
+            username = student_key
+            password = students[student_key]["password"]
+        else:
+            emit("ssh_error", {"message": "未找到该学生的集群账户"})
+            return
+    else:
+        username = "teacher"
+        password = cluster.get("password", "")
 
     owner = {
         "user_id": current_user.id,

@@ -10,7 +10,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from modules.db import (
-    Cluster, delete_cluster_db, get_config, get_pve_server, load_cluster,
+    Cluster, delete_cluster_db, get_config, get_group, get_pve_server,
+    list_group_members, load_cluster,
     load_clusters, save_cluster, session_scope,
 )
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
@@ -309,7 +310,7 @@ def _wait_for_vms_ssh(ssh, vm_ips, timeout=120, log_callback=None):
             try:
                 ssh.exec(
                     f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "
-                    f"k8s@{ip} 'echo OK'",
+                    f"teacher@{ip} 'echo OK'",
                     timeout=10)
                 if log_callback:
                     log_callback(f"{name} ({ip}): SSH 就绪")
@@ -502,7 +503,7 @@ def delete_cluster_async(name, created_by=None):
 
 def create_cluster(master_count, node_count, master_cores, master_memory,
                    node_cores, node_memory, pve_node,
-                   password="k8s.1234", pve_server_id=0, group_id=None,
+                   pve_server_id=0, group_id=None,
                    class_id=None, created_by=None,
                    status_callback=None, log_callback=None, cancel_event=None):
     def report(progress, message):
@@ -512,6 +513,8 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
     def _log(msg):
         if log_callback:
             log_callback(msg)
+
+    password = secrets.token_urlsafe(16)
 
     _log(f"开始创建集群: master={master_count}, node={node_count}, "
          f"cores=(master={master_cores}, node={node_cores}), "
@@ -705,7 +708,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 "full": 0,
                 "agent": 1,
                 "protection": 0,
-                "ciuser": "k8s",
+                "ciuser": "teacher",
                 "cipassword": password,
                 "sshkeys": quote(pub_key.strip(), safe=''),
                 "ipconfig0": "ip=dhcp",
@@ -793,6 +796,8 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
         report(96, "正在等待 client VM 就绪并配置 SSH...")
         client_vm = next((item for item in created_vms if item[0].startswith("client-")), None)
+        _ssh_host = ""
+        _ssh_port = 0
         if client_vm:
             if pve_server_id:
                 _ow_host_cfg = get_pve_server(pve_server_id) or {}
@@ -803,7 +808,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             _ssh_port = 50000 + num
             _log(f"Client VM {client_vm[0]}: 等待 SSH 就绪 ({_ssh_host}:{_ssh_port}, 120s 超时)")
             try:
-                _wait_for_ssh(_ssh_host, _ssh_port, "k8s", priv_key, timeout=120)
+                _wait_for_ssh(_ssh_host, _ssh_port, "teacher", priv_key, timeout=120)
                 _log(f"Client VM {client_vm[0]}: SSH 已就绪")
             except Exception as e:
                 _log(f"Client VM {client_vm[0]}: SSH 未响应 ({e})")
@@ -811,14 +816,17 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             report(98, "正在通过 SSH 配置 client 免密登录...")
             _log(f"Client VM {client_vm[0]}: SSH 上传私钥")
             try:
-                ssh = _SSHClient(_ssh_host, _ssh_port, "k8s", priv_key)
+                ssh = _SSHClient(_ssh_host, _ssh_port, "teacher", priv_key)
                 ssh.connect(timeout=30)
-                _log(f"SSH: mkdir -p /home/k8s/.ssh && chmod 700")
-                ssh.exec("mkdir -p /home/k8s/.ssh && chmod 700 /home/k8s/.ssh")
-                _log(f"SSH: 写入 /home/k8s/.ssh/id_rsa ({len(priv_key)} bytes)")
-                ssh.write_file("/home/k8s/.ssh/id_rsa", priv_key)
+                _log(f"SSH: mkdir -p /home/teacher/.ssh && chmod 700")
+                ssh.exec("mkdir -p /home/teacher/.ssh && chmod 700 /home/teacher/.ssh")
+                _log(f"SSH: 写入 /home/teacher/.ssh/id_rsa ({len(priv_key)} bytes)")
+                ssh.write_file("/home/teacher/.ssh/id_rsa", priv_key)
                 _log(f"SSH: chmod 600 && chown")
-                ssh.exec("chmod 600 /home/k8s/.ssh/id_rsa && chown -R k8s:k8s /home/k8s/.ssh")
+                ssh.exec("chmod 600 /home/teacher/.ssh/id_rsa && chown -R teacher:teacher /home/teacher/.ssh")
+                _log(f"SSH: 写入 /home/teacher/.ssh/id_rsa.pub")
+                ssh.write_file("/home/teacher/.ssh/id_rsa.pub", pub_key)
+                ssh.exec("chmod 644 /home/teacher/.ssh/id_rsa.pub && chown teacher:teacher /home/teacher/.ssh/id_rsa.pub")
                 _log(f"SSH: 私钥上传完成")
 
                 _log(f"SSH: sudo mkdir -p /root/.ssh && chmod 700")
@@ -851,6 +859,42 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
     ow.close()
 
+    # ── 创建学生账户（如果分组有成员）──
+    _pending_students = {}
+    if group_id and _ssh_host and _ssh_port:
+        grp = get_group(group_id)
+        members = list_group_members(group_id) if grp else []
+        if members:
+            report(97.5, f"正在创建 {len(members)} 个学生账户...")
+            _log(f"创建 {len(members)} 个学生账户")
+            try:
+                ssh = _SSHClient(_ssh_host, _ssh_port, "teacher", priv_key)
+                ssh.connect(timeout=30)
+                try:
+                    for member in members:
+                        uname = f"student{member['id']}"
+                        spass = secrets.token_urlsafe(12)
+                        _pending_students[uname] = {
+                            "user_id": member["id"],
+                            "password": spass,
+                        }
+                        _log(f"创建学生账户 {uname}")
+                        ssh.exec(f"sudo useradd -m {uname} -s /bin/bash 2>/dev/null || true")
+                        ssh.exec(f"echo '{uname}:{spass}' | sudo chpasswd")
+                        ssh.exec(f"sudo mkdir -p /home/{uname}/.ssh")
+                        ssh.exec(f"sudo cp /home/teacher/.ssh/id_rsa /home/{uname}/.ssh/")
+                        ssh.exec(f"sudo cp /home/teacher/.ssh/id_rsa.pub /home/{uname}/.ssh/")
+                        ssh.exec(f"sudo sh -c 'cat /home/teacher/.ssh/id_rsa.pub >> /home/{uname}/.ssh/authorized_keys'")
+                        ssh.exec(f"sudo chmod 700 /home/{uname}/.ssh")
+                        ssh.exec(f"sudo chmod 600 /home/{uname}/.ssh/id_rsa")
+                        ssh.exec(f"sudo chmod 644 /home/{uname}/.ssh/authorized_keys")
+                        ssh.exec(f"sudo chown -R {uname}:{uname} /home/{uname}/.ssh")
+                    _log(f"已创建 {len(members)} 个学生账户")
+                finally:
+                    ssh.close()
+            except Exception as e:
+                _log(f"创建学生账户失败: {e}")
+
     report(97, "正在保存集群信息...")
     _log("保存集群信息到数据库")
     _client_mac = next((vm["mac"] for vm in vms.values() if vm.get("role") == "client"), None)
@@ -874,6 +918,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         "group_id": group_id,
         "class_id": class_id,
         "created_by": created_by,
+        "students": _pending_students,
     }
     save_cluster(cluster_name, cluster_entry)
 
@@ -885,7 +930,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
 def create_cluster_async(master_count, node_count, master_cores, master_memory,
                          node_cores, node_memory, pve_node,
-                         password="k8s.1234", pve_server_id=0,
+                         pve_server_id=0,
                          group_id=None, class_id=None, created_by=None):
     task_id = _new_task_id()
     _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
@@ -909,7 +954,6 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                 master_cores, master_memory,
                 node_cores, node_memory,
                 pve_node,
-                password=password,
                 pve_server_id=pve_server_id,
                 group_id=group_id,
                 class_id=class_id,
@@ -992,12 +1036,12 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     report(10, "正在通过 SSH 连接 client VM...")
     _log(f"通过端口转发连接 client VM ({_ssh_host}:{_ssh_port})")
     try:
-        _wait_for_ssh(_ssh_host, _ssh_port, "k8s", _priv_key, timeout=120)
+        _wait_for_ssh(_ssh_host, _ssh_port, "teacher", _priv_key, timeout=120)
     except Exception as e:
         raise K8sError(f"client VM SSH 连接失败: {e}")
     _log("client VM SSH 连接就绪")
 
-    ssh = _SSHClient(_ssh_host, _ssh_port, "k8s", _priv_key)
+    ssh = _SSHClient(_ssh_host, _ssh_port, "teacher", _priv_key)
     ssh.connect(timeout=30)
     _log("SSH 连接已建立")
 
@@ -1018,7 +1062,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     if _existing_key != _priv_key:
         _log("复制 SSH 私钥 → /root/.ssh/id_rsa")
         try:
-            ssh.exec("sudo cp /home/k8s/.ssh/id_rsa /root/.ssh/id_rsa && "
+            ssh.exec("sudo cp /home/teacher/.ssh/id_rsa /root/.ssh/id_rsa && "
                      "sudo chmod 600 /root/.ssh/id_rsa && "
                      "sudo chown root:root /root/.ssh/id_rsa")
             _log("SSH 密钥复制完成")
@@ -1059,7 +1103,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
         try:
             ssh.exec(
                 f"cat /tmp/k8s-setup/cluster.pub | "
-                f"ssh -o StrictHostKeyChecking=no k8s@{_ip} "
+                f"ssh -o StrictHostKeyChecking=no teacher@{_ip} "
                 f"'sudo mkdir -p /root/.ssh && sudo chmod 700 /root/.ssh && "
                 f"sudo tee /root/.ssh/authorized_keys > /dev/null && "
                 f"sudo chmod 600 /root/.ssh/authorized_keys && "
@@ -1072,6 +1116,40 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             save_cluster(name, cluster)
             raise
 
+    # ── 在 master/node 上创建学生账户 ──
+    students = cluster.get("students", {})
+    if students:
+        _log("在 master/node 节点上创建学生账户")
+        for vm_name, vm_info in cluster.get("vms", {}).items():
+            if vm_info.get("role") == "client":
+                continue
+            vip = vm_info.get("ip")
+            if not vip:
+                continue
+            for uname, sinfo in students.items():
+                spass = sinfo["password"]
+                try:
+                    ssh.exec(
+                        f"ssh -o StrictHostKeyChecking=no teacher@{vip} "
+                        f"'sudo useradd -m {uname} -s /bin/bash 2>/dev/null || true'",
+                        timeout=30)
+                    ssh.exec(
+                        f"ssh -o StrictHostKeyChecking=no teacher@{vip} "
+                        f"'echo \"{uname}:{spass}\" | sudo chpasswd'",
+                        timeout=30)
+                    ssh.exec(
+                        f"cat /tmp/k8s-setup/cluster.pub | "
+                        f"ssh -o StrictHostKeyChecking=no teacher@{vip} "
+                        f"'sudo mkdir -p /home/{uname}/.ssh && "
+                        f"sudo sh -c \"cat >> /home/{uname}/.ssh/authorized_keys\" && "
+                        f"sudo chmod 700 /home/{uname}/.ssh && "
+                        f"sudo chmod 600 /home/{uname}/.ssh/authorized_keys && "
+                        f"sudo chown -R {uname}:{uname} /home/{uname}/.ssh'",
+                        timeout=30)
+                except K8sError as e:
+                    _log(f"  {vm_name}: 创建学生账户 {uname} 失败 ({e})")
+        _log("各节点学生账户创建完成")
+
     report(25, "正在更新集群 K8s 状态...")
     cluster["k8s_status"] = "installing"
     save_cluster(name, cluster)
@@ -1079,13 +1157,13 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     # ── ezdown ──
     report(30, "正在下载 ezdown...")
-    if not ssh.file_exists("/home/k8s/ezdown"):
-        _log("下载 ezdown → /home/k8s/ezdown")
+    if not ssh.file_exists("/home/teacher/ezdown"):
+        _log("下载 ezdown → /home/teacher/ezdown")
         try:
             _download_with_retry(
                 "http://10.11.43.82/download/ezdown",
                 "/tmp/ezdown", "ezdown", timeout=120)
-            ssh.exec("mv /tmp/ezdown /home/k8s/ezdown && chmod 755 /home/k8s/ezdown && chown k8s:k8s /home/k8s/ezdown")
+            ssh.exec("mv /tmp/ezdown /home/teacher/ezdown && chmod 755 /home/teacher/ezdown && chown teacher:teacher /home/teacher/ezdown")
             _log("ezdown 下载完成")
         except K8sError as e:
             _log(f"ezdown 下载失败: {e}")
@@ -1097,13 +1175,13 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     # ── kubeasz_offline.tgz ──
     report(40, "正在下载 kubeasz 离线包...")
-    if not ssh.file_exists("/home/k8s/kubeasz_offline.tgz"):
-        _log("下载 kubeasz_offline.tgz → /home/k8s/kubeasz_offline.tgz")
+    if not ssh.file_exists("/home/teacher/kubeasz_offline.tgz"):
+        _log("下载 kubeasz_offline.tgz → /home/teacher/kubeasz_offline.tgz")
         try:
             _download_with_retry(
                 "http://10.11.43.82/download/kubeasz_offline.tgz",
                 "/tmp/kubeasz_offline.tgz", "kubeasz 离线包", timeout=600)
-            ssh.exec("mv /tmp/kubeasz_offline.tgz /home/k8s/kubeasz_offline.tgz && chown k8s:k8s /home/k8s/kubeasz_offline.tgz")
+            ssh.exec("mv /tmp/kubeasz_offline.tgz /home/teacher/kubeasz_offline.tgz && chown teacher:teacher /home/teacher/kubeasz_offline.tgz")
             _log("kubeasz_offline.tgz 下载完成")
         except K8sError as e:
             _log(f"kubeasz_offline.tgz 下载失败: {e}")
@@ -1118,7 +1196,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     if not ssh.dir_exists("/etc/kubeasz/roles"):
         _log("解压 kubeasz_offline.tgz → /etc")
         try:
-            ssh.exec("sudo tar xzf /home/k8s/kubeasz_offline.tgz -C /etc", timeout=300)
+            ssh.exec("sudo tar xzf /home/teacher/kubeasz_offline.tgz -C /etc", timeout=300)
             _log("解压完成")
         except K8sError as e:
             _log(f"解压失败: {e}")
@@ -1131,9 +1209,9 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     # ── ezdown: download dependencies ──
     report(65, "正在部署 ezdown 依赖...")
     if not ssh.exec_with_output("which docker || true"):
-        _log("执行: sudo /home/k8s/ezdown -D")
+        _log("执行: sudo /home/teacher/ezdown -D")
         try:
-            ssh.exec("sudo /home/k8s/ezdown -D", timeout=600)
+            ssh.exec("sudo /home/teacher/ezdown -D", timeout=600)
             _log("ezdown -D 下载完成")
         except K8sError as e:
             _log(f"ezdown -D 失败: {e}")
@@ -1147,9 +1225,9 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     report(75, "正在创建 kubeasz 容器...")
     _container_name = ssh.exec_with_output("sudo docker ps -a --format '{{.Names}}' | grep -w kubeasz || true")
     if not _container_name:
-        _log("执行: sudo /home/k8s/ezdown -S")
+        _log("执行: sudo /home/teacher/ezdown -S")
         try:
-            ssh.exec("sudo /home/k8s/ezdown -S", timeout=120)
+            ssh.exec("sudo /home/teacher/ezdown -S", timeout=120)
             _log("kubeasz 容器创建完成")
         except K8sError as e:
             _log(f"ezdown -S 失败: {e}")
@@ -1255,22 +1333,35 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
     # ── 下载 kubeconfig ──
     report(97, "正在下载 kubeconfig...")
-    _kube_dir = "/home/k8s/.kube"
+    _kube_dir = "/home/teacher/.kube"
     _kubeconfig_path = f"{_kube_dir}/config"
     if not ssh.file_exists(_kubeconfig_path):
         _log(f"创建目录 {_kube_dir}")
-        ssh.exec(f"mkdir -p {_kube_dir} && chown k8s:k8s {_kube_dir}")
+        ssh.exec(f"mkdir -p {_kube_dir} && chown teacher:teacher {_kube_dir}")
         _log(f"从第一个 master 节点下载 kubeconfig → {_kubeconfig_path}")
         try:
             first_master_ip = master_ips[masters[0]]
             ssh.exec(f"ssh -o StrictHostKeyChecking=no root@{first_master_ip} "
                      f"'cat /root/.kube/config' > {_kubeconfig_path} && "
-                     f"chown k8s:k8s {_kubeconfig_path}")
+                     f"chown teacher:teacher {_kubeconfig_path}")
             _log("kubeconfig 下载完成")
         except Exception as e:
             _log(f"kubeconfig 下载失败（可手动下载）: {e}")
     else:
         _log("kubeconfig 已存在，跳过下载")
+
+    # ── 复制 kubeconfig 到学生账户 ──
+    if students:
+        _log("复制 kubeconfig 到学生账户")
+        for uname in students:
+            try:
+                ssh.exec(f"sudo mkdir -p /home/{uname}/.kube")
+                ssh.exec(f"sudo cp /home/teacher/.kube/config /home/{uname}/.kube/config")
+                ssh.exec(f"sudo chown -R {uname}:{uname} /home/{uname}/.kube")
+                _log(f"  已复制 kubeconfig 到 {uname}")
+            except K8sError as e:
+                _log(f"  复制 kubeconfig 到 {uname} 失败 ({e})")
+        _log("kubeconfig 复制完成")
 
     # ── 安装 kubectl ──
     report(98, "正在安装 kubectl...")
@@ -1344,7 +1435,6 @@ def batch_create_clusters(group_ids, master_count, node_count,
                           master_cores, master_memory,
                           node_cores, node_memory,
                           pve_node,
-                          password="k8s.1234",
                           pve_server_id=0,
                           created_by=None,
                           status_callback=None, log_callback=None,
@@ -1367,7 +1457,6 @@ def batch_create_clusters(group_ids, master_count, node_count,
                 master_cores, master_memory,
                 node_cores, node_memory,
                 pve_node,
-                password=password,
                 pve_server_id=pve_server_id,
                 group_id=gid,
                 created_by=created_by,
@@ -1403,7 +1492,6 @@ def batch_create_clusters_async(group_ids, master_count, node_count,
                                 master_cores, master_memory,
                                 node_cores, node_memory,
                                 pve_node,
-                                password="k8s.1234",
                                 pve_server_id=0,
                                 created_by=None,
                                 class_id=None):
@@ -1414,7 +1502,6 @@ def batch_create_clusters_async(group_ids, master_count, node_count,
             master_cores, master_memory,
             node_cores, node_memory,
             pve_node,
-            password=password,
             pve_server_id=pve_server_id,
             group_id=gid,
             class_id=class_id,

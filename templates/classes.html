@@ -29,8 +29,9 @@
 
 <div class="modal-overlay" id="group-modal">
   <div class="modal-card">
-    <h3 class="mb-4">新增组</h3>
+    <h3 class="mb-4" id="group-modal-title">新增组</h3>
     <div class="form-group"><label>组名称 *</label><input id="f-group-name" class="form-control"></div>
+    <div class="form-group"><label>最大人数</label><input id="f-group-max" class="form-control" type="number" value="0" min="0"></div>
     <div id="group-form-error" class="text-danger fs-13 mt-2 d-none"></div>
     <div class="toolbar mt-4">
       <button class="btn btn-primary" id="btn-save-group" onclick="saveGroup()">保存</button>
@@ -58,6 +59,7 @@
 let _editingClassId = null;
 let _currentGroupClassId = null;
 let _currentGroupId = null;
+let _editingGroupId = null;
 
 function $(id) { return document.getElementById(id); }
 function show(el) { (typeof el === 'string' ? $(el) : el).style.display = 'flex'; }
@@ -110,8 +112,9 @@ function renderGroups(groups) {
   if (!groups.length) return '<p class="text-gray fs-13">暂无组</p>';
   return groups.map(g =>
     '<div class="group-item">' +
-      '<div><span class="group-name">' + esc(g.name) + '</span> <span class="badge">' + (g.member_count || 0) + ' 人</span></div>' +
+      '<div><span class="group-name">' + esc(g.name) + '</span> <span class="badge">' + (g.member_count || 0) + ' 人</span>' + (g.max_students ? ' <span class="badge badge-secondary">最多 ' + g.max_students + ' 人</span>' : '') + '</div>' +
       '<div class="group-actions">' +
+        '<button class="btn btn-sm" onclick="openGroupModal(' + g.class_id + ',' + g.id + ',\'' + encodeURIComponent(g.name) + '\',' + (g.max_students || 0) + ')">编辑</button>' +
         '<button class="btn btn-sm" onclick="openMemberModal(' + g.id + ')">成员</button>' +
         '<button class="btn btn-sm btn-danger" onclick="deleteGroup(event, ' + g.id + ')">删除</button>' +
       '</div>' +
@@ -173,21 +176,30 @@ async function classVmAction(cid, action) {
 
 // ── Group CRUD ──
 
-function openGroupModal(classId) {
+function openGroupModal(classId, groupId, groupName, maxStudents) {
   _currentGroupClassId = classId;
-  $('f-group-name').value = '';
+  _editingGroupId = groupId || null;
+  groupName = groupName ? decodeURIComponent(groupName) : '';
+  $('group-modal-title').textContent = groupId ? '编辑组' : '新增组';
+  $('f-group-name').value = groupName || '';
+  $('f-group-max').value = maxStudents || 0;
   $('group-form-error').style.display = 'none';
   show('group-modal');
 }
 
-function closeGroupModal() { hide('group-modal'); _currentGroupClassId = null; }
+function closeGroupModal() { hide('group-modal'); _currentGroupClassId = null; _editingGroupId = null; }
 
 async function saveGroup() {
   const name = $('f-group-name').value.trim();
+  const max_students = parseInt($('f-group-max').value) || 0;
   const err = $('group-form-error');
   if (!name) { err.textContent = '组名称不能为空'; err.style.display = 'block'; return; }
   try {
-    await api('POST', 'groups', { name, class_id: _currentGroupClassId });
+    if (_editingGroupId) {
+      await api('PUT', 'groups/' + _editingGroupId, { name, max_students });
+    } else {
+      await api('POST', 'groups', { name, class_id: _currentGroupClassId, max_students });
+    }
     closeGroupModal();
     loadClasses();
   } catch (e) {
