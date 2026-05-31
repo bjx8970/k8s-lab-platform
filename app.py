@@ -12,7 +12,7 @@ from modules.db import (
     add_group_member, check_user_in_class_group, count_classes, count_groups, count_users,
     create_class, create_group, create_pve_server, create_user, delete_class, delete_group,
     delete_pve_server, delete_user, find_cluster_by_vm, get_class, get_class_by_name, get_classes_for_student,
-    get_config, get_db_config, get_db_status, get_group, get_pve_server,
+    get_config, get_db_config, get_db_status, get_group, get_group_member, get_pve_server,
     get_student_group_ids, get_students_created_by, get_user, get_user_by_username,
     get_user_cluster_ids, get_user_groups, init_db, is_db_configured, list_classes,
     list_cluster_names_by_class_id, list_cluster_names_by_group_id,
@@ -2107,13 +2107,23 @@ def webssh_session_create(data):
     port = cluster.get("ssh_port", 22)
 
     if current_user.role == "student":
-        students = cluster.get("students", {})
-        student_key = f"student{current_user.id}"
-        if student_key in students:
-            username = student_key
-            password = students[student_key]["password"]
+        group_id = cluster.get("group_id")
+        if group_id:
+            gm = get_group_member(group_id, current_user.id)
+            if gm and gm.get("student_number"):
+                student_key = f"student{gm['student_number']}"
+                students = cluster.get("students", {})
+                if student_key in students:
+                    username = student_key
+                    password = students[student_key]["password"]
+                else:
+                    emit("ssh_error", {"message": "未找到该学生的集群账户"})
+                    return
+            else:
+                emit("ssh_error", {"message": "未找到该学生的集群账户"})
+                return
         else:
-            emit("ssh_error", {"message": "未找到该学生的集群账户"})
+            emit("ssh_error", {"message": "集群未关联组"})
             return
     else:
         username = "teacher"

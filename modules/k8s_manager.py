@@ -10,7 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from modules.db import (
-    Cluster, delete_cluster_db, get_config, get_group, get_pve_server,
+    Cluster, backfill_group_student_numbers, delete_cluster_db, get_config, get_group, get_pve_server,
     list_group_members, load_cluster,
     load_clusters, save_cluster, session_scope,
 )
@@ -859,25 +859,23 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
     ow.close()
 
-    # ── 创建学生账户（如果分组有成员）──
+    # ── 创建学生账户（按组最大人数）──
     _pending_students = {}
     if group_id and _ssh_host and _ssh_port:
         grp = get_group(group_id)
-        members = list_group_members(group_id) if grp else []
-        if members:
-            report(97.5, f"正在创建 {len(members)} 个学生账户...")
-            _log(f"创建 {len(members)} 个学生账户")
+        max_n = grp["max_students"] if (grp and grp.get("max_students")) else 0
+        if max_n > 0:
+            backfill_group_student_numbers(group_id)
+            report(97.5, f"正在创建 {max_n} 个学生账户...")
+            _log(f"创建 {max_n} 个学生账户 (student1 ~ student{max_n})")
             try:
                 ssh = _SSHClient(_ssh_host, _ssh_port, "teacher", priv_key)
                 ssh.connect(timeout=30)
                 try:
-                    for member in members:
-                        uname = f"student{member['id']}"
+                    for i in range(1, max_n + 1):
+                        uname = f"student{i}"
                         spass = secrets.token_urlsafe(12)
-                        _pending_students[uname] = {
-                            "user_id": member["id"],
-                            "password": spass,
-                        }
+                        _pending_students[uname] = {"password": spass}
                         _log(f"创建学生账户 {uname}")
                         ssh.exec(f"sudo useradd -m {uname} -s /bin/bash 2>/dev/null || true")
                         ssh.exec(f"echo '{uname}:{spass}' | sudo chpasswd")
@@ -889,7 +887,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                         ssh.exec(f"sudo chmod 600 /home/{uname}/.ssh/id_rsa")
                         ssh.exec(f"sudo chmod 644 /home/{uname}/.ssh/authorized_keys")
                         ssh.exec(f"sudo chown -R {uname}:{uname} /home/{uname}/.ssh")
-                    _log(f"已创建 {len(members)} 个学生账户")
+                    _log(f"已创建 {max_n} 个学生账户")
                 finally:
                     ssh.close()
             except Exception as e:

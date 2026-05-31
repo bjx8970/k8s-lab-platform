@@ -180,6 +180,7 @@ class GroupMember(Base):
     group_id = Column(Integer, ForeignKey("groups.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     class_id = Column(Integer, ForeignKey("classes.id"), nullable=False, index=True)
+    student_number = Column(Integer, nullable=True)
     __table_args__ = (
         UniqueConstraint("user_id", "class_id", name="uq_user_class_group"),
     )
@@ -333,6 +334,7 @@ def init_db():
     _migrate_openwrt_to_pve_servers()
     _migrate_group_max_students()
     _migrate_cluster_students()
+    _migrate_group_member_student_number()
 
 
 @contextmanager
@@ -461,6 +463,17 @@ def _migrate_openwrt_to_pve_servers():
                 s.ow_port = int(ow_cfg.get("port", 22))
                 s.ow_username = ow_cfg.get("username", "")
                 s.ow_password = ow_cfg.get("password", "")
+    except Exception:
+        pass
+
+
+def _migrate_group_member_student_number():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE group_members ADD COLUMN student_number INTEGER"))
+            conn.commit()
     except Exception:
         pass
 
@@ -1053,7 +1066,10 @@ def add_group_member(group_id, user_id):
         ).first()
         if existing:
             raise ValueError("该学生已在本课程的其他组中")
-        gm = GroupMember(group_id=group_id, user_id=user_id, class_id=group.class_id)
+        max_n = group.max_students or 0
+        used = set(m.student_number for m in group.members if m.student_number is not None)
+        slot = next((n for n in range(1, max_n + 1) if n not in used), None)
+        gm = GroupMember(group_id=group_id, user_id=user_id, class_id=group.class_id, student_number=slot)
         session.add(gm)
         session.commit()
         return gm.id
@@ -1081,6 +1097,33 @@ def remove_group_member(group_id, user_id):
         raise
     finally:
         session.close()
+
+
+def get_group_member(group_id, user_id):
+    with session_scope() as session:
+        gm = session.query(GroupMember).filter_by(
+            group_id=group_id, user_id=user_id
+        ).first()
+        if not gm:
+            return None
+        return {"id": gm.id, "student_number": gm.student_number}
+
+
+def backfill_group_student_numbers(group_id):
+    """为组内 student_number 为空的成员分配最低可用序号"""
+    with session_scope(commit=True) as session:
+        group = session.query(Group).filter_by(id=group_id).first()
+        if not group:
+            return
+        max_n = group.max_students or 0
+        used = set(m.student_number for m in group.members if m.student_number is not None)
+        available = (n for n in range(1, max_n + 1) if n not in used)
+        for m in group.members:
+            if m.student_number is None:
+                slot = next(available, None)
+                if slot is None:
+                    break
+                m.student_number = slot
 
 
 def list_group_members(group_id):
