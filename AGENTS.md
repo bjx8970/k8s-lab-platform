@@ -20,13 +20,15 @@ python app.py            # Flask dev at :5000 (with flask-socketio threading mod
 - `modules/k8s_manager.py` — cluster orchestration, async via `modules/task_queue.py` + in-memory `_task_store` (lost on restart, 30 min expiry).
 - `modules/ssh_terminal.py` — WebSSH session pool. SSHSession per (user_id, cluster_name). Supports takeover/view modes, log buffer, configurable limits.
 - `modules/status_cache.py` — background VM status cache, 300s refresh interval. Call `update_vm_status()` after VM start/stop.
+- `modules/authz.py` — unified role × resource × action authorization policy (`is_allowed`); pure helpers, no Flask dependency.
+- `modules/audit.py` — sanitized JSON security-audit logging (`sanitize`, `security_audit`).
 
 ## Key gotchas
 
 - **No tests, CI, linter, typechecker, or formatter** configured.
 - **Invoke in requirements.txt is unused** (`invoke_shell` is paramiko's method, not the `invoke` package).
 - **No `simple-websocket` or `gunicorn`/`waitress` in requirements.txt** — add manually if deploying with WebSockets or waitress.
-- **API routes** use `@csrf.exempt`. CSRFProtect active on non-API routes.
+- **CSRF is enforced on API routes** (all `@csrf.exempt` removed). Origin allowlist via `K8S_LAB_ALLOWED_ORIGINS` (no `*`); fetch `/api/csrf-token` and send `X-CSRFToken`. Browser SSH-private-key endpoint removed; credentials are sanitized via `modules/audit.sanitize`.
 - **`.db_config.json` contains live credentials** (gitignored). Same for `.secret_key`.
 - **Language**: UI/errors/logs in Chinese (except SSH keys).
 - **CSV encoding**: `_decode_csv()` tries `utf-8-sig` → `gbk` → `gb2312`. Template downloads use `gbk`.

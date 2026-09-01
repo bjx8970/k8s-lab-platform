@@ -5,7 +5,7 @@ from functools import wraps
 
 from flask import Flask, render_template, request, jsonify, redirect, g, make_response, session
 from flask_login import LoginManager, login_user, logout_user, login_required as flask_login_required, current_user
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFError, CSRFProtect, generate_csrf
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from modules.db import (
@@ -27,6 +27,8 @@ from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster, set_on_task_update
 from modules.pg_client import PGClient, PGError
 from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor, update_vm_status
+from modules.authz import Actions, is_allowed
+from modules.audit import sanitize, security_audit
 
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from modules.ssh_terminal import SSHManager, SSHConnectionError, SessionExistsError, TooManyConnectionsError
@@ -112,19 +114,45 @@ def _cleanup_stale_votes():
                 key = f"cluster_{v['cluster_name']}" if v["type"] == "cluster" else f"{v['node']}_{v['vmid']}"
                 _vm_shutdown_pending_vms.pop(key, None)
 
+def _load_allowed_origins():
+    origins = []
+    for value in os.getenv("K8S_LAB_ALLOWED_ORIGINS", "").split(","):
+        origin = value.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            raise RuntimeError("K8S_LAB_ALLOWED_ORIGINS 不允许使用通配符 *")
+        origins.append(origin)
+    return origins
+
+
+_allowed_origins = _load_allowed_origins()
+
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev-secret-key-change-in-production")
 app.config["PERMANENT_SESSION_LIFETIME"] = 3600 * 8  # 8 小时
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+if os.getenv("K8S_LAB_ENV", "").strip().lower() == "production":
+    app.config["SESSION_COOKIE_SECURE"] = True
+else:
+    app.config["SESSION_COOKIE_SECURE"] = (
+        os.getenv("SESSION_COOKIE_SECURE", "false").strip().lower() == "true"
+    )
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login_page"
 login_manager.login_message = None
 
-csrf = CSRFProtect(app)
+csrf = CSRFProtect()
 
-socketio = SocketIO(app, async_mode="threading", cors_allowed_origins="*", manage_session=False)
+socketio = SocketIO(
+    app,
+    async_mode="threading",
+    cors_allowed_origins=_allowed_origins or None,
+    manage_session=False,
+)
 ssh_manager = SSHManager()
 ssh_manager.init_app(socketio)
 
@@ -225,20 +253,83 @@ def _needs_setup():
         return True
 
 
+def _request_origin_is_allowed(origin):
+    if not origin:
+        return True
+    normalized = origin.rstrip("/")
+    current_origin = f"{request.scheme}://{request.host}".rstrip("/")
+    return normalized == current_origin or normalized in _allowed_origins
+
+
 @app.before_request
 def before_request():
+    origin = request.headers.get("Origin")
+    if origin and not _request_origin_is_allowed(origin):
+        return jsonify({"error": "不允许的请求来源"}), 403
     if request.path.startswith("/static"):
         return
-    db_setup_paths = ("/db-config", "/api/db-config")
+    db_setup_paths = ("/db-config", "/api/db-config", "/api/csrf-token")
     if not is_db_configured() and request.path not in db_setup_paths:
         return redirect("/db-config")
     if request.path in db_setup_paths:
         return
-    if _needs_setup() and request.path not in ("/setup", "/api/setup"):
+    if _needs_setup() and request.path not in ("/setup", "/api/setup", "/api/csrf-token"):
         return redirect("/setup")
 
     if current_user.is_authenticated:
         session.permanent = True
+
+
+csrf.init_app(app)
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(error):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "CSRF 校验失败"}), 400
+    return make_response("CSRF 校验失败", 400)
+
+
+@app.after_request
+def apply_cors_and_security_audit(response):
+    origin = request.headers.get("Origin")
+    if origin and _request_origin_is_allowed(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.vary.add("Origin")
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-CSRFToken"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+
+    actor = current_user if current_user.is_authenticated else None
+    metadata = {
+        "method": request.method,
+        "path": request.path,
+        "status": response.status_code,
+    }
+    if response.status_code in (401, 403):
+        security_audit(
+            "http.authorization",
+            "denied",
+            actor=actor,
+            resource_type="http",
+            resource_id=request.path,
+            metadata=metadata,
+        )
+    elif request.method in ("POST", "PUT", "PATCH", "DELETE") and response.status_code < 400:
+        security_audit(
+            "http.write",
+            "success",
+            actor=actor,
+            resource_type="http",
+            resource_id=request.path,
+            metadata=metadata,
+        )
+    return response
+
+
+@app.route("/api/csrf-token", methods=["GET"])
+def api_csrf_token():
+    return jsonify({"csrf_token": generate_csrf()})
 
 
 @app.route("/setup")
@@ -249,7 +340,6 @@ def setup_page():
 
 
 @app.route("/api/setup", methods=["POST"])
-@csrf.exempt
 def api_setup():
     if not _needs_setup():
         return jsonify({"error": "已初始化"}), 400
@@ -283,7 +373,6 @@ def login_page():
 
 
 @app.route("/api/login", methods=["POST"])
-@csrf.exempt
 def api_login():
     data = request.get_json() or {}
     username = data.get("username", "").strip()
@@ -309,7 +398,6 @@ def api_login():
 
 
 @app.route("/api/logout", methods=["POST"])
-@csrf.exempt
 def api_logout():
     logout_user()
     return jsonify({"message": "已退出登录"})
@@ -325,7 +413,6 @@ def db_config_wizard():
 
 
 @app.route("/api/db-config", methods=["POST"])
-@csrf.exempt
 def api_db_config():
     if is_db_configured():
         return jsonify({"error": "数据库已配置"}), 400
@@ -377,7 +464,6 @@ def api_users_me():
 
 @app.route("/api/users/me/password", methods=["POST"])
 @login_required
-@csrf.exempt
 def api_change_my_password():
     data = request.get_json(force=True) or {}
     old_pw = data.get("old_password", "")
@@ -897,20 +983,45 @@ def get_pve_client(server_id=None):
     )
 
 
-def _check_vm_access(node, vmid):
+def _student_groups_for(user):
+    if getattr(user, "role", None) != "student":
+        return set()
+    return set(get_student_group_ids(user.id))
+
+
+def _is_allowed(action, resource=None):
+    return is_allowed(
+        current_user,
+        action,
+        resource,
+        student_group_ids=_student_groups_for(current_user),
+    )
+
+
+def _forbidden(message="权限不足"):
+    return jsonify({"error": message}), 403
+
+
+def _check_cluster_access(name, action=Actions.CLUSTER_READ):
+    cluster = get_cluster(name)
+    return bool(cluster and _is_allowed(action, cluster))
+
+
+def _check_vm_access(node, vmid, action=Actions.CLUSTER_READ):
     cluster = find_cluster_by_vm(node, vmid)
     if cluster:
         g._vm_cluster = cluster
-    if current_user.role == "admin":
-        return True
-    if not cluster:
-        return False
-    if current_user.role == "teacher":
-        return cluster.get("created_by") == current_user.id
-    if current_user.role == "student":
-        student_group_ids = get_student_group_ids(current_user.id)
-        return cluster.get("group_id") in student_group_ids
-    return False
+    return bool(cluster and _is_allowed(action, cluster))
+
+
+def _session_authz_resource(session):
+    owner = session.get("owner", {}) if isinstance(session, dict) else session.owner
+    owner_user_id = owner.get("user_id")
+    owner_user = get_user(owner_user_id)
+    return {
+        "owner_user_id": owner_user_id,
+        "owner_teacher_id": getattr(owner_user, "created_by", None) if owner_user else None,
+    }
 
 
 def api_error_handler(f):
@@ -983,15 +1094,14 @@ def pve_config():
         return jsonify({"message": "配置已保存"})
 
     cfg = get_config("pve") or {}
-    safe = {k: v for k, v in cfg.items() if k != "token_value"}
-    return jsonify(safe)
+    return jsonify(sanitize(cfg))
 
 
 @app.route("/api/pve/servers", methods=["GET"])
 @login_required
 @api_error_handler
 def pve_list_servers():
-    return jsonify(list_pve_servers())
+    return jsonify(sanitize(list_pve_servers()))
 
 
 @app.route("/api/pve/servers", methods=["POST"])
@@ -1165,6 +1275,8 @@ def pve_get_vms_status_batch():
         vmid = vm.get("vmid")
         if not node or not vmid:
             continue
+        if not _check_vm_access(node, vmid, Actions.CLUSTER_READ):
+            continue
         key = f"{node}_{vmid}"
         results[key] = get_cached_vm_status(node, vmid)
     return jsonify({"statuses": results})
@@ -1200,6 +1312,7 @@ def pve_get_nextid():
 
 @app.route("/api/pve/clone", methods=["POST"])
 @login_required
+@admin_required
 @api_error_handler
 def pve_clone_vm():
     data = request.get_json()
@@ -1219,6 +1332,7 @@ def pve_clone_vm():
 
 @app.route("/api/pve/create", methods=["POST"])
 @login_required
+@admin_required
 @api_error_handler
 def pve_create_vm():
     data = request.get_json()
@@ -1238,7 +1352,7 @@ def pve_create_vm():
 @login_required
 @api_error_handler
 def pve_start_vm(node, vmid):
-    if not _check_vm_access(node, vmid):
+    if not _check_vm_access(node, vmid, Actions.CLUSTER_VM_ACTION):
         return jsonify({"error": "无权访问该虚拟机"}), 403
     client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
     result = client.start_vm(node, vmid)
@@ -1250,7 +1364,7 @@ def pve_start_vm(node, vmid):
 @login_required
 @api_error_handler
 def pve_stop_vm(node, vmid):
-    if not _check_vm_access(node, vmid):
+    if not _check_vm_access(node, vmid, Actions.CLUSTER_VM_ACTION):
         return jsonify({"error": "无权访问该虚拟机"}), 403
     data = request.get_json() or {}
     force = data.get("force", False)
@@ -1262,13 +1376,14 @@ def pve_stop_vm(node, vmid):
 
 @app.route("/api/pve/vms/<node>/<int:vmid>", methods=["DELETE"])
 @login_required
+@admin_required
 @api_error_handler
 def pve_release_vm(node, vmid):
-    if not _check_vm_access(node, vmid):
-        return jsonify({"error": "无权访问该虚拟机"}), 403
-    data = request.get_json() or {}
+    if not _check_vm_access(node, vmid, Actions.CLUSTER_READ):
+        return jsonify({"error": "虚拟机不存在"}), 404
+    data = request.get_json(silent=True) or {}
     purge = data.get("purge", True)
-    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
+    client = get_pve_client(g._vm_cluster["pve_server_id"])
     result = client.release_vm(node, vmid, purge)
     return jsonify(result)
 
@@ -1325,18 +1440,18 @@ def openwrt_api_error_handler(f):
 
 @app.route("/api/openwrt/config", methods=["GET", "POST"])
 @login_required
-@admin_required
 @openwrt_api_error_handler
 def openwrt_config():
     if request.method == "POST":
+        if current_user.role != "admin":
+            return _forbidden()
         data = request.get_json() or {}
         if not data.get("host") or not data.get("username") or not data.get("password"):
             return jsonify({"error": "host、username、password 均为必填项"}), 400
         set_config("openwrt", data)
         return jsonify({"message": "配置已保存"})
     cfg = get_config("openwrt") or {}
-    safe = {k: v for k, v in cfg.items() if k != "password"}
-    return jsonify(safe)
+    return jsonify(sanitize(cfg))
 
 
 @app.route("/api/openwrt/test", methods=["POST"])
@@ -1679,32 +1794,13 @@ def openwrt_restart_dnsmasq():
 
 
 
-def _check_cluster_access(name):
-    """Check if current user can access the named cluster."""
-    if current_user.role == "admin":
-        return True
-    cluster = get_cluster(name)
-    if not cluster:
-        return False
-    if current_user.role == "teacher":
-        return cluster.get("created_by") == current_user.id
-    if current_user.role == "student":
-        student_group_ids = get_student_group_ids(current_user.id)
-        return cluster.get("group_id") in student_group_ids
-    return False
-
-
 def _filter_clusters(clusters_dict):
-    """Filter clusters dict based on user role."""
-    if current_user.role == "admin":
-        return clusters_dict
-    if current_user.role == "teacher":
-        uid = current_user.id
-        return {k: v for k, v in clusters_dict.items() if v.get("created_by") == uid}
-    if current_user.role == "student":
-        group_ids = get_student_group_ids(current_user.id)
-        return {k: v for k, v in clusters_dict.items() if v.get("group_id") in group_ids}
-    return {}
+    """Filter clusters through the shared authorization policy."""
+    return {
+        name: cluster
+        for name, cluster in clusters_dict.items()
+        if _is_allowed(Actions.CLUSTER_READ, cluster)
+    }
 
 
 def k8s_api_error_handler(f):
@@ -1735,25 +1831,17 @@ def k8s_list_clusters():
         else:
             _ow_cfg = get_config("openwrt") or {}
             entry["ssh_host"] = _ow_cfg.get("host", "")
-        if current_user.role == "student":
-            group_id = c.get("group_id")
-            if group_id:
-                gm = get_group_member(group_id, current_user.id)
-                if gm and gm.get("student_number"):
-                    student_key = f"student{gm['student_number']}"
-                    students = c.get("students", {})
-                    if student_key in students:
-                        entry["student_username"] = student_key
-                        entry["student_password"] = students[student_key]["password"]
-        safe[name] = entry
+        entry.pop("ssh_private_key", None)
+        safe[name] = sanitize(entry)
     return jsonify(safe)
 
 
 @app.route("/api/k8s/clusters", methods=["POST"])
 @login_required
-@teacher_or_admin_required
 @k8s_api_error_handler
 def k8s_create_cluster():
+    if not _is_allowed(Actions.CLUSTER_CREATE):
+        return _forbidden()
     data = request.get_json() or {}
     master_count = int(data.get("master_count", 1))
     node_count = int(data.get("node_count", 1))
@@ -1781,7 +1869,9 @@ def k8s_create_cluster():
         pve_server_id=pve_server_id,
     )
     save_cluster(name, {**cluster, "created_by": current_user.id})
-    safe = {k: v for k, v in cluster.items() if k != "ssh_private_key"}
+    safe = dict(cluster)
+    safe.pop("ssh_private_key", None)
+    safe = sanitize(safe)
     return jsonify({"name": name, "cluster": safe}), 201
 
 
@@ -1789,8 +1879,9 @@ def k8s_create_cluster():
 @login_required
 @k8s_api_error_handler
 def k8s_delete_cluster(name):
-    if not _check_cluster_access(name):
-        return jsonify({"error": "无权操作该集群"}), 403
+    cluster = get_cluster(name)
+    if not cluster or not _is_allowed(Actions.CLUSTER_DELETE, cluster):
+        return _forbidden("无权操作该集群")
     task_id = delete_cluster_async(name, created_by=current_user.id)
     return jsonify({"task_id": task_id}), 202
 
@@ -1805,9 +1896,10 @@ def k8s_force_delete_cluster(name):
 
 @app.route("/api/k8s/create", methods=["POST"])
 @login_required
-@teacher_or_admin_required
 @k8s_api_error_handler
 def k8s_create_cluster_async_route():
+    if not _is_allowed(Actions.CLUSTER_CREATE):
+        return _forbidden()
     data = request.get_json() or {}
     master_count = int(data.get("master_count", 1))
     node_count = int(data.get("node_count", 1))
@@ -1842,9 +1934,10 @@ def k8s_create_cluster_async_route():
 
 @app.route("/api/k8s/batch-create", methods=["POST"])
 @login_required
-@teacher_or_admin_required
 @k8s_api_error_handler
 def k8s_batch_create_clusters():
+    if not _is_allowed(Actions.CLUSTER_CREATE):
+        return _forbidden()
     data = request.get_json() or {}
     group_ids = data.get("group_ids", [])
     if not group_ids:
@@ -1876,7 +1969,7 @@ def k8s_batch_create_clusters():
 @k8s_api_error_handler
 def k8s_list_tasks():
     created_by = None if current_user.role == "admin" else current_user.id
-    return jsonify({"tasks": list_tasks(created_by=created_by)})
+    return jsonify({"tasks": sanitize(list_tasks(created_by=created_by))})
 
 
 @app.route("/api/k8s/tasks/<task_id>", methods=["GET"])
@@ -1886,40 +1979,32 @@ def k8s_get_task(task_id):
     status = get_task_status(task_id)
     if not status:
         return jsonify({"error": "任务不存在"}), 404
-    return jsonify(status)
+    if not _is_allowed(Actions.TASK_READ, status):
+        return _forbidden()
+    return jsonify(sanitize(status))
 
 
 @app.route("/api/k8s/tasks/<task_id>/cancel", methods=["POST"])
 @login_required
 @k8s_api_error_handler
 def k8s_cancel_task(task_id):
+    status = get_task_status(task_id)
+    if not status:
+        return jsonify({"error": "任务不存在"}), 404
+    if not _is_allowed(Actions.TASK_CANCEL, status):
+        return _forbidden()
     ok = cancel_task(task_id)
     if not ok:
         return jsonify({"error": "任务不存在"}), 404
     return jsonify({"message": "取消请求已发送"})
 
 
-@app.route("/api/k8s/clusters/<name>/ssh-key", methods=["GET"])
-@login_required
-@k8s_api_error_handler
-def k8s_get_ssh_key(name):
-    if not _check_cluster_access(name):
-        return jsonify({"error": "无权访问该集群"}), 403
-    cluster = get_cluster(name)
-    if not cluster:
-        return jsonify({"error": "Cluster not found"}), 404
-    return jsonify({
-        "private_key": cluster.get("ssh_private_key", ""),
-        "public_key": cluster.get("ssh_public_key", ""),
-    })
-
-
 @app.route("/api/k8s/clusters/<name>/deploy", methods=["POST"])
 @login_required
 @k8s_api_error_handler
 def k8s_deploy_cluster(name):
-    if not _check_cluster_access(name):
-        return jsonify({"error": "无权操作该集群"}), 403
+    if not _check_cluster_access(name, Actions.CLUSTER_DEPLOY):
+        return _forbidden("无权操作该集群")
     cluster = get_cluster(name)
     if not cluster:
         return jsonify({"error": "集群不存在"}), 404
@@ -1933,8 +2018,8 @@ def k8s_deploy_cluster(name):
 @login_required
 @k8s_api_error_handler
 def k8s_cluster_vm_action_all(name):
-    if not _check_cluster_access(name):
-        return jsonify({"error": "无权操作该集群"}), 403
+    if not _check_cluster_access(name, Actions.CLUSTER_VM_ACTION):
+        return _forbidden("无权操作该集群")
     cluster = get_cluster(name)
     if not cluster:
         return jsonify({"error": "集群不存在"}), 404
@@ -1942,8 +2027,6 @@ def k8s_cluster_vm_action_all(name):
     action = data.get("action", "")
     if action not in ("start", "stop"):
         return jsonify({"error": "无效操作"}), 400
-    if current_user.role == "student" and action == "stop":
-        return jsonify({"error": "无权操作"}), 403
     client = get_pve_client(server_id=cluster.get("pve_server_id"))
     results = []
     for vm_name, vm_info in cluster.get("vms", {}).items():
@@ -2010,6 +2093,11 @@ def api_class_vm_action_all(cid):
 @login_required
 @k8s_api_error_handler
 def k8s_logs_page(task_id):
+    status = get_task_status(task_id)
+    if not status:
+        return jsonify({"error": "任务不存在"}), 404
+    if not _is_allowed(Actions.TASK_READ, status):
+        return _forbidden()
     return render_template("k8s_logs.html", task_id=task_id)
 
 
@@ -2026,8 +2114,7 @@ def db_config():
         init_db()
         return jsonify({"message": "数据库配置已保存并重新初始化"})
     cfg = get_db_config()
-    safe = {k: v for k, v in cfg.items() if k != "password"}
-    return jsonify({"config": safe})
+    return jsonify({"config": sanitize(cfg)})
 
 
 @app.route("/api/db/status", methods=["GET"])
@@ -2067,32 +2154,50 @@ def db_test():
 
 _webssh_connect_times = {}
 
+
+def _audit_webssh(action, outcome, resource_id):
+    security_audit(
+        action,
+        outcome,
+        actor=current_user if current_user.is_authenticated else None,
+        resource_type="webssh",
+        resource_id=resource_id,
+    )
+
+
 @socketio.on("connect", namespace="/webssh")
 def webssh_connect(auth=None):
     if not current_user.is_authenticated:
+        _audit_webssh("webssh.connect", "denied", None)
         return False
 
 @socketio.on("session_create", namespace="/webssh")
 def webssh_session_create(data):
+    data = data or {}
     if not current_user.is_authenticated:
+        _audit_webssh("webssh.connect", "denied", data.get("cluster", ""))
         emit("ssh_error", {"message": "未登录"})
         return
 
     cluster_name = data.get("cluster", "")
     if not cluster_name:
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": "缺少集群名称"})
         return
 
-    if not _check_cluster_access(cluster_name):
+    if not _check_cluster_access(cluster_name, Actions.WEBSSH_CONNECT):
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": "无权访问该集群"})
         return
 
     cluster = get_cluster(cluster_name)
     if not cluster:
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": "集群不存在"})
         return
 
     if cluster.get("status") != "running":
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": "集群未运行，请先启动虚拟机"})
         return
 
@@ -2103,6 +2208,7 @@ def webssh_session_create(data):
             break
 
     if not client_vm:
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": "未找到客户端虚拟机"})
         return
 
@@ -2110,6 +2216,7 @@ def webssh_session_create(data):
     sid = request.sid
     prev = _webssh_connect_times.get(sid, 0)
     if now - prev < 10:
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": "操作过于频繁，请稍后再试"})
         return
     _webssh_connect_times[sid] = now
@@ -2134,12 +2241,15 @@ def webssh_session_create(data):
                     username = student_key
                     password = students[student_key]["password"]
                 else:
+                    _audit_webssh("webssh.connect", "denied", cluster_name)
                     emit("ssh_error", {"message": "未找到该学生的集群账户"})
                     return
             else:
+                _audit_webssh("webssh.connect", "denied", cluster_name)
                 emit("ssh_error", {"message": "未找到该学生的集群账户"})
                 return
         else:
+            _audit_webssh("webssh.connect", "denied", cluster_name)
             emit("ssh_error", {"message": "集群未关联组"})
             return
     else:
@@ -2163,13 +2273,18 @@ def webssh_session_create(data):
             "cluster": cluster_name,
         })
         _emit_session_update(cluster_name, current_user.id, "created")
+        _audit_webssh("webssh.connect", "success", cluster_name)
     except SessionExistsError as e:
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": str(e)})
     except TooManyConnectionsError as e:
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": str(e)})
     except SSHConnectionError as e:
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": str(e)})
     except Exception as e:
+        _audit_webssh("webssh.connect", "denied", cluster_name)
         emit("ssh_error", {"message": f"连接失败: {e}"})
 
 @socketio.on("session_reconnect", namespace="/webssh")
@@ -2183,9 +2298,17 @@ def webssh_session_reconnect(data):
         emit("ssh_error", {"message": "缺少集群名称"})
         return
 
+    if not _check_cluster_access(cluster_name, Actions.WEBSSH_CONNECT):
+        emit("ssh_error", {"message": "无权访问该集群"})
+        return
+
     session = ssh_manager.get_session_by_cluster(current_user.id, cluster_name)
     if not session:
         emit("ssh_error", {"message": "会话不存在"})
+        return
+
+    if session.owner.get("user_id") != current_user.id:
+        emit("ssh_error", {"message": "无权访问该会话"})
         return
 
     if session.status == "terminated":
@@ -2220,39 +2343,58 @@ def webssh_session_reconnect(data):
 
 @socketio.on("session_terminate", namespace="/webssh")
 def webssh_session_terminate(data):
+    data = data or {}
     if not current_user.is_authenticated:
+        _audit_webssh("webssh.terminate_own", "denied", data.get("cluster", ""))
         emit("ssh_error", {"message": "未登录"})
         return
 
     cluster_name = data.get("cluster", "")
     if not cluster_name:
+        _audit_webssh("webssh.terminate_own", "denied", cluster_name)
         emit("ssh_error", {"message": "缺少集群名称"})
+        return
+
+    session = ssh_manager.get_session_by_cluster(current_user.id, cluster_name)
+    if not session or not _is_allowed(
+        Actions.WEBSSH_TERMINATE_OWN,
+        _session_authz_resource(session),
+    ):
+        _audit_webssh(
+            "webssh.terminate_own",
+            "denied",
+            session.session_id if session else cluster_name,
+        )
+        emit("ssh_error", {"message": "会话不存在或无权终止"})
         return
 
     ok = ssh_manager.terminate_by_owner(current_user.id, cluster_name)
     if ok:
         emit("session_terminated", {"cluster": cluster_name})
         _emit_session_update(cluster_name, current_user.id, "terminated")
+        _audit_webssh("webssh.terminate_own", "success", session.session_id)
     else:
+        _audit_webssh("webssh.terminate_own", "denied", session.session_id)
         emit("ssh_error", {"message": "会话不存在或无权终止"})
 
 @socketio.on("takeover_start", namespace="/webssh")
 def webssh_takeover_start(data):
+    data = data or {}
     if not current_user.is_authenticated:
+        _audit_webssh("webssh.observe", "denied", data.get("session_id", ""))
         emit("ssh_error", {"message": "未登录"})
-        return
-    if current_user.role not in ("admin", "teacher"):
-        emit("ssh_error", {"message": "权限不足"})
         return
 
     session_id = data.get("session_id", "")
     session = ssh_manager.get_session(session_id)
     if not session:
+        _audit_webssh("webssh.observe", "denied", session_id)
         emit("ssh_error", {"message": "会话不存在"})
         return
 
-    if not _check_cluster_access(session.cluster_name):
-        emit("ssh_error", {"message": "无权访问该集群"})
+    if not _is_allowed(Actions.WEBSSH_OBSERVE, _session_authz_resource(session)):
+        _audit_webssh("webssh.observe", "denied", session_id)
+        emit("ssh_error", {"message": "权限不足"})
         return
 
     sid = request.sid
@@ -2263,6 +2405,7 @@ def webssh_takeover_start(data):
         if replay:
             emit("log_replay", {"lines": replay})
         emit("takeover_started", {"session_id": session_id, "cluster": session.cluster_name})
+        _audit_webssh("webssh.observe", "success", session_id)
         return
 
     ok, result = ssh_manager.takeover_session(session_id, {
@@ -2271,6 +2414,7 @@ def webssh_takeover_start(data):
         "role": current_user.role,
     })
     if not ok:
+        _audit_webssh("webssh.observe", "denied", session_id)
         emit("ssh_error", {"message": result})
         return
 
@@ -2288,6 +2432,7 @@ def webssh_takeover_start(data):
     _emit_session_update(session.cluster_name, session.owner["user_id"], "takeover_start", {
         "taker": current_user.username,
     })
+    _audit_webssh("webssh.observe", "success", session_id)
 
 @socketio.on("takeover_stop", namespace="/webssh")
 def webssh_takeover_stop(data):
@@ -2314,21 +2459,22 @@ def webssh_takeover_stop(data):
 
 @socketio.on("view_start", namespace="/webssh")
 def webssh_view_start(data):
+    data = data or {}
     if not current_user.is_authenticated:
+        _audit_webssh("webssh.observe", "denied", data.get("session_id", ""))
         emit("ssh_error", {"message": "未登录"})
-        return
-    if current_user.role not in ("admin", "teacher"):
-        emit("ssh_error", {"message": "权限不足"})
         return
 
     session_id = data.get("session_id", "")
     session = ssh_manager.get_session(session_id)
     if not session:
+        _audit_webssh("webssh.observe", "denied", session_id)
         emit("ssh_error", {"message": "会话不存在"})
         return
 
-    if not _check_cluster_access(session.cluster_name):
-        emit("ssh_error", {"message": "无权访问该集群"})
+    if not _is_allowed(Actions.WEBSSH_OBSERVE, _session_authz_resource(session)):
+        _audit_webssh("webssh.observe", "denied", session_id)
+        emit("ssh_error", {"message": "权限不足"})
         return
 
     sid = request.sid
@@ -2339,9 +2485,13 @@ def webssh_view_start(data):
         emit("log_replay", {"lines": replay})
 
     emit("view_started", {"session_id": session_id, "cluster": session.cluster_name})
+    _audit_webssh("webssh.observe", "success", session_id)
 
 @socketio.on("view_stop", namespace="/webssh")
 def webssh_view_stop(data):
+    if not current_user.is_authenticated:
+        emit("ssh_error", {"message": "未登录"})
+        return
     session_id = data.get("session_id", "")
     ssh_manager.unview_session(request.sid)
     emit("view_stopped", {"session_id": session_id})
@@ -2411,12 +2561,16 @@ def webssh_reconnect_response(data):
 
 @socketio.on("ssh_data", namespace="/webssh")
 def webssh_ssh_data(data):
+    if not current_user.is_authenticated:
+        return
     raw = data.get("data", "")
     if raw:
         ssh_manager.write(request.sid, raw)
 
 @socketio.on("ssh_resize", namespace="/webssh")
 def webssh_ssh_resize(data):
+    if not current_user.is_authenticated:
+        return
     cols = data.get("cols", 80)
     rows = data.get("rows", 24)
     ssh_manager.resize(request.sid, cols, rows)
@@ -2758,7 +2912,6 @@ def _emit_task_update(task_id, status, progress, message, created_by, queue):
     if created_by:
         socketio.emit("task_update", data, to=f"user_{created_by}", namespace="/state")
     socketio.emit("task_update", data, to="admin", namespace="/state")
-    socketio.emit("task_update", data, to="teacher", namespace="/state")
 
 
 set_on_task_update(_emit_task_update)
@@ -2772,7 +2925,15 @@ def _emit_session_update(cluster_name, user_id, action, extra=None):
         data.update(extra)
     socketio.emit("session_update", data, to=f"user_{user_id}", namespace="/state")
     socketio.emit("session_update", data, to="admin", namespace="/state")
-    socketio.emit("session_update", data, to="teacher", namespace="/state")
+    owner_user = get_user(user_id)
+    teacher_id = getattr(owner_user, "created_by", None) if owner_user else None
+    if teacher_id:
+        socketio.emit(
+            "session_update",
+            data,
+            to=f"user_{teacher_id}",
+            namespace="/state",
+        )
 
 
 def _on_takeover_released(session):
@@ -2798,7 +2959,11 @@ def api_webssh_sessions():
     if current_user.role == "admin":
         sessions = ssh_manager.list_sessions()
     elif current_user.role == "teacher":
-        sessions = ssh_manager.list_sessions(filter_role="student")
+        sessions = [
+            session
+            for session in ssh_manager.list_sessions(filter_role="student")
+            if _is_allowed(Actions.WEBSSH_OBSERVE, _session_authz_resource(session))
+        ]
     else:
         sessions = ssh_manager.list_sessions(filter_user_id=current_user.id)
     return jsonify({"sessions": sessions})
@@ -2822,9 +2987,15 @@ def api_webssh_cluster_status(name):
 @app.route("/api/teacher/student-sessions", methods=["GET"])
 @login_required
 def api_teacher_student_sessions():
-    if current_user.role not in ("admin", "teacher"):
-        return jsonify({"error": "权限不足"}), 403
+    if current_user.role == "student":
+        return _forbidden()
     sessions = ssh_manager.list_sessions(filter_role="student")
+    if current_user.role == "teacher":
+        sessions = [
+            session
+            for session in sessions
+            if _is_allowed(Actions.WEBSSH_OBSERVE, _session_authz_resource(session))
+        ]
     return jsonify({"sessions": sessions})
 
 @app.route("/api/admin/webssh/config", methods=["GET"])
@@ -2856,13 +3027,14 @@ def api_admin_webssh_terminate(session_id):
 @app.route("/api/webssh/sessions/<cluster_name>/terminate", methods=["POST"])
 @login_required
 def api_webssh_terminate_session(cluster_name):
-    if not _check_cluster_access(cluster_name):
-        return jsonify({"error": "无权访问该集群"}), 403
     session = ssh_manager.get_session_by_cluster(current_user.id, cluster_name)
     if not session:
         return jsonify({"error": "会话不存在"}), 404
-    if session.owner.get("user_id") != current_user.id:
-        return jsonify({"error": "无权终止"}), 403
+    if not _is_allowed(
+        Actions.WEBSSH_TERMINATE_OWN,
+        _session_authz_resource(session),
+    ):
+        return _forbidden("无权终止")
     targets = list(session._get_all_targets())
     ssh_manager.terminate_by_owner(current_user.id, cluster_name)
     for sid in targets:
