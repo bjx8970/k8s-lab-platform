@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 import re
 import sys
 import unittest
@@ -24,15 +25,22 @@ USERS = {
 
 def import_isolated_app():
     """Import app without database initialization or background monitoring."""
-    import modules.db as db_module
-    import modules.ssh_terminal as ssh_terminal_module
-    import modules.status_cache as status_cache_module
+    real_exists = os.path.exists
+    def safe_exists(path):
+        if os.path.basename(os.fspath(path)) in {".db_config.json", ".secret_key", ".credential_key"}:
+            return False
+        return real_exists(path)
+    with patch("os.path.exists", side_effect=safe_exists):
+        import modules.db as db_module
+        import modules.ssh_terminal as ssh_terminal_module
+        import modules.status_cache as status_cache_module
 
     sys.modules.pop("app", None)
     with (
         patch.object(db_module, "is_db_configured", return_value=False),
         patch.object(ssh_terminal_module, "db_get_config", return_value=None),
         patch.object(status_cache_module, "start_monitor"),
+        patch.object(ssh_terminal_module.SSHManager, "_start_cleanup_thread"),
     ):
         module = importlib.import_module("app")
 
@@ -40,6 +48,8 @@ def import_isolated_app():
     module.is_db_configured = lambda: True
     module._needs_setup = lambda: False
     module.login_manager.user_loader(lambda user_id: USERS.get(str(user_id)))
+    module.get_user = lambda user_id: USERS.get(str(user_id))
+    module.get_student_group_ids = lambda user_id: []
     return module
 
 
@@ -53,10 +63,15 @@ class SecurityContractTests(unittest.TestCase):
         cls.template_path = cls.source_path.parent / "templates" / "k8s.html"
 
     def setUp(self):
+        self._db_guard = patch("modules.db.session_scope", side_effect=AssertionError("real DB access forbidden"))
+        self._db_guard.start()
+        self.addCleanup(self._db_guard.stop)
         self._original_allowed_origins = list(app_module._allowed_origins)
         app_module._allowed_origins = []
         app_module._online_users.clear()
         app_module._webssh_connect_times.clear()
+        app_module._state_sid_users.clear()
+        app_module._webssh_sid_users.clear()
 
     def tearDown(self):
         app_module._allowed_origins = self._original_allowed_origins
@@ -325,7 +340,7 @@ class SecurityContractTests(unittest.TestCase):
                 owner, "POST", f"/api/k8s/tasks/{task_id}/cancel"
             )
         self.assertEqual(response.status_code, 200)
-        cancel_mock.assert_called_once_with(task_id)
+        cancel_mock.assert_called_once_with(task_id, actor_id=2)
 
         owner = self.client_for(2)
         with (

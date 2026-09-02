@@ -247,13 +247,13 @@ async function openEditModal(id) {
         $('f-port').value = s.port;
         $('f-user').value = s.user;
         $('f-token-name').value = s.token_name;
-        $('f-token-value').value = '****';
+        $('f-token-value').value = '[REDACTED]';
         $('f-node').value = s.node;
         $('f-template-vmid').value = s.template_vmid || 9000;
         $('f-ow-host').value = s.ow_host || '';
         $('f-ow-port').value = s.ow_port || 22;
         $('f-ow-username').value = s.ow_username || '';
-        $('f-ow-password').value = s.ow_password && s.ow_password !== '****' ? s.ow_password : '****';
+        $('f-ow-password').value = '[REDACTED]';
     } catch (e) {
         $('form-error').textContent = '加载失败: ' + e.message;
         $('form-error').style.display = 'block';
@@ -288,11 +288,11 @@ async function saveServer() {
     if (!data.host) missing.push('服务器 IP');
     if (!data.user) missing.push('用户');
     if (!data.token_name) missing.push('API Name');
-    if (!data.token_value || data.token_value === '****') missing.push('API Token');
+    if (!_editingId && (!data.token_value || data.token_value === '****' || data.token_value === '[REDACTED]')) missing.push('API Token');
     if (!data.node) missing.push('节点名');
     if (!data.ow_host) missing.push('OpenWrt IP');
     if (!data.ow_username) missing.push('OpenWrt 用户');
-    if (!data.ow_password || data.ow_password === '****') missing.push('OpenWrt 密码');
+    if (!_editingId && (!data.ow_password || data.ow_password === '****' || data.ow_password === '[REDACTED]')) missing.push('OpenWrt 密码');
     if (missing.length) {
         errEl.textContent = '请填写必填项: ' + missing.join(', ');
         errEl.style.display = 'block';
