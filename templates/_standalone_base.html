@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{% block title %}K8s Lab Platform{% endblock %}</title>
     <style>
         :root {
@@ -54,6 +55,37 @@
         .error { color:var(--danger); font-size:13px; margin-top:10px; text-align:center; display:none; }
         @keyframes fadeIn { from{opacity:0;transform:translateY(-10px)} to{opacity:1;transform:translateY(0)} }
     </style>
+    <script>
+    (function () {
+        const originalFetch = window.fetch.bind(window);
+        const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
+        const protectedMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+        window.fetch = function (input, init) {
+            let target;
+            try {
+                target = new URL(input instanceof Request ? input.url : String(input), window.location.href);
+            } catch (error) {
+                return originalFetch(input, init);
+            }
+
+            const method = String(
+                (init && init.method) || (input instanceof Request ? input.method : 'GET')
+            ).toUpperCase();
+            if (target.origin !== window.location.origin || !protectedMethods.has(method)) {
+                return originalFetch(input, init);
+            }
+
+            const headers = new Headers(
+                (init && init.headers) || (input instanceof Request ? input.headers : undefined)
+            );
+            if (!headers.has('X-CSRFToken')) {
+                headers.set('X-CSRFToken', csrfToken);
+            }
+            return originalFetch(input, Object.assign({}, init || {}, {headers: headers}));
+        };
+    })();
+    </script>
     {% block extra_head %}{% endblock %}
 </head>
 <body>

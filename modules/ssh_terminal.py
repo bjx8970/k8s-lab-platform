@@ -7,6 +7,7 @@ from collections import deque
 import paramiko
 
 from modules.db import get_config as db_get_config, set_config as db_set_config
+from modules.audit import SecretTextSanitizer, sanitize_text
 
 
 class SSHConnectionError(Exception):
@@ -56,14 +57,40 @@ class SSHSession:
 
         self._lock = threading.Lock()
         self._closed = False
+        self._binding_authorizer = None
+        self._text_sanitizer = SecretTextSanitizer()
+
+    def set_binding_authorizer(self, callback):
+        """Set the callback used to authorize every bound WebSocket.
+
+        The callback is deliberately kept outside this class's lock.  The
+        application callback may need to consult the database, and invoking it
+        while holding the session/manager locks would make disconnect and
+        cleanup paths susceptible to lock inversion.
+        """
+        self._binding_authorizer = callback
 
     def _emit(self, socketio, event, data, to=None):
-        if not socketio:
+        if not socketio or not to or not self._allowed(to):
             return
-        if to:
-            socketio.emit(event, data, to=to, namespace="/webssh")
-        else:
-            socketio.emit(event, data, namespace="/webssh")
+        socketio.emit(event, data, to=to, namespace="/webssh")
+
+    def _role_for(self, sid):
+        if sid and sid == self.owner_sid:
+            return "owner"
+        if sid and sid == self.takeover_sid:
+            return "takeover"
+        if sid and sid in self.viewer_sids:
+            return "viewer"
+        return None
+
+    def _allowed(self, sid):
+        role = self._role_for(sid)
+        try:
+            return bool(role and self._binding_authorizer
+                        and self._binding_authorizer(sid, self, role))
+        except Exception:
+            return False
 
     def connect(self, socketio):
         try:
@@ -73,10 +100,10 @@ class SSHSession:
             self.transport.connect(username=self.ssh_user, password=self.ssh_pass)
         except paramiko.AuthenticationException:
             raise SSHConnectionError("SSH 认证失败，请检查密码")
-        except paramiko.SSHException as e:
-            raise SSHConnectionError(f"SSH 连接失败: {e}")
-        except (OSError, socket.timeout) as e:
-            raise SSHConnectionError(f"无法连接到虚拟机 ({self.host}:{self.port}): {e}")
+        except paramiko.SSHException:
+            raise SSHConnectionError("SSH 连接失败") from None
+        except (OSError, socket.timeout):
+            raise SSHConnectionError("无法连接到虚拟机") from None
 
         self.channel = self.transport.open_session()
         self.channel.get_pty(term="xterm", width=80, height=24)
@@ -99,7 +126,9 @@ class SSHSession:
                 try:
                     data = self.channel.recv(4096)
                     if data:
-                        text = data.decode("utf-8", errors="replace")
+                        text = sanitize_text(self._text_sanitizer.feed(
+                            data.decode("utf-8", errors="replace")
+                        ))
                         self.last_activity = time.time()
                         self.log_buffer.append(text)
                         self.log_buffer_raw.append(text)
@@ -118,12 +147,24 @@ class SSHSession:
                 self._on_close(socketio)
 
     def _get_all_targets(self):
-        targets = set()
+        bindings = []
         if self.owner_sid:
-            targets.add(self.owner_sid)
+            bindings.append((self.owner_sid, "owner"))
         if self.takeover_sid:
-            targets.add(self.takeover_sid)
-        targets.update(self.viewer_sids)
+            bindings.append((self.takeover_sid, "takeover"))
+        bindings.extend((sid, "viewer") for sid in tuple(self.viewer_sids))
+
+        targets = set()
+        for sid, role in bindings:
+            authorizer = self._binding_authorizer
+            if authorizer is None:
+                continue
+            try:
+                allowed = bool(authorizer(sid, self, role))
+            except Exception:
+                allowed = False
+            if allowed:
+                targets.add(sid)
         return targets
 
     def _on_close(self, socketio):
@@ -136,7 +177,7 @@ class SSHSession:
             self._emit(socketio, "ssh_disconnected", {"reason": "连接已断开"}, to=sid)
 
     def write(self, data, from_sid):
-        if self._closed or not self.channel:
+        if self._closed or not self.channel or not self._allowed(from_sid):
             return False
         # Check if this sid is allowed to send input
         if self.takeover_active:
@@ -154,6 +195,8 @@ class SSHSession:
                 self.channel.send(data)
             else:
                 for i in range(0, len(data), chunk_size):
+                    if not self._allowed(from_sid):
+                        return False
                     chunk = data[i:i + chunk_size]
                     self.channel.send(chunk)
                     time.sleep(0.01)
@@ -162,23 +205,25 @@ class SSHSession:
             return False
 
     def resize(self, cols, rows, from_sid):
-        if self._closed or not self.channel:
-            return
+        if self._closed or not self.channel or not self._allowed(from_sid):
+            return False
         if self.takeover_active:
             if from_sid != self.takeover_sid:
-                return
+                return False
         else:
             if from_sid != self.owner_sid:
-                return
+                return False
         try:
             self.channel.resize_pty(width=cols, height=rows)
+            return True
         except Exception:
-            pass
+            return False
 
     def bind_owner(self, sid):
         self.owner_sid = sid
-        self.status = "connected"
-        self.disconnected_at = None
+        if self.channel and not self.channel.closed:
+            self.status = "connected"
+            self.disconnected_at = None
 
     def bind_takeover(self, sid, user_info):
         self.takeover_sid = sid
@@ -221,8 +266,10 @@ class SSHSession:
         self.reconnect_requestor = None
         self.reconnect_expires_at = None
 
-    def get_log_replay(self):
-        return "".join(self.log_buffer)
+    def get_log_replay(self, sid=None):
+        if not self._allowed(sid):
+            return ""
+        return sanitize_text("".join(self.log_buffer))
 
     def close(self):
         self._closed = True
@@ -264,6 +311,8 @@ class SSHManager:
         self._sessions = {}
         self._user_cluster_map = {}
         self._ws_to_session = {}
+        self._ws_roles = {}
+        self._authorizer = None
         self._socketio = socketio
         self._on_session_terminated = None
         self._on_owner_disconnect = None
@@ -292,6 +341,45 @@ class SSHManager:
 
     def set_on_takeover_released(self, callback):
         self._on_takeover_released = callback
+
+    def set_authorizer(self, callback):
+        """Install the application authorization callback.
+
+        No callback means deny all sensitive WebSSH bindings.  This fail-closed
+        default also makes standalone manager use safe until the application
+        has wired the current-user/resource policy.
+        """
+        self._authorizer = callback
+        with self._lock:
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            session.set_binding_authorizer(self._authorize_binding)
+
+    def _revoke_ws(self, sid, session):
+        with self._lock:
+            if self._ws_to_session.get(sid) != session.session_id:
+                return
+            self._ws_to_session.pop(sid, None)
+            self._ws_roles.pop(sid, None)
+        if session.owner_sid == sid:
+            session.unbind_owner(sid)
+        elif session.takeover_sid == sid:
+            session.unbind_takeover(sid)
+        else:
+            session.unbind_viewer(sid)
+
+    def _authorize_binding(self, sid, session, role):
+        callback = self._authorizer
+        if callback is None:
+            allowed = False
+        else:
+            try:
+                allowed = bool(callback(sid, session, role))
+            except Exception:
+                allowed = False
+        if not allowed:
+            self._revoke_ws(sid, session)
+        return allowed
 
     def init_app(self, socketio):
         self._socketio = socketio
@@ -362,15 +450,18 @@ class SSHManager:
             session = SSHSession(
                 session_id, cluster_name, owner, host, port, ssh_user, ssh_pass
             )
+            session.set_binding_authorizer(self._authorize_binding)
             self._sessions[session_id] = session
             self._user_cluster_map[key] = session_id
             return session
 
-    def connect_session(self, session_id):
+    def connect_session(self, session_id, sid=None):
         with self._lock:
             session = self._sessions.get(session_id)
         if not session:
             raise SSHConnectionError("会话不存在")
+        if not self.authorize_ws(sid, session_id, "owner"):
+            raise SSHConnectionError("无权连接该会话")
         session.connect(self._socketio)
 
     def get_session_by_cluster(self, user_id, cluster_name):
@@ -384,16 +475,64 @@ class SSHManager:
     def get_session(self, session_id):
         return self._sessions.get(session_id)
 
+    def authorize_ws(self, sid, session_id=None, role=None):
+        with self._lock:
+            bound_id = self._ws_to_session.get(sid)
+            bound_role = self._ws_roles.get(sid)
+            session = self._sessions.get(bound_id)
+        if not session or (session_id is not None and session_id != bound_id):
+            return False
+        if role is not None and role != bound_role:
+            return False
+        return self._authorize_binding(sid, session, bound_role)
+
+    def bound_session(self, sid):
+        with self._lock:
+            return self._sessions.get(self._ws_to_session.get(sid))
+
+    def emit_to(self, session, event, data, sid):
+        if not sid or not self.authorize_ws(sid, session.session_id):
+            return False
+        session._emit(self._socketio, event, data, to=sid)
+        return True
+
+    def replay(self, sid):
+        session = self.bound_session(sid)
+        if not session or not self.authorize_ws(sid, session.session_id):
+            return False
+        replay = session.get_log_replay(sid)
+        if replay:
+            return self.emit_to(session, "log_replay", {"lines": replay}, sid)
+        return True
+
     def bind_ws(self, sid, session_id, role="owner"):
+        if role not in {"owner", "takeover", "viewer"}:
+            return False
         with self._lock:
             session = self._sessions.get(session_id)
         if not session:
             return False
-        self._ws_to_session[sid] = session_id
+        if not self._authorize_binding(sid, session, role):
+            return False
+
+        with self._lock:
+            previous_id = self._ws_to_session.get(sid)
+            previous_role = self._ws_roles.get(sid)
+        if previous_id and (previous_id != session_id or previous_role != role):
+            self.unbind_ws(sid)
+        displaced_sid = session.owner_sid if role == "owner" else (
+            session.takeover_sid if role == "takeover" else None
+        )
+        takeover_by = session.takeover_by
+        if displaced_sid and displaced_sid != sid:
+            self._revoke_ws(displaced_sid, session)
+        with self._lock:
+            self._ws_to_session[sid] = session_id
+            self._ws_roles[sid] = role
         if role == "owner":
             session.bind_owner(sid)
         elif role == "takeover":
-            session.takeover_sid = sid
+            session.bind_takeover(sid, takeover_by or {})
         elif role == "viewer":
             session.bind_viewer(sid)
         return True
@@ -401,6 +540,7 @@ class SSHManager:
     def unbind_ws(self, sid):
         with self._lock:
             session_id = self._ws_to_session.pop(sid, None)
+            self._ws_roles.pop(sid, None)
         if session_id:
             session = self._sessions.get(session_id)
             if session:
@@ -418,18 +558,22 @@ class SSHManager:
     def write(self, sid, data):
         with self._lock:
             session_id = self._ws_to_session.get(sid)
+            role = self._ws_roles.get(sid)
         if session_id:
             session = self._sessions.get(session_id)
-            if session:
-                session.write(data, sid)
+            if session and role and self._authorize_binding(sid, session, role):
+                return session.write(data, sid)
+        return False
 
     def resize(self, sid, cols, rows):
         with self._lock:
             session_id = self._ws_to_session.get(sid)
+            role = self._ws_roles.get(sid)
         if session_id:
             session = self._sessions.get(session_id)
-            if session:
-                session.resize(cols, rows, sid)
+            if session and role and self._authorize_binding(sid, session, role):
+                return session.resize(cols, rows, sid)
+        return False
 
     def terminate_session(self, session_id):
         with self._lock:
@@ -437,6 +581,11 @@ class SSHManager:
             if session:
                 key = f"{session.owner['user_id']}:{session.cluster_name}"
                 self._user_cluster_map.pop(key, None)
+                bound_sids = [sid for sid, value in self._ws_to_session.items()
+                              if value == session_id]
+                for sid in bound_sids:
+                    self._ws_to_session.pop(sid, None)
+                    self._ws_roles.pop(sid, None)
         if session:
             session.close()
         return session is not None
@@ -451,38 +600,41 @@ class SSHManager:
                 return self.terminate_session(session_id)
         return False
 
-    def takeover_session(self, session_id, user_info):
+    def takeover_session(self, session_id, user_info, sid=None):
         with self._lock:
             session = self._sessions.get(session_id)
         if not session:
             return False, "会话不存在"
-        if session.takeover_active:
+        if not sid or not self._authorize_binding(sid, session, "takeover"):
+            return False, "权限不足"
+        if session.takeover_active and session.takeover_by != user_info:
             return False, "该会话已被其他用户接管"
         session.takeover_active = True
         session.takeover_by = user_info
+        if not self.bind_ws(sid, session_id, "takeover"):
+            session.release_takeover()
+            return False, "权限不足"
         return True, session
 
-    def release_takeover(self, session_id):
+    def release_takeover(self, session_id, sid=None):
+        if not self.authorize_ws(sid, session_id, "takeover"):
+            return False
         with self._lock:
             session = self._sessions.get(session_id)
         if session:
-            session.release_takeover()
+            self.unbind_ws(sid)
             return True
         return False
 
     def view_session(self, session_id, sid):
-        with self._lock:
-            session = self._sessions.get(session_id)
-        if not session:
-            return False
-        session.bind_viewer(sid)
-        self._ws_to_session[sid] = session_id
-        return True
+        return self.bind_ws(sid, session_id, role="viewer")
 
     def unview_session(self, sid):
         self.unbind_ws(sid)
 
-    def request_reconnect(self, session_id, user_info):
+    def request_reconnect(self, session_id, user_info, sid=None):
+        if not self.authorize_ws(sid, session_id, "owner"):
+            return False, "权限不足"
         with self._lock:
             session = self._sessions.get(session_id)
         if not session:
@@ -490,13 +642,15 @@ class SSHManager:
         session.request_reconnect(user_info)
         return True, session
 
-    def respond_reconnect(self, session_id, accepted):
+    def respond_reconnect(self, session_id, accepted, sid=None):
+        if not self.authorize_ws(sid, session_id, "takeover"):
+            return False
         with self._lock:
             session = self._sessions.get(session_id)
         if not session:
             return False
         if accepted:
-            session.release_takeover()
+            self.unbind_ws(sid)
             session.clear_reconnect_request()
         else:
             session.clear_reconnect_request()
@@ -542,14 +696,22 @@ class SSHManager:
         })
 
     def _remove_session(self, session_id):
-        session = self._sessions.pop(session_id, None)
+        with self._lock:
+            session = self._sessions.pop(session_id, None)
         if session:
             key = f"{session.owner['user_id']}:{session.cluster_name}"
             self._user_cluster_map.pop(key, None)
+            with self._lock:
+                bound_sids = [sid for sid, value in self._ws_to_session.items()
+                              if value == session_id]
+                for sid in bound_sids:
+                    self._ws_to_session.pop(sid, None)
+                    self._ws_roles.pop(sid, None)
             session.close()
 
     def stop(self):
         self._cleanup_running = False
         with self._lock:
-            for sid in list(self._sessions):
-                self._remove_session(sid)
+            session_ids = list(self._sessions)
+        for sid in session_ids:
+            self._remove_session(sid)

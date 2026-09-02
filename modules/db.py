@@ -11,6 +11,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, selectinload
 
+from modules.credential_store import decrypt_secret, encrypt_secret
+
+
+REDACTED = "[REDACTED]"
+_SECRET_PLACEHOLDERS = frozenset(("", "****", REDACTED))
+
 DB_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".db_config.json")
 
 
@@ -43,6 +49,7 @@ def _create_engine():
             url, echo=False,
             pool_size=10, max_overflow=20,
             pool_pre_ping=True, pool_recycle=3600,
+            hide_parameters=True,
         )
     except Exception:
         return None
@@ -115,13 +122,13 @@ class PVEServer(Base):
     port = Column(Integer, default=8006)
     user = Column(String(64), nullable=False)
     token_name = Column(String(64), nullable=False)
-    token_value = Column(String(256), nullable=False)
+    token_value = Column(Text, nullable=False)
     node = Column(String(64), default="")
     template_vmid = Column(Integer, default=9000)
     ow_host = Column(String(128), default="")
     ow_port = Column(Integer, default=22)
     ow_username = Column(String(64), default="")
-    ow_password = Column(String(256), default="")
+    ow_password = Column(Text, default="")
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -192,17 +199,76 @@ class GroupMember(Base):
 def get_config(key):
     with session_scope() as session:
         row = session.query(Config).filter_by(key=key).first()
-        return json.loads(row.value) if row else None
+        return _decode_config(key, json.loads(row.value)) if row else None
 
 
 def set_config(key, value):
     with session_scope(commit=True) as session:
         row = session.query(Config).filter_by(key=key).first()
-        val = json.dumps(value, ensure_ascii=False)
+        previous = json.loads(row.value) if row else {}
+        stored = _prepare_config_for_storage(key, value, previous)
+        val = json.dumps(stored, ensure_ascii=False)
         if row:
             row.value = val
         else:
             session.add(Config(key=key, value=val))
+
+
+def _config_secret_fields(key):
+    if key in {"pve", "openwrt"}:
+        return ("password", "token_value")
+    return ()
+
+
+def _is_secret_placeholder(value):
+    return value is None or (isinstance(value, str) and value in _SECRET_PLACEHOLDERS)
+
+
+def _stored_secret(value):
+    return encrypt_secret(value)
+
+
+def _decode_config(key, value):
+    if not isinstance(value, dict):
+        return value
+    decoded = dict(value)
+    # Reading an old plaintext value deliberately raises CredentialError.  A
+    # caller must run the explicit migration after configuring the key.
+    for field in _config_secret_fields(key):
+        if decoded.get(field) not in (None, ""):
+            decoded[field] = decrypt_secret(decoded[field])
+    return decoded
+
+
+def _prepare_config_for_storage(key, value, previous):
+    if key not in {"pve", "openwrt"} or not isinstance(value, dict):
+        return value
+    stored = dict(previous or {})
+    stored.update(value)
+    if key == "pve" and "token_name" in value and _is_secret_placeholder(value["token_name"]):
+        old_token_name = (previous or {}).get("token_name")
+        if old_token_name not in (None, ""):
+            stored["token_name"] = old_token_name
+        elif value["token_name"] in {"****", REDACTED}:
+            raise ValueError("token_name 不能使用脱敏占位符创建凭据标识")
+    for field in _config_secret_fields(key):
+        incoming_present = field in value
+        incoming = value.get(field) if incoming_present else None
+        old = (previous or {}).get(field)
+        if incoming_present and _is_secret_placeholder(incoming):
+            if old not in (None, ""):
+                stored[field] = old
+            elif isinstance(incoming, str) and incoming in {"****", REDACTED}:
+                raise ValueError(f"{field} 不能使用脱敏占位符创建凭据")
+            else:
+                stored[field] = incoming
+        elif incoming_present:
+            stored[field] = _stored_secret(incoming)
+        elif old not in (None, ""):
+            stored[field] = old
+        if stored.get(field) not in (None, ""):
+            stored[field] = _stored_secret(stored[field])
+    return stored
 
 
 def delete_config(key):
@@ -215,20 +281,25 @@ def migrate_pve_config():
         result = session.execute(text("SELECT 1 FROM pve_servers LIMIT 1"))
         if result.fetchone():
             return
-        cfg = get_config("pve")
-        if not cfg:
+        row = session.query(Config).filter_by(key="pve").first()
+        if not row:
             return
+        cfg = json.loads(row.value)
+        token_value = cfg.get("token_value", "")
+        # Structural migration only: plaintext requires the explicit migration
+        # first, while authenticated ciphertext is copied without re-encryption.
+        decrypt_secret(token_value)
         server = PVEServer(
             name="default",
             host=cfg.get("host", ""),
             port=int(cfg.get("port", 8006)),
             user=cfg.get("user", ""),
             token_name=cfg.get("token_name", ""),
-            token_value=cfg.get("token_value", ""),
+            token_value=token_value,
             node=cfg.get("node", ""),
         )
         session.add(server)
-        delete_config("pve")
+        session.delete(row)
 
 
 def list_pve_servers():
@@ -241,13 +312,13 @@ def list_pve_servers():
             "port": s.port,
             "user": s.user,
             "token_name": s.token_name,
-            "token_value": "****",
+            "token_value": REDACTED,
             "node": s.node,
             "template_vmid": s.template_vmid,
             "ow_host": s.ow_host,
             "ow_port": s.ow_port,
             "ow_username": s.ow_username,
-            "ow_password": "****",
+            "ow_password": REDACTED,
         } for s in servers]
 
 def get_pve_server(server_id):
@@ -262,33 +333,37 @@ def get_pve_server(server_id):
             "port": s.port,
             "user": s.user,
             "token_name": s.token_name,
-            "token_value": s.token_value,
+            "token_value": decrypt_secret(s.token_value),
             "node": s.node,
             "template_vmid": s.template_vmid,
             "ow_host": s.ow_host,
             "ow_port": s.ow_port,
             "ow_username": s.ow_username,
-            "ow_password": s.ow_password,
+            "ow_password": decrypt_secret(s.ow_password),
         }
 
 
 def create_pve_server(data):
     with session_scope(commit=True) as session:
+        token_name = data.get("token_name")
+        if _is_secret_placeholder(token_name):
+            raise ValueError("token_name 不能使用脱敏占位符创建凭据标识")
         s = PVEServer(
             name=data["name"],
             host=data["host"],
             port=int(data.get("port", 8006)),
             user=data["user"],
-            token_name=data["token_name"],
-            token_value=data["token_value"],
+            token_name=token_name,
+            token_value=_new_secret(data.get("token_value"), "token_value"),
             node=data.get("node", ""),
             template_vmid=int(data.get("template_vmid", 9000)),
             ow_host=data.get("ow_host", ""),
             ow_port=int(data.get("ow_port", 22)),
             ow_username=data.get("ow_username", ""),
-            ow_password=data.get("ow_password", ""),
+            ow_password=_new_optional_secret(data.get("ow_password", ""), "ow_password"),
         )
         session.add(s)
+        session.flush()
         return s.id
 
 
@@ -301,17 +376,30 @@ def update_pve_server(server_id, data):
         if "host" in data: s.host = data["host"]
         if "port" in data: s.port = int(data["port"])
         if "user" in data: s.user = data["user"]
-        if "token_name" in data: s.token_name = data["token_name"]
-        if "token_value" in data and data["token_value"] and data["token_value"] != "****":
-            s.token_value = data["token_value"]
+        if "token_name" in data and not _is_secret_placeholder(data["token_name"]):
+            s.token_name = data["token_name"]
+        if "token_value" in data and not _is_secret_placeholder(data["token_value"]):
+            s.token_value = _stored_secret(data["token_value"])
         if "node" in data: s.node = data["node"]
         if "template_vmid" in data: s.template_vmid = int(data["template_vmid"])
         if "ow_host" in data: s.ow_host = data["ow_host"]
         if "ow_port" in data: s.ow_port = int(data["ow_port"])
         if "ow_username" in data: s.ow_username = data["ow_username"]
-        if "ow_password" in data and data["ow_password"] and data["ow_password"] != "****":
-            s.ow_password = data["ow_password"]
+        if "ow_password" in data and not _is_secret_placeholder(data["ow_password"]):
+            s.ow_password = _stored_secret(data["ow_password"])
         return s.id
+
+
+def _new_secret(value, field):
+    if _is_secret_placeholder(value):
+        raise ValueError(f"{field} 不能使用脱敏占位符创建凭据")
+    return _stored_secret(value)
+
+
+def _new_optional_secret(value, field):
+    if isinstance(value, str) and value in {"****", REDACTED}:
+        raise ValueError(f"{field} 不能使用脱敏占位符创建凭据")
+    return _stored_secret(value)
 
 
 def delete_pve_server(server_id):
@@ -368,7 +456,7 @@ def _cluster_to_dict(cluster):
         "gateway": cluster.gateway,
         "netmask": cluster.netmask,
         "dnsmasq": cluster.dnsmasq,
-        "ssh_private_key": cluster.ssh_private_key,
+        "ssh_private_key": decrypt_secret(cluster.ssh_private_key),
         "ssh_public_key": cluster.ssh_public_key,
         "password": cluster.password,
         "students": json.loads(cluster.students) if cluster.students else {},
@@ -450,21 +538,21 @@ def _migrate_pve_ow_fields():
 def _migrate_openwrt_to_pve_servers():
     if engine is None:
         return
-    ow_cfg = get_config("openwrt")
-    if not ow_cfg:
-        return
-    try:
-        with session_scope(commit=True) as session:
-            servers = session.query(PVEServer).filter(PVEServer.ow_host == "").all()
-            if not servers:
-                return
-            for s in servers:
-                s.ow_host = ow_cfg.get("host", "")
-                s.ow_port = int(ow_cfg.get("port", 22))
-                s.ow_username = ow_cfg.get("username", "")
-                s.ow_password = ow_cfg.get("password", "")
-    except Exception:
-        pass
+    with session_scope(commit=True) as session:
+        row = session.query(Config).filter_by(key="openwrt").first()
+        if not row:
+            return
+        ow_cfg = json.loads(row.value)
+        servers = session.query(PVEServer).filter(PVEServer.ow_host == "").all()
+        if not servers:
+            return
+        password = ow_cfg.get("password", "")
+        decrypt_secret(password)
+        for s in servers:
+            s.ow_host = ow_cfg.get("host", "")
+            s.ow_port = int(ow_cfg.get("port", 22))
+            s.ow_username = ow_cfg.get("username", "")
+            s.ow_password = password
 
 
 def _migrate_group_member_student_number():
@@ -543,7 +631,8 @@ def save_cluster(name, cluster_data):
         cluster.gateway = cluster_data.get("gateway")
         cluster.netmask = cluster_data.get("netmask")
         cluster.dnsmasq = cluster_data.get("dnsmasq")
-        cluster.ssh_private_key = cluster_data.get("ssh_private_key")
+        if "ssh_private_key" in cluster_data:
+            cluster.ssh_private_key = _stored_secret(cluster_data.get("ssh_private_key"))
         cluster.ssh_public_key = cluster_data.get("ssh_public_key")
         cluster.pve_node = cluster_data.get("pve_node")
         cluster.template_vmid = cluster_data.get("template_vmid")
@@ -574,6 +663,47 @@ def save_cluster(name, cluster_data):
             vm.ip = vm_info.get("ip", "")
 
         return cluster.id
+
+
+def migrate_plaintext_credentials():
+    """Explicitly encrypt credentials already stored in the database.
+
+    This function is intentionally never called by ``init_db``.  Every change
+    occurs in one transaction; an encryption failure rolls back all changes.
+    """
+
+    with session_scope(commit=True) as session:
+        if engine is not None and getattr(engine.dialect, "name", "") == "postgresql":
+            # Existing installations may still have the old VARCHAR(256)
+            # columns.  This DDL is transactional on PostgreSQL and is not
+            # issued for SQLite test databases.
+            session.execute(text(
+                "ALTER TABLE pve_servers ALTER COLUMN token_value TYPE TEXT"
+            ))
+            session.execute(text(
+                "ALTER TABLE pve_servers ALTER COLUMN ow_password TYPE TEXT"
+            ))
+
+        for server in session.query(PVEServer).all():
+            server.token_value = _stored_secret(server.token_value)
+            server.ow_password = _stored_secret(server.ow_password)
+
+        for row in session.query(Config).filter(Config.key.in_(("pve", "openwrt"))).all():
+            data = json.loads(row.value)
+            if not isinstance(data, dict):
+                continue
+            changed = False
+            for field in _config_secret_fields(row.key):
+                if field in data and data[field] not in (None, ""):
+                    encrypted = _stored_secret(data[field])
+                    changed = changed or encrypted != data[field]
+                    data[field] = encrypted
+            if changed:
+                row.value = json.dumps(data, ensure_ascii=False)
+
+        for cluster in session.query(Cluster).all():
+            if cluster.ssh_private_key not in (None, ""):
+                cluster.ssh_private_key = _stored_secret(cluster.ssh_private_key)
 
 
 def delete_cluster_db(name):

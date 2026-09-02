@@ -1,4 +1,8 @@
 import io
+import codecs
+from dataclasses import dataclass
+from functools import wraps
+from inspect import signature
 import secrets
 import threading
 import time as _time
@@ -10,12 +14,19 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from modules.db import (
-    Cluster, backfill_group_student_numbers, delete_cluster_db, get_config, get_group, get_pve_server,
+    Cluster, backfill_group_student_numbers, delete_cluster_db, get_config, get_group, get_pve_server, get_user,
     list_group_members, load_cluster,
     load_clusters, save_cluster, session_scope,
 )
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.pve_client import PVEClient, PVEError
+from modules.authz import Actions, AuthorizationDenied, is_allowed
+from modules.security_service import (
+    authorize_cluster_action,
+    authorize_task,
+    reload_actor,
+    validate_cluster_creation,
+)
 from modules.task_queue import scheduler, Task
 
 
@@ -23,9 +34,31 @@ class K8sError(Exception):
     pass
 
 
+class TaskNotFoundError(LookupError):
+    def __init__(self, *args):
+        super().__init__("任务不存在")
+
+
+class TaskRetryConflict(K8sError):
+    def __init__(self, *args):
+        super().__init__("任务当前不可重试，请检查任务和资源状态")
+
+
+@dataclass(frozen=True)
+class _TaskRetryDescription:
+    operation: str
+    cluster_name: str
+    resource_fingerprint: tuple
+
+
+_RETRY_ACTIONS = {"deploy": Actions.CLUSTER_DEPLOY, "delete": Actions.CLUSTER_DELETE}
 _task_store = {}
 _task_lock = threading.Lock()
 _task_cancel_events = {}
+# These records are server-owned and must never be added to public task data.
+_task_retry_descriptions = {}
+_task_retry_reservations = {}
+_task_retry_pending = set()
 _on_task_update = None
 
 _openwrt_locks = {}
@@ -41,35 +74,139 @@ def set_on_task_update(callback):
     _on_task_update = callback
 
 
+def _sanitize_text(value):
+    from modules.audit import sanitize_text
+
+    return sanitize_text(value)
+
+
+def _sanitize(value):
+    from modules.audit import sanitize
+
+    return sanitize(value)
+
+
+def _safe_error_message(exc, fallback="操作失败，请联系管理员"):
+    from modules.audit import safe_error_message
+
+    return safe_error_message(exc, fallback=fallback)
+
+
+def _audit(action, outcome, *, actor_id=None, resource_type=None,
+           resource_id=None, reason=None, metadata=None):
+    from modules.audit import security_audit
+
+    safe_metadata = dict(metadata or {})
+    if actor_id is not None:
+        safe_metadata.setdefault("actor_id", actor_id)
+    security_audit(
+        action,
+        outcome,
+        actor={"id": actor_id} if actor_id is not None else None,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        reason=_sanitize_text(reason) if reason is not None else None,
+        metadata=safe_metadata,
+    )
+
+
+def _audited_operation(action, actor_parameter):
+    """Record actual synchronous service outcomes, including direct callers."""
+    def decorate(func):
+        parameters = signature(func)
+
+        @wraps(func)
+        def audited(*args, **kwargs):
+            bound = parameters.bind(*args, **kwargs)
+            actor_id = bound.arguments.get(actor_parameter)
+            resource_id = bound.arguments.get("name")
+            try:
+                result = func(*args, **kwargs)
+            except Exception as exc:
+                _audit(action, "denied" if isinstance(exc, AuthorizationDenied) else "failure",
+                       actor_id=actor_id, resource_type="cluster", resource_id=resource_id,
+                       reason="权限不足" if isinstance(exc, AuthorizationDenied) else _safe_error_message(exc))
+                raise
+            if resource_id is None and isinstance(result, tuple):
+                resource_id = result[0]
+            _audit(action, "success", actor_id=actor_id,
+                   resource_type="cluster", resource_id=resource_id)
+            return result
+
+        return audited
+    return decorate
+
+
+def _cluster_owner_teacher_id(cluster):
+    owner = cluster.get("owner_teacher_id") if isinstance(cluster, dict) else None
+    if owner is not None:
+        return owner
+    creator_id = cluster.get("created_by") if isinstance(cluster, dict) else None
+    if creator_id is not None:
+        # Ownership metadata survives account disablement; loading an owner
+        # here does not grant that account permission to execute or read jobs.
+        creator = get_user(creator_id)
+        if getattr(creator, "role", None) == "teacher":
+            return creator.id
+    group_id = cluster.get("group_id") if isinstance(cluster, dict) else None
+    if group_id is not None:
+        group = get_group(group_id)
+        group_creator_id = group.get("created_by") if group else None
+        if group_creator_id is not None:
+            group_creator = get_user(group_creator_id)
+            if getattr(group_creator, "role", None) == "teacher":
+                return group_creator.id
+    return None
+
+
 def _update_task(task_id, status="running", progress=0, message="", result=None, error=None,
-                 created_by=None, queue=None):
+                 created_by=None, queue=None, owner_teacher_id=None, retry_of=None):
+    safe_message = _sanitize_text(message)
+    safe_error = _sanitize_text(error) if error is not None else None
     with _task_lock:
         entry = _task_store.get(task_id)
         if entry is None:
-            entry = {}
+            entry = {"owner_teacher_id": None}
             _task_store[task_id] = entry
         entry["status"] = status
         entry["progress"] = progress
-        entry["message"] = message
+        entry["message"] = safe_message
         if result is not None:
-            entry["result"] = result
+            entry["result"] = _sanitize(result)
         if error is not None:
-            entry["error"] = error
+            entry["error"] = safe_error
         if created_by is not None:
             entry["created_by"] = created_by
         if queue is not None:
             entry["queue"] = queue
+        if owner_teacher_id is not None:
+            entry["owner_teacher_id"] = owner_teacher_id
+        if retry_of is not None:
+            entry["retry_of"] = retry_of
         entry["updated_at"] = _time.time()
         entry.setdefault("logs", []).append({
             "time": _time.strftime("%H:%M:%S"),
             "progress": progress,
-            "message": message,
+            "message": safe_message,
         })
+        callback_created_by = entry.get("created_by")
+    if status in {"completed", "cancelled", "error"}:
+        _audit(
+            "job.execution",
+            "failure" if status == "error" else "success",
+            actor_id=callback_created_by,
+            resource_type="task",
+            resource_id=task_id,
+            reason=safe_error if status == "error" else None,
+        )
     if _on_task_update:
-        _on_task_update(task_id, status, progress, message, entry.get("created_by"), queue)
+        # Keep the established six-argument callback contract.  Consumers
+        # resolve owner_teacher_id from the task record by task_id.
+        _on_task_update(task_id, status, progress, safe_message, callback_created_by, queue)
 
 
 def _append_log(task_id, message):
+    safe_message = _sanitize_text(message)
     with _task_lock:
         entry = _task_store.get(task_id)
         if entry is None:
@@ -78,7 +215,7 @@ def _append_log(task_id, message):
         entry.setdefault("logs", []).append({
             "time": _time.strftime("%H:%M:%S"),
             "progress": entry.get("progress", 0),
-            "message": message,
+            "message": safe_message,
         })
 
 
@@ -90,13 +227,41 @@ def get_task_status(task_id):
 def _cleanup_old_tasks():
     now = _time.time()
     with _task_lock:
-        expired = [tid for tid, t in _task_store.items() if now - t.get("updated_at", 0) > 1800]
+        # Protect a parent and its child only while a submission is in flight;
+        # finally in retry_task always releases this short-lived protection.
+        protected = set(_task_retry_pending)
+        protected.update(_task_retry_reservations[tid] for tid in _task_retry_pending
+                         if tid in _task_retry_reservations)
+        expired = [tid for tid, t in _task_store.items()
+                   if tid not in protected and now - t.get("updated_at", 0) > 1800]
         for tid in expired:
             del _task_store[tid]
             _task_cancel_events.pop(tid, None)
+        for records in (_task_retry_descriptions, _task_retry_reservations):
+            for tid in list(records):
+                if tid not in _task_store and tid not in protected:
+                    records.pop(tid, None)
 
 
-def cancel_task(task_id):
+def cancel_task(task_id, actor_id=None):
+    try:
+        actor = reload_actor(actor_id)
+    except AuthorizationDenied:
+        _audit("job.cancel", "denied", resource_type="task", resource_id=task_id,
+               actor_id=actor_id, reason="权限不足")
+        raise
+    with _task_lock:
+        task = _task_store.get(task_id)
+    if not task:
+        _audit("job.cancel", "denied", actor_id=actor_id, resource_type="task",
+               resource_id=task_id, reason="任务不存在")
+        return False
+    try:
+        authorize_task(actor, Actions.TASK_CANCEL, {**task, "task_id": task_id})
+    except (AuthorizationDenied, ValueError) as exc:
+        _audit("job.cancel", "denied", actor_id=actor_id, resource_type="task",
+               resource_id=task_id, reason=_safe_error_message(exc))
+        raise
     with _task_lock:
         entry = _task_store.get(task_id)
         if not entry:
@@ -106,27 +271,254 @@ def cancel_task(task_id):
             ev.set()
         if entry.get("status") == "running":
             entry["status"] = "cancelling"
-            entry["message"] = "正在取消..."
-        return True
+            entry["message"] = _sanitize_text("正在取消...")
+    _audit("job.cancel", "success", actor_id=actor_id, resource_type="task",
+           resource_id=task_id)
+    return True
 
 
-def list_tasks(created_by=None):
+def list_tasks(created_by=None, actor=None):
+    if actor is not None:
+        actor_id = getattr(actor, "id", None) if not isinstance(actor, dict) else actor.get("id")
+        try:
+            actor = reload_actor(actor_id)
+        except AuthorizationDenied:
+            return []
     with _task_lock:
         now = _time.time()
         result = []
         for tid, entry in list(_task_store.items()):
-            if created_by and entry.get("created_by") != created_by:
+            if created_by is not None and entry.get("created_by") != created_by:
                 continue
-            result.append({
+            task = {
                 "task_id": tid,
                 "status": entry.get("status"),
                 "progress": entry.get("progress", 0),
                 "message": entry.get("message", ""),
                 "queue": entry.get("queue"),
                 "updated_at": entry.get("updated_at", 0),
-            })
+                "created_by": entry.get("created_by"),
+                "owner_teacher_id": entry.get("owner_teacher_id"),
+            }
+            if "retry_of" in entry:
+                task["retry_of"] = entry["retry_of"]
+            if actor is not None and not is_allowed(actor, Actions.TASK_READ, entry):
+                continue
+            result.append(task)
         result.sort(key=lambda t: t["updated_at"], reverse=True)
         return result
+
+
+def _retry_identity_id(value, *, optional=False, allow_zero=False):
+    if value is None and optional:
+        return None
+    if type(value) is int:
+        normalized = value
+    elif isinstance(value, str) and value.isascii() and value.isdecimal():
+        try:
+            normalized = int(value)
+        except ValueError:
+            raise TaskRetryConflict() from None
+        if str(normalized) != value:
+            raise TaskRetryConflict()
+    else:
+        raise TaskRetryConflict()
+    if normalized < (0 if allow_zero else 1):
+        raise TaskRetryConflict()
+    return normalized
+
+
+def _retry_resource_fingerprint(name, cluster):
+    """Copy only stable resource identities, never credentials or settings."""
+    if not isinstance(name, str) or not name or not isinstance(cluster, dict):
+        raise TaskRetryConflict()
+    if cluster.get("name", name) != name:
+        raise TaskRetryConflict()
+    values = (
+        _retry_identity_id(cluster.get("pve_server_id"), optional=True, allow_zero=True),
+        _retry_identity_id(cluster.get("created_by"), optional=True),
+        _retry_identity_id(cluster.get("group_id"), optional=True),
+    )
+    vms = cluster.get("vms")
+    if not isinstance(vms, dict):
+        raise TaskRetryConflict()
+    identities = []
+    for vm_name, vm in vms.items():
+        if (not isinstance(vm_name, str) or not vm_name or not isinstance(vm, dict)
+                or not isinstance(vm.get("node"), str) or not vm["node"]):
+            raise TaskRetryConflict()
+        identities.append((vm_name, vm["node"], _retry_identity_id(vm.get("vmid"))))
+    return (name, *values, tuple(sorted(identities)))
+
+
+def _remember_task_retry(task_id, operation, name, cluster):
+    """Called only from trusted async entry points after authorization."""
+    if operation not in _RETRY_ACTIONS:
+        return
+    try:
+        description = _TaskRetryDescription(operation, name, _retry_resource_fingerprint(name, cluster))
+    except TaskRetryConflict:
+        # An incomplete legacy resource can still follow its existing workflow,
+        # but it cannot safely provide a descriptor for automatic repetition.
+        return
+    with _task_lock:
+        if task_id in _task_store:
+            _task_retry_descriptions[task_id] = description
+
+
+def _retry_task_snapshot(task_id):
+    """Caller holds _task_lock; copying auth fields never exposes job results."""
+    task = _task_store.get(task_id)
+    if task is None:
+        return None
+    return {"task_id": task_id, "created_by": task.get("created_by"),
+            "owner_teacher_id": task.get("owner_teacher_id"), "status": task.get("status")}
+
+
+def _authorize_retry_actor(actor_id, task):
+    actor = reload_actor(actor_id)
+    return authorize_task(actor, Actions.TASK_RETRY, task)
+
+
+def _authorize_retry_resource(actor_id, description):
+    try:
+        actor, cluster = authorize_cluster_action(
+            actor_id, _RETRY_ACTIONS[description.operation], description.cluster_name
+        )
+    except ValueError:
+        raise TaskRetryConflict() from None
+    # Resource permission always precedes fingerprint/state conflict disclosure.
+    if _retry_resource_fingerprint(description.cluster_name, cluster) != description.resource_fingerprint:
+        raise TaskRetryConflict()
+    if description.operation == "deploy" and cluster.get("status") != "running":
+        raise TaskRetryConflict()
+    return actor, cluster
+
+
+def _audit_retry(outcome, actor_id, source_id, child_id=None, description=None, *, phase="enqueue", reason=None):
+    metadata = {"source_task_id": source_id, "child_task_id": child_id, "phase": phase}
+    if description is not None:
+        metadata.update(operation=description.operation, cluster_name=description.cluster_name)
+    _audit("job.retry", outcome, actor_id=actor_id, resource_type="task",
+           resource_id=source_id, reason=reason, metadata=metadata)
+
+
+def _run_retry_task(task_id, source_id, actor_id, description):
+    try:
+        with _task_lock:
+            source = _retry_task_snapshot(source_id)
+            child = _retry_task_snapshot(task_id)
+            trusted = _task_retry_descriptions.get(task_id)
+        actor = _authorize_retry_actor(actor_id, child or {"task_id": task_id})
+        if source is not None:
+            actor = _authorize_retry_actor(actor.id, source)
+        if child is None or trusted != description:
+            raise TaskRetryConflict()
+        actor, cluster = _authorize_retry_resource(actor.id, description)
+        if child["status"] in {"cancelled", "cancelling"}:
+            _update_task(task_id, status="cancelled", message="任务已取消")
+            return
+        if child["status"] != "running":
+            raise TaskRetryConflict()
+        _update_task(task_id, message="正在执行重试任务...")
+        callback = lambda progress, message: _update_task(task_id, progress=progress, message=message)
+        log_callback = lambda message: _append_log(task_id, message)
+        operation = deploy_k8s if description.operation == "deploy" else delete_cluster
+        operation(description.cluster_name, status_callback=callback,
+                  log_callback=log_callback, actor_id=actor.id)
+        _update_task(task_id, status="completed", progress=100, message="重试任务已完成")
+    except Exception as exc:
+        reason = "权限不足" if isinstance(exc, AuthorizationDenied) else _safe_error_message(exc)
+        _audit_retry("denied" if isinstance(exc, AuthorizationDenied) else "failure",
+                     actor_id, source_id, task_id, description, phase="execution", reason=reason)
+        with _task_lock:
+            exists = task_id in _task_store
+        if exists:
+            _update_task(task_id, status="error", message=reason, error=reason)
+
+
+def retry_task(task_id, actor_id=None):
+    """Retry one trusted, failed operation without modifying its parent job."""
+    child_id = None
+    description = None
+    reserved = False
+    enqueued = False
+    try:
+        actor = reload_actor(actor_id)
+        with _task_lock:
+            source = _retry_task_snapshot(task_id)
+        # With no resource ownership evidence, only admin can pass this policy
+        # and receive a 404.  Other roles cannot probe missing/foreign job IDs.
+        actor = _authorize_retry_actor(actor.id, source or {"task_id": task_id})
+        if source is None:
+            raise TaskNotFoundError()
+        with _task_lock:
+            description = _task_retry_descriptions.get(task_id)
+        if (not isinstance(description, _TaskRetryDescription)
+                or description.operation not in _RETRY_ACTIONS):
+            raise TaskRetryConflict()
+        # TASK_RETRY alone is insufficient: e.g. students may read/retry their
+        # historical own tasks in the matrix, but cannot deploy/delete clusters.
+        # Check the actual target action before revealing a status conflict.
+        actor, cluster = _authorize_retry_resource(actor.id, description)
+        child_id = _new_task_id()
+        with _task_lock:
+            source = _retry_task_snapshot(task_id)
+            if not is_allowed(actor, Actions.TASK_RETRY, source):
+                raise AuthorizationDenied("权限不足")
+            if source is None:
+                raise TaskNotFoundError()
+            if (source["status"] not in {"error", "cancelled"}
+                    or _task_retry_descriptions.get(task_id) != description
+                    or task_id in _task_retry_reservations):
+                raise TaskRetryConflict()
+            while child_id in _task_store or child_id in _task_retry_descriptions:
+                child_id = _new_task_id()
+            _task_retry_reservations[task_id] = child_id
+            _task_retry_pending.add(task_id)
+            reserved = True
+
+        actor, cluster = _authorize_retry_resource(actor.id, description)
+        owner_teacher_id = _cluster_owner_teacher_id(cluster)
+        with _task_lock:
+            current_source = _retry_task_snapshot(task_id)
+        actor = _authorize_retry_actor(actor.id, current_source or {"task_id": task_id})
+        with _task_lock:
+            current_source = _retry_task_snapshot(task_id)
+            if not is_allowed(actor, Actions.TASK_RETRY, current_source):
+                raise AuthorizationDenied("权限不足")
+            if (current_source is None or current_source["status"] not in {"error", "cancelled"}
+                    or _task_retry_descriptions.get(task_id) != description
+                    or _task_retry_reservations.get(task_id) != child_id):
+                raise TaskRetryConflict()
+            _task_retry_descriptions[child_id] = description
+        _update_task(child_id, message="重试任务排队中...", created_by=actor.id,
+                     owner_teacher_id=owner_teacher_id, queue=description.operation,
+                     retry_of=task_id)
+        def _run():
+            _run_retry_task(child_id, task_id, actor.id, description)
+
+        scheduler.enqueue(description.operation, Task(description.operation, child_id, _run))
+        enqueued = True
+    except Exception as exc:
+        _audit_retry("denied" if isinstance(exc, AuthorizationDenied) else "failure",
+                     actor_id, task_id, child_id, description,
+                     reason="权限不足" if isinstance(exc, AuthorizationDenied) else _safe_error_message(exc))
+        if isinstance(exc, (AuthorizationDenied, TaskNotFoundError, TaskRetryConflict)):
+            raise
+        raise RuntimeError("任务重试失败，请稍后重试") from None
+    finally:
+        if reserved:
+            with _task_lock:
+                _task_retry_pending.discard(task_id)
+                if not enqueued and _task_retry_reservations.get(task_id) == child_id:
+                    _task_retry_reservations.pop(task_id, None)
+                    _task_store.pop(child_id, None)
+                    _task_retry_descriptions.pop(child_id, None)
+                    _task_cancel_events.pop(child_id, None)
+    _audit_retry("success", actor.id, task_id, child_id, description)
+    _cleanup_old_tasks()
+    return child_id
 
 
 def _openwrt_lock(server_id=None):
@@ -208,7 +600,9 @@ class _SSHClient:
         exit_code = stdout.channel.recv_exit_status()
         if exit_code != 0:
             err = stderr.read().decode().strip()
-            raise K8sError(f"SSH 命令失败 (exit={exit_code}): {err[:200]}")
+            raise K8sError(
+                f"SSH 命令失败 (exit={exit_code}): {_sanitize_text(err[:200])}"
+            )
 
     def exec_with_output(self, command, timeout=30):
         if not self._ssh:
@@ -218,44 +612,50 @@ class _SSHClient:
         out = stdout.read().decode().strip()
         if exit_code != 0:
             err = stderr.read().decode().strip()
-            raise K8sError(f"SSH 命令失败 (exit={exit_code}): {err[:200]}")
+            raise K8sError(
+                f"SSH 命令失败 (exit={exit_code}): {_sanitize_text(err[:200])}"
+            )
         return out
 
     def exec_streaming(self, command, log_callback=None, timeout=3600):
+        from modules.audit import SecretTextSanitizer
+
         if not self._ssh:
             raise K8sError("SSH 未连接")
         transport = self._ssh.get_transport()
         channel = transport.open_session()
-        channel.exec_command(command)
-
+        sanitizer = SecretTextSanitizer()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         prev_data = ""
-        deadline = _time.time() + timeout
-        while _time.time() < deadline:
-            if channel.recv_ready():
-                data = channel.recv(4096).decode(errors="replace")
-                if data:
-                    prev_data += data
-                    if "\n" in prev_data:
-                        lines = prev_data.split("\n")
-                        for line in lines[:-1]:
-                            if log_callback and line.rstrip():
-                                log_callback(f"  {line.rstrip()}")
-                        prev_data = lines[-1]
 
-            if channel.exit_status_ready():
-                break
-            _time.sleep(3)
+        def emit_chunk(data, *, final=False):
+            nonlocal prev_data
+            # One sanitizer for this channel preserves private-key suppression
+            # across receive chunks AND lines; only safe text reaches callbacks.
+            prev_data += sanitizer.feed(decoder.decode(data, final=final))
+            if final:
+                prev_data += sanitizer.flush()
+            lines = prev_data.split("\n")
+            prev_data = "" if final else lines.pop()
+            for line in lines:
+                if log_callback and line.rstrip():
+                    log_callback(_sanitize_text(f"  {line.rstrip()}"))
 
-        while channel.recv_ready():
-            data = channel.recv(4096).decode(errors="replace")
-            prev_data += data
-        if prev_data.strip() and log_callback:
-            for line in prev_data.rstrip("\n").split("\n"):
-                if line.rstrip():
-                    log_callback(f"  {line.rstrip()}")
-
-        exit_code = channel.recv_exit_status()
-        channel.close()
+        try:
+            channel.exec_command(command)
+            deadline = _time.time() + timeout
+            while _time.time() < deadline:
+                if channel.recv_ready():
+                    emit_chunk(channel.recv(4096))
+                if channel.exit_status_ready():
+                    break
+                _time.sleep(3)
+            while channel.recv_ready():
+                emit_chunk(channel.recv(4096))
+            emit_chunk(b"", final=True)
+            exit_code = channel.recv_exit_status()
+        finally:
+            channel.close()
         if exit_code != 0:
             raise K8sError(f"命令失败 (exit={exit_code})")
 
@@ -270,7 +670,9 @@ class _SSHClient:
         exit_code = stdout.channel.recv_exit_status()
         if exit_code != 0:
             err = stderr.read().decode().strip()
-            raise K8sError(f"SSH 写入文件失败 (exit={exit_code}): {err[:200]}")
+            raise K8sError(
+                f"SSH 写入文件失败 (exit={exit_code}): {_sanitize_text(err[:200])}"
+            )
 
     def file_exists(self, path):
         try:
@@ -297,9 +699,9 @@ def _wait_for_ssh(host, port, username, private_key, timeout=120):
             ssh.close()
             return True
         except Exception as e:
-            last_error = str(e)
+            last_error = _safe_error_message(e)
             _time.sleep(2)
-    raise K8sError(f"SSH 连接失败 ({host}:{port}): {last_error}")
+    raise K8sError(f"SSH 连接失败 ({host}:{port}): {_sanitize_text(last_error)}")
 
 
 def _wait_for_vms_ssh(ssh, vm_ips, timeout=120, log_callback=None):
@@ -313,7 +715,7 @@ def _wait_for_vms_ssh(ssh, vm_ips, timeout=120, log_callback=None):
                     f"teacher@{ip} 'echo OK'",
                     timeout=10)
                 if log_callback:
-                    log_callback(f"{name} ({ip}): SSH 就绪")
+                    log_callback(_sanitize_text(f"{name} ({ip}): SSH 就绪"))
                 del pending[name]
             except K8sError:
                 pass
@@ -383,16 +785,19 @@ def get_cluster(name):
     return load_cluster(name)
 
 
-def delete_cluster(name, status_callback=None, log_callback=None):
+@_audited_operation(Actions.CLUSTER_DELETE, "actor_id")
+def delete_cluster(name, status_callback=None, log_callback=None, *, actor_id=None):
+    actor, authorized_cluster = authorize_cluster_action(
+        actor_id, Actions.CLUSTER_DELETE, name
+    )
+
     def report(p, m):
-        if status_callback: status_callback(p, m)
+        if status_callback: status_callback(p, _sanitize_text(m))
     def _log(m):
-        if log_callback: log_callback(m)
+        if log_callback: log_callback(_sanitize_text(m))
 
     report(5, "正在加载集群信息...")
-    cluster = load_cluster(name)
-    if not cluster:
-        raise K8sError(f"Cluster {name} not found")
+    cluster = authorized_cluster
     _num = name.split("_")[1]
     pve = _pve_client(server_id=cluster.get("pve_server_id"))
     pve.connect()
@@ -405,7 +810,7 @@ def delete_cluster(name, status_callback=None, log_callback=None):
             pve.release_vm(vm_info["node"], vm_info["vmid"], purge=True)
             _log(f"{vm_name} 已释放")
         except Exception as e:
-            _log(f"{vm_name} 释放失败: {e}")
+            _log(f"{vm_name} 释放失败: {_safe_error_message(e)}")
         report(10 + int((i + 1) / _total * 30), f"正在释放虚拟机 ({i + 1}/{_total})...")
     try:
         pve.api
@@ -479,9 +884,17 @@ def delete_cluster(name, status_callback=None, log_callback=None):
 
 
 def delete_cluster_async(name, created_by=None):
+    actor, cluster = authorize_cluster_action(
+        created_by, Actions.CLUSTER_DELETE, name
+    )
+    owner_teacher_id = _cluster_owner_teacher_id(cluster)
     task_id = _new_task_id()
     _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
-                 created_by=created_by, queue="delete")
+                 created_by=actor.id, queue="delete",
+                 owner_teacher_id=owner_teacher_id)
+    _remember_task_retry(task_id, "delete", name, cluster)
+    _audit("job.create", "success", actor_id=actor.id, resource_type="task",
+           resource_id=task_id, metadata={"queue": "delete", "cluster": name})
 
     def _cb(p, m):
         _update_task(task_id, progress=p, message=m)
@@ -491,28 +904,41 @@ def delete_cluster_async(name, created_by=None):
     def _run():
         _update_task(task_id, status="running", progress=0, message="正在初始化删除...")
         try:
-            delete_cluster(name, status_callback=_cb, log_callback=_log)
+            authorize_cluster_action(actor.id, Actions.CLUSTER_DELETE, name)
+            delete_cluster(name, status_callback=_cb, log_callback=_log,
+                           actor_id=actor.id)
             _update_task(task_id, status="completed", progress=100, message="集群已删除")
         except Exception as e:
-            _update_task(task_id, status="error", progress=0, message=str(e), error=str(e))
+            _update_task(task_id, status="error", progress=0,
+                         message=_safe_error_message(e),
+                         error=_safe_error_message(e))
 
     scheduler.enqueue("delete", Task("delete", task_id, _run))
     _cleanup_old_tasks()
     return task_id
 
 
+@_audited_operation(Actions.CLUSTER_CREATE, "created_by")
 def create_cluster(master_count, node_count, master_cores, master_memory,
                    node_cores, node_memory, pve_node,
                    pve_server_id=0, group_id=None,
                    class_id=None, created_by=None,
                    status_callback=None, log_callback=None, cancel_event=None):
+    actor = reload_actor(created_by)
+    validate_cluster_creation(
+        actor,
+        group_ids=[group_id] if group_id is not None else (),
+        class_id=class_id,
+    )
+    created_by = actor.id
+
     def report(progress, message):
         if status_callback:
-            status_callback(progress, message)
+            status_callback(progress, _sanitize_text(message))
 
     def _log(msg):
         if log_callback:
-            log_callback(msg)
+            log_callback(_sanitize_text(msg))
 
     password = secrets.token_urlsafe(16)
 
@@ -578,7 +1004,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             delete_cluster_db(cluster_name)
         except Exception:
             pass
-        raise K8sError(f"数据库保存失败: {e}") from e
+        raise K8sError(f"数据库保存失败: {_safe_error_message(e)}") from e
 
     vms = {}
     created_vms = []
@@ -660,7 +1086,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             _rollback_openwrt(ow)
             ow.close()
             _cleanup_db()
-            raise K8sError(f"OpenWrt setup failed: {e}") from e
+            raise K8sError(f"OpenWrt setup failed: {_safe_error_message(e)}") from e
     finally:
         ow_lock.release()
 
@@ -774,7 +1200,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
             finally:
                 _dhcp_lock.release()
         except Exception as e:
-            _log(f"DHCP/端口转发配置异常 ({e})")
+            _log(f"DHCP/端口转发配置异常 ({_safe_error_message(e)})")
 
         report(92, "正在启动虚拟机...")
         for vm_name, node, vmid in created_vms:
@@ -783,7 +1209,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 pve.start_vm(node, vmid)
                 _log(f"VM {vm_name}: 启动命令已发送")
             except Exception as e:
-                _log(f"VM {vm_name}: 启动跳过 ({e})")
+                _log(f"VM {vm_name}: 启动跳过 ({_safe_error_message(e)})")
 
         report(94, "正在重启虚拟机以刷新主机名...")
         for vm_name, node, vmid in created_vms:
@@ -792,7 +1218,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 pve.reboot_vm(node, vmid)
                 _log(f"VM {vm_name}: 重启完成")
             except Exception as e:
-                _log(f"VM {vm_name}: 重启跳过 ({e})")
+                _log(f"VM {vm_name}: 重启跳过 ({_safe_error_message(e)})")
 
         report(96, "正在等待 client VM 就绪并配置 SSH...")
         client_vm = next((item for item in created_vms if item[0].startswith("client-")), None)
@@ -811,7 +1237,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 _wait_for_ssh(_ssh_host, _ssh_port, "teacher", priv_key, timeout=120)
                 _log(f"Client VM {client_vm[0]}: SSH 已就绪")
             except Exception as e:
-                _log(f"Client VM {client_vm[0]}: SSH 未响应 ({e})")
+                _log(f"Client VM {client_vm[0]}: SSH 未响应 ({_safe_error_message(e)})")
 
             report(98, "正在通过 SSH 配置 client 免密登录...")
             _log(f"Client VM {client_vm[0]}: SSH 上传私钥")
@@ -838,24 +1264,24 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 _log(f"SSH: 公钥上传完成")
                 ssh.close()
             except Exception as e:
-                _log(f"Client VM {client_vm[0]}: SSH 配置异常, 终止创建 ({e})")
-                raise K8sError(f"Client VM SSH 配置失败: {e}") from e
+                _log(f"Client VM {client_vm[0]}: SSH 配置异常, 终止创建 ({_safe_error_message(e)})")
+                raise K8sError(f"Client VM SSH 配置失败: {_safe_error_message(e)}") from e
 
     except Exception as e:
-        _log(f"错误: {e}")
+        _log(f"错误: {_safe_error_message(e)}")
         _log("回滚: 释放已创建的虚拟机")
         for vm_name, node, vmid in created_vms:
             try:
                 pve.release_vm(node, vmid, purge=True)
                 _log(f"回滚: VM {vm_name} (VMID {vmid}) 已释放")
             except Exception as re:
-                _log(f"回滚: VM {vm_name} 释放失败 ({re})")
+                _log(f"回滚: VM {vm_name} 释放失败 ({_safe_error_message(re)})")
         _log("回滚: 清理 OpenWrt 配置")
         _rollback_openwrt(ow)
         ow.close()
         _cleanup_db()
         _log("回滚: 数据库记录已清理")
-        raise K8sError(f"PVE VM creation failed: {e}") from e
+        raise K8sError(f"PVE VM creation failed: {_safe_error_message(e)}") from e
 
     ow.close()
 
@@ -891,7 +1317,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
                 finally:
                     ssh.close()
             except Exception as e:
-                _log(f"创建学生账户失败: {e}")
+                _log(f"创建学生账户失败: {_safe_error_message(e)}")
 
     report(97, "正在保存集群信息...")
     _log("保存集群信息到数据库")
@@ -930,9 +1356,22 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                          node_cores, node_memory, pve_node,
                          pve_server_id=0,
                          group_id=None, class_id=None, created_by=None):
+    actor = reload_actor(created_by)
+    validate_cluster_creation(
+        actor,
+        group_ids=[group_id] if group_id is not None else (),
+        class_id=class_id,
+    )
+    owner_teacher_id = _cluster_owner_teacher_id({
+        "created_by": actor.id,
+        "group_id": group_id,
+    })
     task_id = _new_task_id()
     _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
-                 created_by=created_by, queue="create")
+                 created_by=actor.id, queue="create",
+                 owner_teacher_id=owner_teacher_id)
+    _audit("job.create", "success", actor_id=actor.id, resource_type="task",
+           resource_id=task_id, metadata={"queue": "create"})
 
     def _cb(progress, message):
         _update_task(task_id, progress=progress, message=message)
@@ -945,6 +1384,12 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
         ev = threading.Event()
         _task_cancel_events[task_id] = ev
         try:
+            worker_actor = reload_actor(actor.id)
+            validate_cluster_creation(
+                worker_actor,
+                group_ids=[group_id] if group_id is not None else (),
+                class_id=class_id,
+            )
             def _create_cb(p, m):
                 _update_task(task_id, progress=int(p * 0.5), message=m)
             name, cluster = create_cluster(
@@ -955,11 +1400,14 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                 pve_server_id=pve_server_id,
                 group_id=group_id,
                 class_id=class_id,
-                created_by=created_by,
+                created_by=worker_actor.id,
                 status_callback=_create_cb,
                 log_callback=_log,
                 cancel_event=ev,
             )
+            # Only a completed create can turn this job into a deployment
+            # retry.  A failed create may have left resources and stays blocked.
+            _remember_task_retry(task_id, "deploy", name, cluster)
             _append_log(task_id, "虚拟机创建完成，排队等待部署 K8s...")
 
             def _deploy_cb(p, m):
@@ -969,7 +1417,10 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
             def _run_deploy():
                 _update_task(task_id, queue="deploy")
                 try:
-                    deploy_k8s(name, status_callback=_deploy_cb, log_callback=deploy_log)
+                    worker_actor = reload_actor(actor.id)
+                    authorize_cluster_action(actor.id, Actions.CLUSTER_DEPLOY, name)
+                    deploy_k8s(name, status_callback=_deploy_cb, log_callback=deploy_log,
+                               actor_id=worker_actor.id)
                     cluster = load_cluster(name)
                     safe = {k: v for k, v in cluster.items() if k != "ssh_private_key"}
                     _update_task(task_id, status="completed", progress=100,
@@ -981,7 +1432,8 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                                      message="任务已取消")
                     else:
                         _update_task(task_id, status="error", progress=0,
-                                     message=str(e), error=str(e))
+                                     message=_safe_error_message(e),
+                                     error=_safe_error_message(e))
 
             scheduler.enqueue("deploy", Task("deploy", _new_task_id(), _run_deploy))
 
@@ -991,7 +1443,8 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                              message="任务已取消")
             else:
                 _update_task(task_id, status="error", progress=0,
-                             message=str(e), error=str(e))
+                             message=_safe_error_message(e),
+                             error=_safe_error_message(e))
         finally:
             _task_cancel_events.pop(task_id, None)
 
@@ -1000,23 +1453,28 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
     return task_id
 
 
-def force_delete_cluster(name):
+@_audited_operation(Actions.ADMIN_COMPENSATE, "actor_id")
+def force_delete_cluster(name, *, actor_id=None):
+    actor, cluster = authorize_cluster_action(
+        actor_id, Actions.ADMIN_COMPENSATE, name
+    )
     delete_cluster_db(name)
 
 
-def deploy_k8s(name, status_callback=None, log_callback=None):
-    cluster = load_cluster(name)
-    if not cluster:
-        raise K8sError(f"集群 {name} 不存在")
+@_audited_operation(Actions.CLUSTER_DEPLOY, "actor_id")
+def deploy_k8s(name, status_callback=None, log_callback=None, *, actor_id=None):
+    actor, cluster = authorize_cluster_action(
+        actor_id, Actions.CLUSTER_DEPLOY, name
+    )
     if cluster.get("status") != "running":
         raise K8sError(f"集群 {name} 状态异常，无法部署 K8s")
 
     def report(progress, message):
         if status_callback:
-            status_callback(progress, message)
+            status_callback(progress, _sanitize_text(message))
     def _log(msg):
         if log_callback:
-            log_callback(msg)
+            log_callback(_sanitize_text(msg))
 
     _log(f"开始部署 K8s: 集群 {name}")
 
@@ -1036,7 +1494,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
     try:
         _wait_for_ssh(_ssh_host, _ssh_port, "teacher", _priv_key, timeout=120)
     except Exception as e:
-        raise K8sError(f"client VM SSH 连接失败: {e}")
+        raise K8sError(f"client VM SSH 连接失败: {_safe_error_message(e)}")
     _log("client VM SSH 连接就绪")
 
     ssh = _SSHClient(_ssh_host, _ssh_port, "teacher", _priv_key)
@@ -1065,7 +1523,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
                      "sudo chown root:root /root/.ssh/id_rsa")
             _log("SSH 密钥复制完成")
         except K8sError as e:
-            _log(f"SSH 密钥复制失败: {e}")
+            _log(f"SSH 密钥复制失败: {_safe_error_message(e)}")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1109,7 +1567,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
                 timeout=60)
             _log(f"{vm_name}: 配置完成")
         except K8sError as e:
-            _log(f"{vm_name}: 配置失败 ({e})")
+            _log(f"{vm_name}: 配置失败 ({_safe_error_message(e)})")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1145,7 +1603,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
                         f"sudo chown -R {uname}:{uname} /home/{uname}/.ssh'",
                         timeout=30)
                 except K8sError as e:
-                    _log(f"  {vm_name}: 创建学生账户 {uname} 失败 ({e})")
+                    _log(f"  {vm_name}: 创建学生账户 {uname} 失败 ({_safe_error_message(e)})")
         _log("各节点学生账户创建完成")
 
     report(25, "正在更新集群 K8s 状态...")
@@ -1164,7 +1622,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             ssh.exec("mv /tmp/ezdown /home/teacher/ezdown && chmod 755 /home/teacher/ezdown && chown teacher:teacher /home/teacher/ezdown")
             _log("ezdown 下载完成")
         except K8sError as e:
-            _log(f"ezdown 下载失败: {e}")
+            _log(f"ezdown 下载失败: {_safe_error_message(e)}")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1182,7 +1640,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             ssh.exec("mv /tmp/kubeasz_offline.tgz /home/teacher/kubeasz_offline.tgz && chown teacher:teacher /home/teacher/kubeasz_offline.tgz")
             _log("kubeasz_offline.tgz 下载完成")
         except K8sError as e:
-            _log(f"kubeasz_offline.tgz 下载失败: {e}")
+            _log(f"kubeasz_offline.tgz 下载失败: {_safe_error_message(e)}")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1197,7 +1655,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             ssh.exec("sudo tar xzf /home/teacher/kubeasz_offline.tgz -C /etc", timeout=300)
             _log("解压完成")
         except K8sError as e:
-            _log(f"解压失败: {e}")
+            _log(f"解压失败: {_safe_error_message(e)}")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1212,7 +1670,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             ssh.exec("sudo /home/teacher/ezdown -D", timeout=600)
             _log("ezdown -D 下载完成")
         except K8sError as e:
-            _log(f"ezdown -D 失败: {e}")
+            _log(f"ezdown -D 失败: {_safe_error_message(e)}")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1228,7 +1686,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             ssh.exec("sudo /home/teacher/ezdown -S", timeout=120)
             _log("kubeasz 容器创建完成")
         except K8sError as e:
-            _log(f"ezdown -S 失败: {e}")
+            _log(f"ezdown -S 失败: {_safe_error_message(e)}")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1244,7 +1702,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             ssh.exec(f"sudo docker exec kubeasz ezctl new {name}", timeout=60)
             _log("ezctl new 完成")
         except K8sError as e:
-            _log(f"ezctl new 失败: {e}")
+            _log(f"ezctl new 失败: {_safe_error_message(e)}")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1295,7 +1753,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
         ssh.write_file(f"{cluster_dir}/hosts", _tmpl, sudo=True)
         _log("hosts 文件写入完成")
     except K8sError as e:
-        _log(f"hosts 文件写入失败: {e}")
+        _log(f"hosts 文件写入失败: {_safe_error_message(e)}")
         cluster["k8s_status"] = "failed"
         save_cluster(name, cluster)
         raise
@@ -1332,7 +1790,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             ssh.exec_streaming(f"sudo docker exec kubeasz ezctl setup {name} all", log_callback=_log)
             _log("Kubernetes 集群安装完成")
         except K8sError as e:
-            _log(f"集群安装失败: {e}")
+            _log(f"集群安装失败: {_safe_error_message(e)}")
             cluster["k8s_status"] = "failed"
             save_cluster(name, cluster)
             raise
@@ -1354,7 +1812,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
                      f"chown teacher:teacher {_kubeconfig_path}")
             _log("kubeconfig 下载完成")
         except Exception as e:
-            _log(f"kubeconfig 下载失败（可手动下载）: {e}")
+            _log(f"kubeconfig 下载失败（可手动下载）: {_safe_error_message(e)}")
     else:
         _log("kubeconfig 已存在，跳过下载")
 
@@ -1368,7 +1826,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
                 ssh.exec(f"sudo chown -R {uname}:{uname} /home/{uname}/.kube")
                 _log(f"  已复制 kubeconfig 到 {uname}")
             except K8sError as e:
-                _log(f"  复制 kubeconfig 到 {uname} 失败 ({e})")
+                _log(f"  复制 kubeconfig 到 {uname} 失败 ({_safe_error_message(e)})")
         _log("kubeconfig 复制完成")
 
     # ── 安装 kubectl ──
@@ -1380,7 +1838,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
                      "sudo chmod 755 /usr/local/bin/kubectl")
             _log("kubectl 安装完成")
         except Exception as e:
-            _log(f"kubectl 安装失败（可手动安装）: {e}")
+            _log(f"kubectl 安装失败（可手动安装）: {_safe_error_message(e)}")
     else:
         _log("kubectl 已存在，跳过安装")
 
@@ -1392,7 +1850,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
         ssh.exec("nslookup kubernetes.default.svc.cluster.local || nslookup kubernetes.default || echo 'DNS 验证跳过'", timeout=30)
         _log("DNS 验证完成")
     except Exception as e:
-        _log(f"DNS 验证警告: {e}")
+        _log(f"DNS 验证警告: {_safe_error_message(e)}")
 
     _log("验证 SSH 连通性到 master 节点")
     if masters:
@@ -1401,7 +1859,7 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
             ssh.exec(f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{first_master_ip} 'echo SSH_OK'", timeout=30)
             _log(f"SSH 连通性验证完成: root@{first_master_ip}")
         except Exception as e:
-            _log(f"SSH 验证警告: {e}")
+            _log(f"SSH 验证警告: {_safe_error_message(e)}")
 
     report(99, "正在保存 K8s 部署状态...")
     _log("更新集群 K8s 状态为 installed")
@@ -1415,9 +1873,17 @@ def deploy_k8s(name, status_callback=None, log_callback=None):
 
 
 def deploy_k8s_async(name, created_by=None):
+    actor, cluster = authorize_cluster_action(
+        created_by, Actions.CLUSTER_DEPLOY, name
+    )
+    owner_teacher_id = _cluster_owner_teacher_id(cluster)
     task_id = _new_task_id()
     _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
-                 created_by=created_by, queue="deploy")
+                 created_by=actor.id, queue="deploy",
+                 owner_teacher_id=owner_teacher_id)
+    _remember_task_retry(task_id, "deploy", name, cluster)
+    _audit("job.create", "success", actor_id=actor.id, resource_type="task",
+           resource_id=task_id, metadata={"queue": "deploy", "cluster": name})
 
     def _cb(progress, message):
         _update_task(task_id, progress=progress, message=message)
@@ -1427,12 +1893,16 @@ def deploy_k8s_async(name, created_by=None):
     def _run():
         _update_task(task_id, status="running", progress=0, message="正在初始化 K8s 部署...")
         try:
-            deploy_k8s(name, status_callback=_cb, log_callback=_log)
+            worker_actor = reload_actor(actor.id)
+            authorize_cluster_action(worker_actor.id, Actions.CLUSTER_DEPLOY, name)
+            deploy_k8s(name, status_callback=_cb, log_callback=_log,
+                       actor_id=worker_actor.id)
             _update_task(task_id, status="completed", progress=100,
              message="K8s 部署完成")
         except Exception as e:
             _update_task(task_id, status="error", progress=0,
-                         message=str(e), error=str(e))
+                         message=_safe_error_message(e),
+                         error=_safe_error_message(e))
 
     scheduler.enqueue("deploy", Task("deploy", task_id, _run))
     _cleanup_old_tasks()
@@ -1446,11 +1916,13 @@ def batch_create_clusters(group_ids, master_count, node_count,
                           pve_server_id=0,
                           created_by=None,
                           status_callback=None, log_callback=None,
-                          cancel_event=None):
+                          cancel_event=None, class_id=None):
+    actor = reload_actor(created_by)
+    validate_cluster_creation(actor, group_ids=group_ids, class_id=class_id)
     def report(p, m):
-        if status_callback: status_callback(p, m)
+        if status_callback: status_callback(p, _sanitize_text(m))
     def _log(msg):
-        if log_callback: log_callback(msg)
+        if log_callback: log_callback(_sanitize_text(msg))
 
     total = len(group_ids)
     results = []
@@ -1467,6 +1939,7 @@ def batch_create_clusters(group_ids, master_count, node_count,
                 pve_node,
                 pve_server_id=pve_server_id,
                 group_id=gid,
+                class_id=class_id,
                 created_by=created_by,
                 status_callback=lambda p, m, idx=idx, total=total: report(
                     int((idx * 100 + p * 0.5) / total), m
@@ -1481,14 +1954,16 @@ def batch_create_clusters(group_ids, master_count, node_count,
                     int((idx * 100 + 50 + p * 0.5) / total), m
                 ),
                 log_callback=lambda m, prefix=prefix: _log(prefix + m),
+                actor_id=actor.id,
             )
             results.append({"group_id": gid, "name": name, "status": "success"})
             report(int((idx + 1) * 100 / total), f"分组 {idx + 1}/{total} 完成")
         except Exception as e:
             if cancel_event and cancel_event.is_set():
                 raise K8sError("批量任务已取消") from e
-            _log(f"{prefix}失败: {e}，跳过本组")
-            results.append({"group_id": gid, "status": "failed", "error": str(e)})
+            safe_error = _safe_error_message(e)
+            _log(f"{prefix}失败: {safe_error}，跳过本组")
+            results.append({"group_id": gid, "status": "failed", "error": safe_error})
             report(int((idx + 1) * 100 / total), f"分组 {idx + 1}/{total} 失败，继续下一组")
 
     ok = sum(1 for r in results if r["status"] == "success")
@@ -1503,6 +1978,8 @@ def batch_create_clusters_async(group_ids, master_count, node_count,
                                 pve_server_id=0,
                                 created_by=None,
                                 class_id=None):
+    actor = reload_actor(created_by)
+    validate_cluster_creation(actor, group_ids=group_ids, class_id=class_id)
     task_ids = []
     for gid in group_ids:
         tid = create_cluster_async(
@@ -1513,7 +1990,7 @@ def batch_create_clusters_async(group_ids, master_count, node_count,
             pve_server_id=pve_server_id,
             group_id=gid,
             class_id=class_id,
-            created_by=created_by,
+            created_by=actor.id,
         )
         task_ids.append(tid)
     return task_ids
