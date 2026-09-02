@@ -1,5 +1,6 @@
 import io
 import codecs
+from dataclasses import dataclass
 from functools import wraps
 from inspect import signature
 import secrets
@@ -33,9 +34,31 @@ class K8sError(Exception):
     pass
 
 
+class TaskNotFoundError(LookupError):
+    def __init__(self, *args):
+        super().__init__("任务不存在")
+
+
+class TaskRetryConflict(K8sError):
+    def __init__(self, *args):
+        super().__init__("任务当前不可重试，请检查任务和资源状态")
+
+
+@dataclass(frozen=True)
+class _TaskRetryDescription:
+    operation: str
+    cluster_name: str
+    resource_fingerprint: tuple
+
+
+_RETRY_ACTIONS = {"deploy": Actions.CLUSTER_DEPLOY, "delete": Actions.CLUSTER_DELETE}
 _task_store = {}
 _task_lock = threading.Lock()
 _task_cancel_events = {}
+# These records are server-owned and must never be added to public task data.
+_task_retry_descriptions = {}
+_task_retry_reservations = {}
+_task_retry_pending = set()
 _on_task_update = None
 
 _openwrt_locks = {}
@@ -137,7 +160,7 @@ def _cluster_owner_teacher_id(cluster):
 
 
 def _update_task(task_id, status="running", progress=0, message="", result=None, error=None,
-                 created_by=None, queue=None, owner_teacher_id=None):
+                 created_by=None, queue=None, owner_teacher_id=None, retry_of=None):
     safe_message = _sanitize_text(message)
     safe_error = _sanitize_text(error) if error is not None else None
     with _task_lock:
@@ -158,6 +181,8 @@ def _update_task(task_id, status="running", progress=0, message="", result=None,
             entry["queue"] = queue
         if owner_teacher_id is not None:
             entry["owner_teacher_id"] = owner_teacher_id
+        if retry_of is not None:
+            entry["retry_of"] = retry_of
         entry["updated_at"] = _time.time()
         entry.setdefault("logs", []).append({
             "time": _time.strftime("%H:%M:%S"),
@@ -202,10 +227,20 @@ def get_task_status(task_id):
 def _cleanup_old_tasks():
     now = _time.time()
     with _task_lock:
-        expired = [tid for tid, t in _task_store.items() if now - t.get("updated_at", 0) > 1800]
+        # Protect a parent and its child only while a submission is in flight;
+        # finally in retry_task always releases this short-lived protection.
+        protected = set(_task_retry_pending)
+        protected.update(_task_retry_reservations[tid] for tid in _task_retry_pending
+                         if tid in _task_retry_reservations)
+        expired = [tid for tid, t in _task_store.items()
+                   if tid not in protected and now - t.get("updated_at", 0) > 1800]
         for tid in expired:
             del _task_store[tid]
             _task_cancel_events.pop(tid, None)
+        for records in (_task_retry_descriptions, _task_retry_reservations):
+            for tid in list(records):
+                if tid not in _task_store and tid not in protected:
+                    records.pop(tid, None)
 
 
 def cancel_task(task_id, actor_id=None):
@@ -265,11 +300,225 @@ def list_tasks(created_by=None, actor=None):
                 "created_by": entry.get("created_by"),
                 "owner_teacher_id": entry.get("owner_teacher_id"),
             }
+            if "retry_of" in entry:
+                task["retry_of"] = entry["retry_of"]
             if actor is not None and not is_allowed(actor, Actions.TASK_READ, entry):
                 continue
             result.append(task)
         result.sort(key=lambda t: t["updated_at"], reverse=True)
         return result
+
+
+def _retry_identity_id(value, *, optional=False, allow_zero=False):
+    if value is None and optional:
+        return None
+    if type(value) is int:
+        normalized = value
+    elif isinstance(value, str) and value.isascii() and value.isdecimal():
+        try:
+            normalized = int(value)
+        except ValueError:
+            raise TaskRetryConflict() from None
+        if str(normalized) != value:
+            raise TaskRetryConflict()
+    else:
+        raise TaskRetryConflict()
+    if normalized < (0 if allow_zero else 1):
+        raise TaskRetryConflict()
+    return normalized
+
+
+def _retry_resource_fingerprint(name, cluster):
+    """Copy only stable resource identities, never credentials or settings."""
+    if not isinstance(name, str) or not name or not isinstance(cluster, dict):
+        raise TaskRetryConflict()
+    if cluster.get("name", name) != name:
+        raise TaskRetryConflict()
+    values = (
+        _retry_identity_id(cluster.get("pve_server_id"), optional=True, allow_zero=True),
+        _retry_identity_id(cluster.get("created_by"), optional=True),
+        _retry_identity_id(cluster.get("group_id"), optional=True),
+    )
+    vms = cluster.get("vms")
+    if not isinstance(vms, dict):
+        raise TaskRetryConflict()
+    identities = []
+    for vm_name, vm in vms.items():
+        if (not isinstance(vm_name, str) or not vm_name or not isinstance(vm, dict)
+                or not isinstance(vm.get("node"), str) or not vm["node"]):
+            raise TaskRetryConflict()
+        identities.append((vm_name, vm["node"], _retry_identity_id(vm.get("vmid"))))
+    return (name, *values, tuple(sorted(identities)))
+
+
+def _remember_task_retry(task_id, operation, name, cluster):
+    """Called only from trusted async entry points after authorization."""
+    if operation not in _RETRY_ACTIONS:
+        return
+    try:
+        description = _TaskRetryDescription(operation, name, _retry_resource_fingerprint(name, cluster))
+    except TaskRetryConflict:
+        # An incomplete legacy resource can still follow its existing workflow,
+        # but it cannot safely provide a descriptor for automatic repetition.
+        return
+    with _task_lock:
+        if task_id in _task_store:
+            _task_retry_descriptions[task_id] = description
+
+
+def _retry_task_snapshot(task_id):
+    """Caller holds _task_lock; copying auth fields never exposes job results."""
+    task = _task_store.get(task_id)
+    if task is None:
+        return None
+    return {"task_id": task_id, "created_by": task.get("created_by"),
+            "owner_teacher_id": task.get("owner_teacher_id"), "status": task.get("status")}
+
+
+def _authorize_retry_actor(actor_id, task):
+    actor = reload_actor(actor_id)
+    return authorize_task(actor, Actions.TASK_RETRY, task)
+
+
+def _authorize_retry_resource(actor_id, description):
+    try:
+        actor, cluster = authorize_cluster_action(
+            actor_id, _RETRY_ACTIONS[description.operation], description.cluster_name
+        )
+    except ValueError:
+        raise TaskRetryConflict() from None
+    # Resource permission always precedes fingerprint/state conflict disclosure.
+    if _retry_resource_fingerprint(description.cluster_name, cluster) != description.resource_fingerprint:
+        raise TaskRetryConflict()
+    if description.operation == "deploy" and cluster.get("status") != "running":
+        raise TaskRetryConflict()
+    return actor, cluster
+
+
+def _audit_retry(outcome, actor_id, source_id, child_id=None, description=None, *, phase="enqueue", reason=None):
+    metadata = {"source_task_id": source_id, "child_task_id": child_id, "phase": phase}
+    if description is not None:
+        metadata.update(operation=description.operation, cluster_name=description.cluster_name)
+    _audit("job.retry", outcome, actor_id=actor_id, resource_type="task",
+           resource_id=source_id, reason=reason, metadata=metadata)
+
+
+def _run_retry_task(task_id, source_id, actor_id, description):
+    try:
+        with _task_lock:
+            source = _retry_task_snapshot(source_id)
+            child = _retry_task_snapshot(task_id)
+            trusted = _task_retry_descriptions.get(task_id)
+        actor = _authorize_retry_actor(actor_id, child or {"task_id": task_id})
+        if source is not None:
+            actor = _authorize_retry_actor(actor.id, source)
+        if child is None or trusted != description:
+            raise TaskRetryConflict()
+        actor, cluster = _authorize_retry_resource(actor.id, description)
+        if child["status"] in {"cancelled", "cancelling"}:
+            _update_task(task_id, status="cancelled", message="任务已取消")
+            return
+        if child["status"] != "running":
+            raise TaskRetryConflict()
+        _update_task(task_id, message="正在执行重试任务...")
+        callback = lambda progress, message: _update_task(task_id, progress=progress, message=message)
+        log_callback = lambda message: _append_log(task_id, message)
+        operation = deploy_k8s if description.operation == "deploy" else delete_cluster
+        operation(description.cluster_name, status_callback=callback,
+                  log_callback=log_callback, actor_id=actor.id)
+        _update_task(task_id, status="completed", progress=100, message="重试任务已完成")
+    except Exception as exc:
+        reason = "权限不足" if isinstance(exc, AuthorizationDenied) else _safe_error_message(exc)
+        _audit_retry("denied" if isinstance(exc, AuthorizationDenied) else "failure",
+                     actor_id, source_id, task_id, description, phase="execution", reason=reason)
+        with _task_lock:
+            exists = task_id in _task_store
+        if exists:
+            _update_task(task_id, status="error", message=reason, error=reason)
+
+
+def retry_task(task_id, actor_id=None):
+    """Retry one trusted, failed operation without modifying its parent job."""
+    child_id = None
+    description = None
+    reserved = False
+    enqueued = False
+    try:
+        actor = reload_actor(actor_id)
+        with _task_lock:
+            source = _retry_task_snapshot(task_id)
+        # With no resource ownership evidence, only admin can pass this policy
+        # and receive a 404.  Other roles cannot probe missing/foreign job IDs.
+        actor = _authorize_retry_actor(actor.id, source or {"task_id": task_id})
+        if source is None:
+            raise TaskNotFoundError()
+        with _task_lock:
+            description = _task_retry_descriptions.get(task_id)
+        if (not isinstance(description, _TaskRetryDescription)
+                or description.operation not in _RETRY_ACTIONS):
+            raise TaskRetryConflict()
+        # TASK_RETRY alone is insufficient: e.g. students may read/retry their
+        # historical own tasks in the matrix, but cannot deploy/delete clusters.
+        # Check the actual target action before revealing a status conflict.
+        actor, cluster = _authorize_retry_resource(actor.id, description)
+        child_id = _new_task_id()
+        with _task_lock:
+            source = _retry_task_snapshot(task_id)
+            if not is_allowed(actor, Actions.TASK_RETRY, source):
+                raise AuthorizationDenied("权限不足")
+            if source is None:
+                raise TaskNotFoundError()
+            if (source["status"] not in {"error", "cancelled"}
+                    or _task_retry_descriptions.get(task_id) != description
+                    or task_id in _task_retry_reservations):
+                raise TaskRetryConflict()
+            while child_id in _task_store or child_id in _task_retry_descriptions:
+                child_id = _new_task_id()
+            _task_retry_reservations[task_id] = child_id
+            _task_retry_pending.add(task_id)
+            reserved = True
+
+        actor, cluster = _authorize_retry_resource(actor.id, description)
+        owner_teacher_id = _cluster_owner_teacher_id(cluster)
+        with _task_lock:
+            current_source = _retry_task_snapshot(task_id)
+        actor = _authorize_retry_actor(actor.id, current_source or {"task_id": task_id})
+        with _task_lock:
+            current_source = _retry_task_snapshot(task_id)
+            if not is_allowed(actor, Actions.TASK_RETRY, current_source):
+                raise AuthorizationDenied("权限不足")
+            if (current_source is None or current_source["status"] not in {"error", "cancelled"}
+                    or _task_retry_descriptions.get(task_id) != description
+                    or _task_retry_reservations.get(task_id) != child_id):
+                raise TaskRetryConflict()
+            _task_retry_descriptions[child_id] = description
+        _update_task(child_id, message="重试任务排队中...", created_by=actor.id,
+                     owner_teacher_id=owner_teacher_id, queue=description.operation,
+                     retry_of=task_id)
+        def _run():
+            _run_retry_task(child_id, task_id, actor.id, description)
+
+        scheduler.enqueue(description.operation, Task(description.operation, child_id, _run))
+        enqueued = True
+    except Exception as exc:
+        _audit_retry("denied" if isinstance(exc, AuthorizationDenied) else "failure",
+                     actor_id, task_id, child_id, description,
+                     reason="权限不足" if isinstance(exc, AuthorizationDenied) else _safe_error_message(exc))
+        if isinstance(exc, (AuthorizationDenied, TaskNotFoundError, TaskRetryConflict)):
+            raise
+        raise RuntimeError("任务重试失败，请稍后重试") from None
+    finally:
+        if reserved:
+            with _task_lock:
+                _task_retry_pending.discard(task_id)
+                if not enqueued and _task_retry_reservations.get(task_id) == child_id:
+                    _task_retry_reservations.pop(task_id, None)
+                    _task_store.pop(child_id, None)
+                    _task_retry_descriptions.pop(child_id, None)
+                    _task_cancel_events.pop(child_id, None)
+    _audit_retry("success", actor.id, task_id, child_id, description)
+    _cleanup_old_tasks()
+    return child_id
 
 
 def _openwrt_lock(server_id=None):
@@ -643,6 +892,7 @@ def delete_cluster_async(name, created_by=None):
     _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
                  created_by=actor.id, queue="delete",
                  owner_teacher_id=owner_teacher_id)
+    _remember_task_retry(task_id, "delete", name, cluster)
     _audit("job.create", "success", actor_id=actor.id, resource_type="task",
            resource_id=task_id, metadata={"queue": "delete", "cluster": name})
 
@@ -1155,6 +1405,9 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
                 log_callback=_log,
                 cancel_event=ev,
             )
+            # Only a completed create can turn this job into a deployment
+            # retry.  A failed create may have left resources and stays blocked.
+            _remember_task_retry(task_id, "deploy", name, cluster)
             _append_log(task_id, "虚拟机创建完成，排队等待部署 K8s...")
 
             def _deploy_cb(p, m):
@@ -1628,6 +1881,7 @@ def deploy_k8s_async(name, created_by=None):
     _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
                  created_by=actor.id, queue="deploy",
                  owner_teacher_id=owner_teacher_id)
+    _remember_task_retry(task_id, "deploy", name, cluster)
     _audit("job.create", "success", actor_id=actor.id, resource_type="task",
            resource_id=task_id, metadata={"queue": "deploy", "cluster": name})
 

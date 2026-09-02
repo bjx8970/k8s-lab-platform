@@ -26,6 +26,7 @@ from modules.db import (
 from modules.pve_client import PVEClient, PVEError
 from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster, set_on_task_update
+from modules.k8s_manager import retry_task, TaskNotFoundError, TaskRetryConflict
 from modules.pg_client import PGClient, PGError
 from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor, update_vm_status
 from modules.authz import Actions, AuthorizationDenied, is_allowed
@@ -2134,6 +2135,19 @@ def k8s_cancel_task(task_id):
     if not ok:
         return jsonify({"error": "任务不存在"}), 404
     return jsonify({"message": "取消请求已发送"})
+
+
+@app.route("/api/k8s/tasks/<task_id>/retry", methods=["POST"])
+@login_required
+@k8s_api_error_handler
+def k8s_retry_task(task_id):
+    try:
+        new_task_id = retry_task(task_id, actor_id=current_user.id)
+    except TaskNotFoundError:
+        return jsonify({"error": "任务不存在"}), 404
+    except TaskRetryConflict:
+        return jsonify({"error": "当前任务状态不允许重试"}), 409
+    return jsonify({"task_id": new_task_id, "retry_of": task_id}), 202
 
 
 @app.route("/api/k8s/clusters/<name>/deploy", methods=["POST"])

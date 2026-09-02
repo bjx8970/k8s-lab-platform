@@ -1,12 +1,14 @@
 # Issue #1 独立验收记录
 
-当前状态：补齐无导入副作用的 `tests/__init__.py` 后，两种全套发现方式均运行 101 项且全部通过：规范发现耗时 2.936 秒，默认发现耗时 2.918 秒；两者失败、错误、跳过均为 0，进程退出码均为 0。首次规范发现因缺少包标记而加载失败的历史记录保留如下，这是测试打包问题，不是生产安全断言失败。此记录不表示生产数据已迁移、Issue 已关闭或变更已合并。
+当前结论（2026-09-02）：Issue 原六项安全代码验收通过，依据为真实接口与隔离环境测试。本轮 canonical/default 完整发现各执行一次，均 152/152 通过，分别耗时 8.807 秒和 9.121 秒，失败/错误/跳过均为 0。已包含 D 新增 13 条真实 retry 验收；D 专项此前单次 13/13、4.666 秒通过，本次未单独重复。未执行生产迁移、部署、Issue 关闭或合并。
+
+上一轮基线（本轮起点 HEAD `76ec3ce`）在补齐无副作用的测试包标记后，两种发现方式均 101/101 通过；本轮增加 51 条重试测试，最终实际总数为 152。以下保留上一轮首次测试加载失败及修正历史，不把测试打包错误当作生产安全修复失败，也不把历史 101 项混作本轮结果。
 
 ## 验证方法与范围
 
 `tests/test_issue1_acceptance.py` 导入真实 `app`、`modules.k8s_manager`、`modules.db`，通过 Flask 和 SocketIO 内存客户端调用真实接口。数据库替换为每个用例独享的临时 SQLite；首次导入 DB 模块时只屏蔽仓库 `.db_config.json` 的存在性检查，避免读取真实连接配置。测试中的口令、Token、私钥内容均为虚构标记。
 
-D 组夹具已在应用导入期间同时屏蔽数据库启动初始化、状态监控和 `SSHManager._start_cleanup_thread`；本次夹具修正未替换业务函数或修改安全断言，已包含在默认发现方式通过的 101 项之中。
+D 组夹具在应用导入期间同时屏蔽数据库启动初始化、状态监控和 `SSHManager._start_cleanup_thread`；该导入隔离保留在本轮 152 项中。重试夹具另外隔离三个私有容器，但不伪造可信描述、不替换真实授权或重试服务、不修改原安全断言。
 
 队列入队边界被捕获，后台闭包由测试显式调用；PVE/OpenWrt 构造器及必要的执行函数被模拟。没有真实 PVE、OpenWrt、SSH、浏览器 E2E 或 PostgreSQL 运行验证。登录、当前用户、退出、Origin 三组合、跨 PVE 及旧 Socket 撤权专项由 A 组测试提供，不在本文件复制基础测试。
 
@@ -28,20 +30,85 @@ D 组夹具已在应用导入期间同时屏蔽数据库启动初始化、状态
 
 | 原验收项 | 证据来源 | 当前结论 |
 | --- | --- | --- |
-| 学生/教师原始提供器写操作返回 403 | 原安全契约测试、A 组跨 PVE 用例 | 仅隔离验证通过，包含拒绝前不得调用提供器 |
-| 不可读取/取消/重试他人任务，无越权 WebSSH | 本组 Job 所属教师与出队撤权；A 组 WebSSH 撤权与通知隔离；TASK_RETRY 纯策略矩阵 | 已实现的读取、取消、WebSSH 边界仅隔离验证通过。当前无可执行重试 API，不能声称重试功能完成 |
-| 浏览器 API、SocketIO、日志不含私钥或凭据 | 本组异常/任务输出与配置回存；C 组秘密文本/加密专项；A 组终端输出脱敏 | 仅隔离验证通过，覆盖 SQLAlchemy 异常、任务及终端输出；未进行真实终端/浏览器 E2E |
-| 登录、退出、当前用户、CSRF、401/403、握手契约 | A 组真实认证接口契约及原测试 | 仅隔离验证通过，使用真实路由与内存用户/客户端 |
-| HTTP/SocketIO 可配置 Origin 白名单 | A 组白名单为空、非空、拒绝来源及转发头伪造用例 | 仅隔离验证通过，包含真实 Engine.IO 传输入口 |
-| 权限矩阵及越权审计自动化测试 | 原 authz 矩阵、本组真实审计输出、A/B/C 专项 | 补齐测试包标记后，规范及默认发现均 101 项通过；测试数量与结果一致，全部属于隔离验证 |
+| 学生/教师原始提供器写操作返回 403 | `test_security_contract`、`test_socket_security`，跨 PVE 与拒绝后零执行用例 | 通过（真实接口、隔离提供器），两种全套一致 |
+| 不可读取/取消/重试他人任务，无越权 WebSSH | `test_job_security`、`test_job_retry`、`test_socket_security`、D 新重试验收；当前执行者、通知边界、worker 再授权和资源指纹 | 通过（真实 retry，不再仅凭纯策略）；越权拒绝、一次直接 child、失败恢复均通过 |
+| 浏览器 API、SocketIO、日志不含私钥或凭据 | `test_secret_boundaries`、D 原异常用例和新重试用例；SQLAlchemy/PEM、私有描述、入队失败与审计脱敏 | 通过（虚构秘密、真实输出边界）；临时 SQLite 加密及迁移回归通过 |
+| 登录、退出、当前用户、CSRF、401/403、握手契约 | `test_http_security`、`test_http_retry`、`test_socket_security`、D retry 正反路径 | 通过（真实 HTTP/SocketIO 内存客户端）；不等同浏览器 E2E |
+| HTTP/SocketIO 可配置 Origin 白名单 | HTTP/Socket Origin 组合、Engine.IO 检查、retry 非允许 Origin 拒绝 | 通过（隔离客户端），两种全套一致 |
+| 权限矩阵及越权审计自动化测试 | `test_authz`、Job/Socket 用例和真实 audit handler；root WARNING 下 job.retry success/denied/failure | 通过；两种发现均 152 项，0 失败/错误/跳过，0 重复收集 |
 
-全部自动化验证即使通过，也仅代表上述隔离环境通过；不能据此声明真实提供器、浏览器或生产部署验收完成。
+六项安全代码验收均通过，证据范围为真实业务接口与隔离环境自动化；没有操作真实生产基础设施不等于本 Issue 代码未完成。生产凭据配置、备份与显式迁移另列为发布门槛，不混作代码验收的前置条件，也不声称已经生产部署验证。
 
-## Retry 范围与实际路由核查
+## 本轮 Retry 范围及上一轮路由历史
 
-已导入隔离的真实应用并遍历实际 `app.url_map`：共 108 条路由，路由地址或 endpoint 中包含 `retry` 的入口为 0（`RETRY_ROUTES=[]`）。这次只读检查在导入期间禁用线程启动，线程清单确认 `ADDED_THREADS=[]`；未执行测试套件、未读取真实 DB 配置或访问提供器。
+本轮新增契约为 `POST /api/k8s/tasks/<task_id>/retry`：登录、CSRF、Origin 和真实服务授权共同保护；成功返回 202 及新 task_id/retry_of，权限不足 403，管理员访问不存在的源返回 404，其他角色可能先因 TASK_RETRY 授权失败返回 403；状态/描述/重复重试冲突 409。未知入队异常返回安全 500，释放重试占用且不留下虚假的运行中子任务；恢复队列后同源请求仍可 202。成功审计关联真实 child；拒绝/失败审计关联操作者与源，不要求失败必有 child。D 专项已验证实际 url_map 恰有一个该 POST 入口及上述正反路径，未把源码文本匹配作为验收。
 
-当前无可执行重试 API。`TASK_RETRY` 角色/所有权纯策略已有矩阵验证用例，包括教师作为创建者、所属教师及无关教师等边界；这些策略用例不能证明重试工作流存在或完成。本次按协调决策不新增队列重试工作流，它属于后续任务生命周期范围。不存在的 retry URL 返回 404 属于路由不存在，不能表述为权限检查返回 403，也不以取消任务用例替代重试功能验收。
+安全支持范围：有服务端描述的 deploy/delete 在 error 或 cancelled 后可重试；create 已成功、随后 auto-deploy 失败时只重试 deploy。create 阶段失败返回 409，不重放 VM 创建，必须先检查已产生的资源并按补偿/清理流程处理。历史任务无安全描述、仍在执行或已完成、同源已有直接重试子任务等返回 409；不能通过客户端补传描述扩大执行范围。详见 [Job 安全重试](job-retry.md)。
+
+Job 仍使用既有进程内队列，历史约保留 30 分钟；重试描述与源任务同生命周期。本 Issue 不新增持久 Job、跨进程或重启恢复能力，不能声称重启后能恢复历史任务。源记录已消失时管理员得到 404，其他角色可能先得到 403；通过授权且记录尚在而无可执行描述时返回 409。
+
+上一轮历史：当时实际 `app.url_map` 为 108 条、retry 入口 0，故当时准确记录了“无可执行重试 API，只有 TASK_RETRY 纯策略用例”。该旧决策已由本轮真实 retry 工作流扩展替代，不能继续作为当前支持范围结论；上一轮的路由 404 也不应回溯描述为授权 403。
+
+## 本轮独立 Retry 专项结果
+
+新 TestCase 不继承原验收类，不重复计入旧测试。复制最小应用/临时 SQLite 初始化并复用无测试类导入的安全 DB/capture helper；源任务通过真实 HTTP/manager 入口创建并由捕获 worker 模拟失败，不直接伪造私有重试描述。`_task_retry_descriptions`、`_task_retry_reservations`、`_task_retry_pending` 逐用例替换为空容器，仅隔离残留状态，不预置可信描述。
+
+验收覆盖：真实 route/login/CSRF/Origin/404；无关教师及已分组学生 403 且无入队；教师重试管理员任务后新执行者/所属教师正确；新任务详情、日志、列表及 task_update 隔离；同源重复 409 且仅一次入队；出队前禁用用户或变更 provider/VM 指纹不得执行；deploy/delete 的 error/cancelled；running/completed/历史无描述冲突；create 失败不得复制 VM；auto-deploy 失败只重试 deploy；root WARNING 下 job.retry 成功/拒绝真实审计；入队含秘密异常 500、失败审计且无成功审计、无僵尸子任务、恢复后可再次重试。
+
+实际于本轮运行一次 `tests.test_issue1_retry_acceptance`：`Ran 13 tests in 4.666s`，`OK`；外层计时 4.666576 秒，进程退出码 0。失败 0、错误 0、跳过 0、预期失败 0、意外成功 0，无需派回 A/B 的失败。AST 解析通过，13 个独立测试方法，不含继承重复计数。
+
+实际内存 runner 设置下列路径并加载专项，在加载前增加真实凭据文件、网络、非 SQLite 引擎及真实数据库连接拒绝护栏；以下为同一专项的常规复现入口（不含外层护栏代码）：
+
+```powershell
+$env:PYTHONPATH='D:\bjx897\Documents\code\k8s-lab-platform\tmp\security-test-deps;D:\bjx897\Documents\code\k8s-lab-platform'
+python -B -c "import os, unittest, sys; os.chdir(r'D:\bjx897\Documents\code\k8s-lab-platform'); print(os.getcwd()); r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromName('tests.test_issue1_retry_acceptance')); sys.exit(not r.wasSuccessful())"
+```
+
+此次全部护栏触发为 0，创建 13 个临时 SQLite 引擎。测试结束存活线程为 MainThread、worker-create、worker-delete、两个 worker-deploy；后四个为既有进程内队列的空闲线程，无 SSH 清理线程。没有连接真实 DB/PVE/OpenWrt/SSH，没有浏览器 E2E、生产迁移或部署。
+
+上述 13 个独立测试随后全部纳入下面两次完整发现，三个私有容器隔离和入队 500 后恢复用例均未删减或放宽断言。
+
+## 本轮最终完整回归（含真实 Retry）
+
+在 A/B 最终兼容补丁完成后，规范发现与默认发现各运行一次，分别使用全新 Python 进程。既有依赖目录不变，未安装依赖、修改生产代码或真实配置。实际加载入口如下；内存 runner 在入口外增加下述安全护栏和统计，不改用例集合：
+
+```powershell
+$env:PYTHONPATH='D:\bjx897\Documents\code\k8s-lab-platform\tmp\security-test-deps;D:\bjx897\Documents\code\k8s-lab-platform'
+$env:PYTHONIOENCODING='utf-8'
+python -B -c "import os, unittest, sys; os.chdir(r'D:\bjx897\Documents\code\k8s-lab-platform'); print(os.getcwd()); r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests', top_level_dir='.')); sys.exit(not r.wasSuccessful())"
+python -B -c "import os, unittest, sys; os.chdir(r'D:\bjx897\Documents\code\k8s-lab-platform'); print(os.getcwd()); r=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests')); sys.exit(not r.wasSuccessful())"
+```
+
+| 发现入口 | 发现/实际运行/通过 | 失败 | 错误 | 跳过 | unittest 耗时 | 外层计时 | 退出码 |
+| --- | --- | ---: | ---: | ---: | --- | --- | ---: |
+| canonical：`discover('tests', top_level_dir='.')` | 152 / 152 / 152 | 0 | 0 | 0 | 8.807 秒 | 8.806918 秒 | 0 |
+| default：`discover('tests')` | 152 / 152 / 152 | 0 | 0 | 0 | 9.121 秒 | 9.120765 秒 | 0 |
+
+两次预期失败与意外成功也均为 0。原 101 项加新 `test_http_retry` 9 项、`test_job_retry` 29 项、D `test_issue1_retry_acceptance` 13 项，共增加 51 项；未重复继承原验收类。按去除可选 `tests.` 前缀后的完整用例 ID 检查，重复收集均为 0。
+
+| 模块（canonical 加 `tests.` 前缀） | 两种发现各自实际用例数 |
+| --- | ---: |
+| test_authz | 16 |
+| test_http_retry | 9 |
+| test_http_security | 4 |
+| test_issue1_acceptance | 10 |
+| test_issue1_retry_acceptance | 13 |
+| test_job_retry | 29 |
+| test_job_security | 25 |
+| test_secret_boundaries | 14 |
+| test_security_contract | 10 |
+| test_socket_security | 22 |
+| 合计 | 152 |
+
+两次护栏观测一致：对 `.db_config.json`、`.secret_key`、`.credential_key` 及旧提供器/集群配置文件的读取拦截触发 0；真实网络连接触发 0；非 SQLite 引擎及仓库内真实数据库连接触发 0。每次创建 24 个测试 SQLite 引擎。护栏覆盖加载和执行全过程，临时 SQLite 在测试后清理；不存在真实 DB/PVE/OpenWrt/SSH 访问或部署。
+
+两次发现前均只有 MainThread；发现后均增加 worker-create、worker-delete、两个 worker-deploy，属于生产队列首次导入启动的 4 个空闲守护线程。测试结束仍为这五个线程，相对发现完成新增存活线程为 0，无 SSH 清理线程遗留。不能将此描述为“从未启动后台线程”。
+
+canonical 只有 `tests.test_security_contract`、`tests.test_http_security`、`tests.test_issue1_acceptance` 这三种已检查 helper 名称。default 同时存在各自带与不带 `tests.` 前缀的模块别名，但没有重复收集测试，没有额外真实数据库连接或新增遗留线程；结果和用例数一致。优先使用 canonical，以避免双名称导入。
+
+两次均检查实际 `app.url_map`：共 109 条路由，其中 retry 入口恰有一条 `/api/k8s/tasks/<task_id>/retry`，endpoint 为 `k8s_retry_task`，methods 为 POST/OPTIONS。不存在本轮“无 retry 接口”的结论；下方旧 108 条/0 retry 只保留为历史。
+
+本轮无测试失败需要派回 A/B/C，未改安全断言。真实 PostgreSQL DDL/事务、PVE、OpenWrt、SSH、浏览器 E2E、生产迁移与部署未运行，属于另列环境/发布限制，不否定上述六项安全代码验收结论。
 
 ## 凭据迁移发布门槛
 
@@ -52,9 +119,9 @@ D 组夹具已在应用导入期间同时屏蔽数据库启动初始化、状态
 5. 在数据库副本上执行显式迁移入口 `modules.db.migrate_plaintext_credentials()`，确认失败回滚、成功解密和重复运行幂等。正常应用启动不能代替这一步。
 6. 在受控生产维护窗口运行同一显式迁移，记录不含秘密的结果；完成授权人员的配置读取、普通字段回存和提供器连接核验后恢复服务。本文未执行这些生产步骤。
 
-迁移审查检查点：迁移函数使用一个提交事务包住凭据变更；PostgreSQL 历史 `pve_servers.token_value` 和 `pve_servers.ow_password` 的短 VARCHAR 列在事务内扩为 TEXT，避免 Fernet 密文长度超限。C 组事务/DDL 模拟用例和本组 SQLite 幂等、故障回滚用例已包含在本次通过的 101 项中。PostgreSQL DDL、锁与事务行为尚无服务实测，不能标为 PostgreSQL 运行验证通过。
+迁移审查检查点：迁移函数使用一个提交事务包住凭据变更；PostgreSQL 历史 `pve_servers.token_value` 和 `pve_servers.ow_password` 的短 VARCHAR 列在事务内扩为 TEXT，避免 Fernet 密文长度超限。C 组事务/DDL 模拟用例和本组 SQLite 幂等、故障回滚用例均已在本轮两次 152 项回归中通过。PostgreSQL DDL、锁与事务行为尚无服务实测，不能标为 PostgreSQL 运行验证通过。
 
-## 已执行记录与剩余集成验证
+## 上一轮已执行历史（本轮 Retry 不在该结果内）
 
 按主会话通知，仅执行本组 10 条测试，实际命令如下：
 
@@ -100,4 +167,4 @@ ImportError: Start directory is not importable: 'D:\\bjx897\\Documents\\code\\k8
 
 补包标记后两个独立运行的隔离观测均为：真实凭据文件访问、非 SQLite 引擎创建、真实网络连接的护栏触发为 0；各创建 11 个测试 SQLite 引擎。各进程在发现阶段由生产队列模块首次导入启动 4 个空闲守护工作线程（create 1、delete 1、deploy 2）；测试结束相对发现完成时额外存活线程为 0，没有新增遗留 SSH 清理线程。不是全进程从未创建任何线程，亦未实际连接真实数据库或提供器。
 
-最终两个进程均再次确认实际路由共 108 条，retry 入口 0。规范发现包结构阻塞已解除，两种发现的测试数量、结果及隔离观测一致。没有真实 PostgreSQL、PVE、OpenWrt、SSH 或浏览器 E2E 验证；未执行生产迁移、提交或推送。重试功能未实现，不能从 TASK_RETRY 策略测试推断已有队列重试工作流；这项明确范围限制及真实环境验证仍保留。
+上一轮结束时两个进程均确认实际路由 108 条、retry 入口 0，规范发现包结构阻塞已解除，测试数量、结果及隔离观测一致。当时重试功能未实现，仅有 TASK_RETRY 策略；这段记录是历史，不代表本轮新增支持范围。真实 PostgreSQL、PVE、OpenWrt、SSH、浏览器 E2E 及生产迁移未执行；本轮按上述真实接口加隔离证据进行代码验收，发布门槛另行保留。
