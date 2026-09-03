@@ -1,0 +1,76 @@
+{
+  "format_version": "v1",
+  "description": "独立指令的接口设计示例。examples 不是执行序列，框架不运行此文件；示例 ID 均由调用方替换为明确的登记资源/连接。",
+  "examples": {
+    "list_virtual_machines": {
+      "method": "list_resources",
+      "query": {
+        "type": "compute.vm/v1",
+        "domain_id": "22222222-2222-4222-8222-222222222222",
+        "limit": 50
+      }
+    },
+    "stop_virtual_machine": {
+      "method": "execute",
+      "resource_id": "11111111-1111-4111-8111-111111111111",
+      "action": "stop",
+      "parameters": {
+        "mode": "graceful"
+      },
+      "context": {
+        "request_id": "stop-request-001",
+        "caller_ref": "application-api"
+      }
+    },
+    "delete_virtual_machine": {
+      "method": "execute",
+      "resource_id": "11111111-1111-4111-8111-111111111111",
+      "action": "delete",
+      "parameters": {
+        "purge": true
+      },
+      "context": {
+        "request_id": "delete-request-001",
+        "caller_ref": "application-api"
+      }
+    },
+    "create_interface": {
+      "method": "create",
+      "type": "openwrt.interface/v1",
+      "driver_id": "openwrt.uci/v1",
+      "connection_id": "33333333-3333-4333-8333-333333333333",
+      "parameters": {
+        "section": "lab_demo",
+        "device": "eth1.101",
+        "proto": "static",
+        "ipaddr": "10.100.1.1",
+        "netmask": "255.255.255.0",
+        "apply_mode": "commit"
+      },
+      "context": {
+        "request_id": "interface-request-001",
+        "caller_ref": "application-api"
+      }
+    },
+    "reload_network": {
+      "method": "execute",
+      "resource_id": "44444444-4444-4444-8444-444444444444",
+      "action": "reload_service",
+      "parameters": {
+        "service": "network"
+      },
+      "context": {
+        "request_id": "reload-request-001",
+        "caller_ref": "application-api"
+      }
+    },
+    "observe_kubernetes": {
+      "method": "observe",
+      "resource_id": "55555555-5555-4555-8555-555555555555"
+    },
+    "query_operation": {
+      "method": "get_operation",
+      "operation_id": "66666666-6666-4666-8666-666666666666"
+    }
+  }
+}

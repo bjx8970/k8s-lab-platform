@@ -1,0 +1,226 @@
+{
+  "api_version": "lab.template/v1",
+  "kind": "LabTemplate",
+  "metadata": {
+    "id": "python-development",
+    "version": "1.0.0",
+    "name": "Python 终端开发环境",
+    "description": "待实现的模板格式示例。依赖预制 Python/SSH 镜像和已有可访问网络，不会隐式创建网络。"
+  },
+  "parameters_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "name"
+    ],
+    "properties": {
+      "name": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{0,39}$"
+      },
+      "cores": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 8,
+        "default": 2
+      },
+      "memory_mib": {
+        "type": "integer",
+        "minimum": 1024,
+        "maximum": 16384,
+        "default": 2048
+      }
+    }
+  },
+  "requirements": [
+    {
+      "type": "compute.vm/v1",
+      "driver_id": "pve.qemu/v1",
+      "actions": [
+        "create",
+        "start",
+        "stop",
+        "delete",
+        "observe"
+      ]
+    }
+  ],
+  "resources": {
+    "workspace": {
+      "type": "compute.vm/v1",
+      "driver_id": "pve.qemu/v1",
+      "origin": "created"
+    }
+  },
+  "planning": {
+    "kind": "pve.single_vm/v1",
+    "resource": "workspace",
+    "image": "python-base",
+    "access_network": "development",
+    "name": {
+      "$ref": "parameters.name"
+    },
+    "cpu_cores": {
+      "$ref": "parameters.cores"
+    },
+    "memory_mib": {
+      "$ref": "parameters.memory_mib"
+    }
+  },
+  "failure_policy": "retain",
+  "lifecycle": {
+    "create": [
+      {
+        "id": "create_vm",
+        "kind": "resource.create",
+        "resource": "workspace",
+        "request": {
+          "$ref": "plan.workspace.create_request"
+        }
+      },
+      {
+        "id": "start_vm",
+        "kind": "resource.action",
+        "target": {
+          "$ref": "resources.workspace.resource_id"
+        },
+        "action": "start",
+        "parameters": {},
+        "skip_if_observation": {
+          "field": "power_state",
+          "equals": "running"
+        }
+      },
+      {
+        "id": "wait_ssh",
+        "kind": "wait.endpoint",
+        "endpoint": {
+          "protocol": "tcp",
+          "host": {
+            "$ref": "plan.workspace.access.host"
+          },
+          "port": {
+            "$ref": "plan.workspace.access.port"
+          }
+        },
+        "timeout_seconds": 600,
+        "interval_seconds": 5
+      }
+    ],
+    "start": [
+      {
+        "id": "start_vm",
+        "kind": "resource.action",
+        "target": {
+          "$ref": "resources.workspace.resource_id"
+        },
+        "action": "start",
+        "parameters": {},
+        "skip_if_observation": {
+          "field": "power_state",
+          "equals": "running"
+        }
+      },
+      {
+        "id": "wait_ssh",
+        "kind": "wait.endpoint",
+        "endpoint": {
+          "protocol": "tcp",
+          "host": {
+            "$ref": "plan.workspace.access.host"
+          },
+          "port": {
+            "$ref": "plan.workspace.access.port"
+          }
+        },
+        "timeout_seconds": 600,
+        "interval_seconds": 5
+      }
+    ],
+    "stop": [
+      {
+        "id": "stop_vm",
+        "kind": "resource.action",
+        "target": {
+          "$ref": "resources.workspace.resource_id"
+        },
+        "action": "stop",
+        "parameters": {
+          "mode": "graceful"
+        },
+        "skip_if_observation": {
+          "field": "power_state",
+          "equals": "stopped"
+        }
+      },
+      {
+        "id": "wait_stopped",
+        "kind": "wait.observation",
+        "target": {
+          "$ref": "resources.workspace.resource_id"
+        },
+        "field": "power_state",
+        "equals": "stopped",
+        "timeout_seconds": 300,
+        "interval_seconds": 5
+      }
+    ],
+    "delete": [
+      {
+        "id": "stop_vm",
+        "kind": "resource.action",
+        "target": {
+          "$ref": "resources.workspace.resource_id"
+        },
+        "action": "stop",
+        "parameters": {
+          "mode": "graceful"
+        },
+        "skip_if_observation": {
+          "field": "power_state",
+          "equals": "stopped"
+        }
+      },
+      {
+        "id": "wait_stopped",
+        "kind": "wait.observation",
+        "target": {
+          "$ref": "resources.workspace.resource_id"
+        },
+        "field": "power_state",
+        "equals": "stopped",
+        "timeout_seconds": 300,
+        "interval_seconds": 5
+      },
+      {
+        "id": "delete_vm",
+        "kind": "resource.action",
+        "target": {
+          "$ref": "resources.workspace.resource_id"
+        },
+        "action": "delete",
+        "parameters": {
+          "purge": true
+        }
+      }
+    ]
+  },
+  "access": [
+    {
+      "kind": "ssh",
+      "label": "Python 开发终端",
+      "resource_id": {
+        "$ref": "resources.workspace.resource_id"
+      },
+      "host": {
+        "$ref": "plan.workspace.access.host"
+      },
+      "port": {
+        "$ref": "plan.workspace.access.port"
+      },
+      "username": {
+        "$ref": "plan.workspace.access.username"
+      }
+    }
+  ]
+}

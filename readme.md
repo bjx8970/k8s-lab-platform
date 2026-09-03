@@ -2,6 +2,10 @@
 
 基于 Flask 的 Web 管理平台，自动化完成 PVE 虚拟机克隆 → OpenWrt 网络配置 → K8s 集群部署的全流程。支持多用户 RBAC 权限管理（管理员/教师/学生）。
 
+通用实验平台的四模块架构、控制平面、模板机制及实施交接见 [平台设计与接手指南](docs/platform-design/README.md)（设计稿，尚未实现）。
+
+资源管理框架及 PVE、OpenWrt、K8s、虚拟机插件的规划见 [统一资源管理框架设计](docs/resource-framework/README.md)（设计稿，尚未实现）。
+
 ## 架构
 
 ```
