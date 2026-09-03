@@ -4,6 +4,8 @@
 
 平台层的实施顺序与交接清单见 [平台实施计划](../platform-design/implementation-plan.md)。本文 M0–M6 仅描述资源子项目，不要求先实现通用编排引擎。
 
+实现基线已同步至 GitHub main `64891df`。Issue #1 的 authz/security_service、audit、credential_store 和安全重试已有代码及测试，M6 应复用这些能力；资源核心和持久化单操作执行仍待实现。
+
 ## 1. 阶段
 
 | 阶段 | 工作 | 完成条件 |
@@ -44,7 +46,7 @@ M1 可独立发布，不必等待整个框架。每类资源切换时，旧入�
 | Cluster | 保留应用模型，通过 resource_id 引用 VM/网络/K8s；无需迁入内置 lab 控制器 |
 | K8s 安装信息 | k8s.cluster 属性、安装器执行定位、API 连接 |
 | Cluster 网络字段 | 分别登记实际 VLAN/interface/DHCP/转发等；地址 allocation 仍在应用侧 |
-| SSH key/密码 | 现有 SecretStore 引用，资源元数据不复制正文 |
+| SSH key/密码 | 通过宿主 credential_store 加密适配实现新的 SecretStore 引用；资源元数据不复制正文 |
 | 内存业务任务 | 保留业务语义；新执行记录只代表单条资源指令 |
 
 框架不创建 rf_relations、rf_operation_steps、资源删除策略或业务分配表。应用可自行实现这些概念，但它们不属于插件接入前提。
@@ -119,4 +121,4 @@ M1 可独立发布，不必等待整个框架。每类资源切换时，旧入�
 
 ## 8. 下一步实现顺序
 
-先完成 M1 的定位修复，然后实现 register/list/get/execute + VM/PVE 的最小闭环，再接入 OpenWrt 与 K8s。核心可先用测试 handler 验证不依赖业务模块运行。框架实现不以完成新的工作流引擎、权限框架或网络规划器为前置条件。
+先完成 M1 的定位修复，然后实现 register/list/get/execute + VM/PVE 的最小闭环，再接入 OpenWrt 与 K8s。核心可先用测试 handler 验证不依赖业务模块运行。框架实现不以完成新的工作流引擎、权限框架或网络规划器为前置条件。已有[安全验收](../issue-1-acceptance.md)和[重试约定](../job-retry.md)作为应用回归基线，不能因抽取资源框架而删除或降低原约束。

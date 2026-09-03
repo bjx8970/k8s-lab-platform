@@ -63,6 +63,8 @@ Content-Type: application/json
 }
 ```
 
+沿用现有 Session、CSRF 和 Origin 规则：浏览器先从 `/api/csrf-token` 获取令牌，变更请求携带 `X-CSRFToken`，Origin 按 `K8S_LAB_ALLOWED_ORIGINS` 校验。上面的 JSON 只展示业务载荷，不表示新路由豁免现有入口保护。
+
 认证主体、业务归属授权和内部 caller_ref 由服务端建立。请求可以指定目标课程/组，但必须通过真实成员关系校验，不能据此直接获得权限。
 
 通过授权和模板参数校验后，在同一数据库事务中写入 Environment、Task、去重记录，再返回：
@@ -114,6 +116,8 @@ authenticate(credentials_or_session) -> Principal | AuthenticationError
 authorize(principal, action, target, scope, parameters) -> Decision
 Decision = {allow, reason_code, visible_scope?}
 ```
+
+现有 `authz.is_allowed/require_allowed` 与 `security_service` 是适配基线，以上接口为未来统一外观，不要求另建一套权限矩阵。
 
 Principal 与目标归属从服务端可信信息构造。visible_scope 用于生成资源查询过滤或环境查询条件，不把未经验证的客户端过滤器当成授权范围。
 
@@ -170,6 +174,8 @@ lease/claim_revision 能防止旧 worker 覆盖数据库状态，不能阻止已
 | 插件版本缺失或不兼容 | 停止推进并保留历史，不能用不兼容驱动重放 |
 | PostgreSQL 不可用 | 不受理新的变更、不提交未持久化命令；已有外部作业可能继续运行 |
 
+当前应用已经提供 `/api/k8s/tasks/<task_id>/retry`，其安全重试限制见 [Job 安全重试](../job-retry.md)。它仍使用进程内记录；这里的持久化 Task/Operation 恢复为后续目标，迁移时保留现有授权、一次直接重试子任务及拒绝重放未确认 create 的约束，不将既有 retry 等同于通用 resume。
+
 首版失败策略为保留资源并停止后续步骤。补偿是编排显式记录的新步骤/清理任务，不属于资源框架。失败的外部命令重新执行时分配新 attempt/request_id；读取旧操作结果和恢复轮询继续使用原记录。
 
 resume 用于继续已确认可继续的任务，不允许把用户提交的 succeeded 字段当成外部执行事实。未知结果应通过查询得到足够证据并记录；无法确认时继续 blocked，由有权限的人员明确制定后续清理/重建操作。
@@ -180,6 +186,6 @@ cancel 先进入 cancelling，停止调度新步骤，并尝试取消支持取�
 
 持久化 task/operation 是状态事实来源。首版以前端轮询为完整路径，Socket.IO 仅用于提示刷新，断线重连后重新读取状态，不要求消息总线或完整事件溯源。
 
-每个步骤关联 correlation_id、task_id、step_id、operation_id、resource_id 和适用的 external_task_ref。日志只输出必要且脱敏的错误和进度。状态写入提交后才发通知，通知失败不改变操作结果。
+每个步骤关联 correlation_id、task_id、step_id、operation_id、resource_id 和适用的 external_task_ref。日志只输出必要且脱敏的错误和进度，复用现有 `modules/audit.py` 的安全审计与流式脱敏；凭据存储和迁移沿用[现有凭据设计](../security-credentials.md)。状态写入提交后才发通知，通知失败不改变操作结果。
 
 状态缓存统一按 resource_id 定位，并附 observed_at/stale；过渡期使用完整服务器/node/VMID。禁止仅凭 VM 正在 running 就认定上一次 reboot 已执行完成。

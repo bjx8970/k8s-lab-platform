@@ -56,6 +56,8 @@ flowchart TD
 
 ## 5. 鉴权与教学规则
 
+现有 `modules/authz.py` 已提供无 Flask 依赖的授权策略，`modules/security_service.py` 已实现主体/对象重载及服务层授权。目标鉴权模块以这些实现为基础抽取接口；HTTP、Socket.IO、worker 和 WebSSH 的既有授权边界及审计继续复用。
+
 鉴权接受可序列化请求上下文，主体来自服务端会话或已验证的内部身份，不采用请求正文声明的角色。资源/环境的归属从其所属服务读取；资源框架中的 labels 不是授权事实来源。
 
 “这个学生是否能操作此环境”属于鉴权；“共享关机投票是否通过”属于教学应用规则；“先关 VM 再删除”属于流程定义。三个判断不加入资源插件。
@@ -124,7 +126,7 @@ sequenceDiagram
 
 ## 9. 运行与依赖
 
-建议目标包结构（不代表当前已存在）：
+建议目标包结构（不代表当前已存在）：现有 `authz.py`、`security_service.py`、`audit.py` 和 `credential_store.py` 可以先保持位置并通过适配接入，不要求先重命名或重写。
 
 ```text
 modules/
@@ -145,7 +147,7 @@ resource_plugins/         # virtual_machine、pve、openwrt、k8s
 
 首版一个 API 进程和一个后台 worker 进程，worker 内区分编排推进和资源操作执行。二者调用同一资源库及其持久化接口；开发时可以同进程运行，但禁止通过模块导入隐式启动重复 worker。长时间外部任务通过轮询推进，不长期占住编排调度线程。
 
-队列事实来源为 PostgreSQL 中的任务/操作记录，进程内队列只能用于唤醒。各进程显式装配数据库连接与插件。凭据通过连接的 secret_ref 解析，模板和计划只引用凭据，不复制正文。
+队列事实来源为 PostgreSQL 中的任务/操作记录，进程内队列只能用于唤醒。各进程显式装配数据库连接与插件。凭据通过连接的 secret_ref 解析，模板和计划只引用凭据，不复制正文。宿主适配复用 `modules/credential_store.py` 的加密/解密及 `modules/audit.py` 的脱敏处理；新 SecretStore 接口不替代现有密钥管理与显式迁移机制。
 
 扩展多个 worker 前，必须补齐数据库领取租约、资源域互斥和故障恢复。跨进程后不能继续依赖 threading.Lock 保证 OpenWrt 写入串行。首版的线程数是配置项，不等于 HA 保证。
 
