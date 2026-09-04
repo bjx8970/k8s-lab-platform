@@ -39,3 +39,11 @@ python -B -c "from modules.db import migrate_plaintext_credentials; migrate_plai
 安全审计通过独立的 `security.audit` INFO handler 输出到标准错误流，可在服务进程的 stderr 或其服务管理器收集的日志中查看 JSON 记录，不依赖 root logger 的级别。审计处理完整私钥块、结构化秘密字段和带密码 URI。`token_name` 是非秘密标识，保留用于定位配置；`token_value`、`ow_password` 等对外仍返回 `[REDACTED]`。更新时省略、空值、`****` 或 `[REDACTED]` 均表示保留原凭据；新建不接受脱敏占位符作为凭据。
 
 流式日志必须在同一输出流内复用 `SecretTextSanitizer`，对每个 chunk 调用 `feed()`，结束时调用 `flush()`，以跨越逐行或 chunk 边界抑制私钥块。将输出继续交给 `sanitize_text()` 处理完整的秘密字段和 URI。无状态函数无法识别完全脱离 BEGIN 标记的私钥正文；不要对每行重新创建流式实例。未闭合的私钥块到流结束仍保持抑制。
+
+## 控制面目标适配
+
+当前 `enc:v1` 与 `K8S_LAB_CREDENTIAL_KEY` 继续作为迁移基线。引入 Resource Executor 后，Connection、Profile、PlanRevision 和 Operation 只保存 `secret_ref`，不复制密文或明文。
+
+目标 SecretStore 必须提供版本化引用：Operation 受理时固定 `secret_version_ref`；轮换凭据产生新版本，不能让排队中的旧 Operation 静默改用另一份秘密。旧版本至少保留到引用它的 Operation 进入终态并超过审计/恢复保留期。若旧版本已不可用，Executor 返回明确的 SecretVersionUnavailable，不尝试猜测或回退明文。
+
+凭据轮换、停用和删除属于高权限受审计操作。删除前检查技术引用是 SecretStore 的一致性要求，不等同资源业务依赖判断；控制面仍负责决定何时允许执行轮换。

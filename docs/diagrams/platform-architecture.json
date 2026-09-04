@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "通用实验平台对象驱动控制面",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    {
+      "id": "client",
+      "type": "external",
+      "label": "浏览器 / API 客户端",
+      "sublabel": "HTTP · Socket.IO",
+      "pos": [390, 20],
+      "size": [180, 58]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "Platform API Server",
+      "sublabel": "AuthN/AuthZ · Admission · CRUD · Watch",
+      "pos": [355, 110],
+      "size": [250, 82],
+      "tag": "api"
+    },
+    {
+      "id": "postgres",
+      "type": "database",
+      "label": "PostgreSQL",
+      "sublabel": "对象状态 · resourceVersion · lease · outbox",
+      "pos": [350, 265],
+      "size": [260, 78],
+      "tag": "storage"
+    },
+    {
+      "id": "scheduler",
+      "type": "backend",
+      "label": "Scheduler",
+      "sublabel": "Filter · Score · Reserve · Bind",
+      "pos": [45, 410],
+      "size": [220, 72],
+      "tag": "scheduler"
+    },
+    {
+      "id": "controllers",
+      "type": "backend",
+      "label": "Controller Manager",
+      "sublabel": "Reconcile · PlanRevision · Finalizer",
+      "pos": [345, 410],
+      "size": [270, 72],
+      "tag": "controller"
+    },
+    {
+      "id": "executor",
+      "type": "backend",
+      "label": "Resource Executor",
+      "sublabel": "Operation lease · snapshot · poll",
+      "pos": [700, 410],
+      "size": [235, 72],
+      "tag": "execution"
+    },
+    {
+      "id": "resources",
+      "type": "backend",
+      "label": "Resource Framework",
+      "sublabel": "ResourceService · Binding · Observation",
+      "pos": [1010, 410],
+      "size": [245, 72],
+      "tag": "resource"
+    },
+    {
+      "id": "pve",
+      "type": "external",
+      "label": "PVE / VM",
+      "sublabel": "pve.qemu/v1 · UPID",
+      "pos": [1325, 225],
+      "size": [195, 62],
+      "tag": "plugin"
+    },
+    {
+      "id": "openwrt",
+      "type": "external",
+      "label": "OpenWrt",
+      "sublabel": "UCI · domain lock",
+      "pos": [1325, 345],
+      "size": [195, 62],
+      "tag": "plugin"
+    },
+    {
+      "id": "k8s",
+      "type": "external",
+      "label": "K8s / kubeasz",
+      "sublabel": "deterministic remote job",
+      "pos": [1325, 465],
+      "size": [195, 62],
+      "tag": "plugin"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "API 进程",
+      "wraps": ["api"],
+      "pad": 14
+    },
+    {
+      "kind": "region",
+      "label": "Control-plane Worker",
+      "wraps": ["scheduler", "controllers", "executor", "resources"],
+      "pad": 17
+    },
+    {
+      "kind": "region",
+      "label": "持久化对象层",
+      "wraps": ["postgres"],
+      "pad": 14
+    },
+    {
+      "kind": "region",
+      "label": "外部平台与插件",
+      "wraps": ["pve", "openwrt", "k8s"],
+      "pad": 15
+    }
+  ],
+  "connections": [
+    {
+      "from": "client",
+      "to": "api",
+      "label": "提交 / 查询对象",
+      "variant": "emphasis"
+    },
+    {
+      "from": "api",
+      "to": "postgres",
+      "label": "事务写 spec / 读 status",
+      "variant": "emphasis"
+    },
+    {
+      "from": "postgres",
+      "to": "scheduler",
+      "label": "LIST/WATCH 未绑定 generation",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "scheduler",
+      "to": "postgres",
+      "label": "Placement / Allocation",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "from": "postgres",
+      "to": "controllers",
+      "label": "LIST/WATCH spec/status",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "controllers",
+      "to": "postgres",
+      "label": "PlanRevision / Operation / Conditions",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "variant": "emphasis"
+    },
+    {
+      "from": "postgres",
+      "to": "executor",
+      "label": "领取 Pending Operation",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "from": "executor",
+      "to": "resources",
+      "label": "固定目标的单资源命令",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "from": "executor",
+      "to": "postgres",
+      "label": "Operation / Resource status",
+      "fromSide": "top",
+      "toSide": "right"
+    },
+    {
+      "from": "resources",
+      "to": "pve",
+      "label": "PVE API / UPID poll",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "from": "resources",
+      "to": "openwrt",
+      "label": "SSH / UCI",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "from": "resources",
+      "to": "k8s",
+      "label": "API / remote job",
+      "fromSide": "right",
+      "toSide": "left"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "五个控制面角色",
+      "items": [
+        "API Server 只管理对象和授权，不调用规划器或插件",
+        "PostgreSQL 是正确性来源，通知只降低延迟",
+        "Scheduler 只做 placement/allocation，无外部副作用",
+        "Controller reconcile spec/status，并创建确定性 Operation",
+        "Executor 执行一次性 Operation，保存真实外部结果"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "对象驱动路径",
+      "items": [
+        "Environment.spec → Placement → PlanRevision → Operation",
+        "Operation → Resource Framework → 外部平台 → Resource.status",
+        "Environment.status/conditions 由 Controller 根据事实更新",
+        "finalizer 在 Unknown 或未释放 Allocation 时保持"
+      ]
+    }
+  ]
+}
