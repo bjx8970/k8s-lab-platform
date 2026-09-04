@@ -18,6 +18,7 @@
         "mode": "graceful"
       },
       "context": {
+        "server_scope": "api:user:42:resources",
         "request_id": "stop-request-001",
         "caller_ref": "application-api"
       }
@@ -30,6 +31,7 @@
         "purge": true
       },
       "context": {
+        "server_scope": "api:user:42:resources",
         "request_id": "delete-request-001",
         "caller_ref": "application-api"
       }
@@ -48,6 +50,7 @@
         "apply_mode": "commit"
       },
       "context": {
+        "server_scope": "controller:environment:env-demo",
         "request_id": "interface-request-001",
         "caller_ref": "application-api"
       }
@@ -60,6 +63,7 @@
         "service": "network"
       },
       "context": {
+        "server_scope": "controller:environment:env-demo",
         "request_id": "reload-request-001",
         "caller_ref": "application-api"
       }

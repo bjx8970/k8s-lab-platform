@@ -37,9 +37,8 @@ UCI 的节表示参考 [OpenWrt 官方接口说明](https://openwrt.org/docs/gui
 
 ## 提交和服务应用
 
-写动作使用显式 `apply_mode`：
+写动作使用显式 `apply_mode`。首版只支持以下安全模式：
 
-- `none`：执行当前节的 UCI 写入，暂不 commit。
 - `commit`（默认）：写入并 commit 相关 package。
 - `reload`：写入、commit，并 reload 调用方指定的 service。
 - `restart`：写入、commit，并 restart 调用方指定的 service。
@@ -48,7 +47,7 @@ reload/restart 的 service 必填，由插件支持的服务名称 schema 校验
 
 保存配置与服务应用分别返回结果，参考 [OpenWrt 防火墙配置说明](https://openwrt.org/docs/guide-user/firewall/firewall_configuration)。例如 commit 成功而 restart 断线时，返回 committed=true、服务执行结果 unknown，不报告整套网络已经可用。
 
-同一条写指令的 set/commit 序列可在 domain 上串行，避免本执行器命令交错。这只是传输层技术互斥，不保证调用方分别发送的多条命令形成事务；none 模式下的多个命令如何安排由调用方负责。
+同一条写指令的 set/commit/apply 序列使用 PostgreSQL advisory lock 或数据库租约按 domain 跨进程串行，避免多个 Executor 命令交错。首版禁止 `apply_mode=none`，因为 UCI 未提交候选配置是路由器全局状态，无法安全归属于单个 Operation。未来如需批处理，必须设计显式 change-set/session 及跨 Operation 锁。
 
 ## 删除与失败
 

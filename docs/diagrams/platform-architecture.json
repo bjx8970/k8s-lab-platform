@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "通用实验平台控制平面架构",
+    "title": "通用实验平台对象驱动控制面",
     "locale": "zh-CN",
     "quality_profile": "showcase"
   },
@@ -11,405 +11,223 @@
       "id": "client",
       "type": "external",
       "label": "浏览器 / API 客户端",
-      "sublabel": "页面 · API · WebSocket",
-      "pos": [
-        350,
-        25
-      ],
-      "size": [
-        160,
-        60
-      ]
+      "sublabel": "HTTP · Socket.IO",
+      "pos": [390, 20],
+      "size": [180, 58]
     },
     {
       "id": "api",
       "type": "backend",
-      "label": "API 模块",
-      "sublabel": "全局管理 · 鉴权 · 定义文件持久化",
-      "pos": [
-        330,
-        120
-      ],
-      "size": [
-        200,
-        90
-      ],
+      "label": "Platform API Server",
+      "sublabel": "AuthN/AuthZ · Admission · CRUD · Watch",
+      "pos": [355, 110],
+      "size": [250, 82],
       "tag": "api"
-    },
-    {
-      "id": "orch",
-      "type": "backend",
-      "label": "编排模块",
-      "sublabel": "生成标准定义文件",
-      "pos": [
-        80,
-        290
-      ],
-      "size": [
-        200,
-        70
-      ],
-      "tag": "orchestration"
-    },
-    {
-      "id": "exec",
-      "type": "backend",
-      "label": "执行模块",
-      "sublabel": "消费定义文件 · 执行资源命令",
-      "pos": [
-        330,
-        290
-      ],
-      "size": [
-        200,
-        70
-      ],
-      "tag": "execution"
-    },
-    {
-      "id": "resources",
-      "type": "backend",
-      "label": "资源管理模块",
-      "sublabel": "ResourceService",
-      "pos": [
-        620,
-        280
-      ],
-      "size": [
-        200,
-        72
-      ],
-      "tag": "resource"
-    },
-    {
-      "id": "registry",
-      "type": "backend",
-      "label": "插件与驱动注册表",
-      "sublabel": "类型 · 连接 · 驱动",
-      "pos": [
-        850,
-        280
-      ],
-      "size": [
-        200,
-        72
-      ],
-      "tag": "resource"
     },
     {
       "id": "postgres",
       "type": "database",
       "label": "PostgreSQL",
-      "sublabel": "状态与定义文件",
-      "pos": [
-        850,
-        420
-      ],
-      "size": [
-        200,
-        68
-      ],
+      "sublabel": "对象状态 · resourceVersion · lease · outbox",
+      "pos": [350, 265],
+      "size": [260, 78],
       "tag": "storage"
+    },
+    {
+      "id": "scheduler",
+      "type": "backend",
+      "label": "Scheduler",
+      "sublabel": "Filter · Score · Reserve · Bind",
+      "pos": [45, 410],
+      "size": [220, 72],
+      "tag": "scheduler"
+    },
+    {
+      "id": "controllers",
+      "type": "backend",
+      "label": "Controller Manager",
+      "sublabel": "Reconcile · PlanRevision · Finalizer",
+      "pos": [345, 410],
+      "size": [270, 72],
+      "tag": "controller"
+    },
+    {
+      "id": "executor",
+      "type": "backend",
+      "label": "Resource Executor",
+      "sublabel": "Operation lease · snapshot · poll",
+      "pos": [700, 410],
+      "size": [235, 72],
+      "tag": "execution"
+    },
+    {
+      "id": "resources",
+      "type": "backend",
+      "label": "Resource Framework",
+      "sublabel": "ResourceService · Binding · Observation",
+      "pos": [1010, 410],
+      "size": [245, 72],
+      "tag": "resource"
     },
     {
       "id": "pve",
       "type": "external",
-      "label": "PVE / VM 插件",
-      "sublabel": "pve.qemu/v1",
-      "pos": [
-        1140,
-        60
-      ],
-      "size": [
-        196,
-        65
-      ],
+      "label": "PVE / VM",
+      "sublabel": "pve.qemu/v1 · UPID",
+      "pos": [1325, 225],
+      "size": [195, 62],
       "tag": "plugin"
     },
     {
       "id": "openwrt",
       "type": "external",
-      "label": "OpenWrt 插件",
-      "sublabel": "VLAN · DHCP · zone",
-      "pos": [
-        1140,
-        220
-      ],
-      "size": [
-        196,
-        65
-      ],
+      "label": "OpenWrt",
+      "sublabel": "UCI · domain lock",
+      "pos": [1325, 345],
+      "size": [195, 62],
       "tag": "plugin"
     },
     {
       "id": "k8s",
       "type": "external",
-      "label": "K8s 插件",
-      "sublabel": "集群登记 · kubeasz",
-      "pos": [
-        1140,
-        380
-      ],
-      "size": [
-        196,
-        65
-      ],
+      "label": "K8s / kubeasz",
+      "sublabel": "deterministic remote job",
+      "pos": [1325, 465],
+      "size": [195, 62],
       "tag": "plugin"
     }
   ],
   "boundaries": [
     {
       "kind": "region",
-      "label": "平台控制平面（模块化单体：API 进程 + Worker 进程）",
-      "wraps": [
-        "api",
-        "orch",
-        "exec",
-        "resources",
-        "registry"
-      ],
-      "pad": 18
-    },
-    {
-      "kind": "security-group",
-      "label": "编排模块",
-      "wraps": [
-        "orch"
-      ],
-      "pad": 12
-    },
-    {
-      "kind": "security-group",
-      "label": "执行模块",
-      "wraps": [
-        "exec"
-      ],
-      "pad": 12
-    },
-    {
-      "kind": "security-group",
-      "label": "资源管理模块",
-      "wraps": [
-        "resources",
-        "registry"
-      ],
-      "pad": 12
+      "label": "API 进程",
+      "wraps": ["api"],
+      "pad": 14
     },
     {
       "kind": "region",
-      "label": "资源插件与外部平台",
-      "wraps": [
-        "pve",
-        "openwrt",
-        "k8s"
-      ],
+      "label": "Control-plane Worker",
+      "wraps": ["scheduler", "controllers", "executor", "resources"],
+      "pad": 17
+    },
+    {
+      "kind": "region",
+      "label": "持久化对象层",
+      "wraps": ["postgres"],
+      "pad": 14
+    },
+    {
+      "kind": "region",
+      "label": "外部平台与插件",
+      "wraps": ["pve", "openwrt", "k8s"],
       "pad": 15
-    },
-    {
-      "kind": "region",
-      "label": "数据层",
-      "wraps": [
-        "postgres"
-      ],
-      "pad": 13
     }
   ],
   "connections": [
     {
       "from": "client",
       "to": "api",
-      "label": "HTTP / Socket.IO",
-      "variant": "emphasis",
-      "labelAt": [
-        430,
-        99
-      ]
+      "label": "提交 / 查询对象",
+      "variant": "emphasis"
     },
     {
       "from": "api",
-      "to": "orch",
-      "label": "受理生命周期请求",
-      "fromSide": "left",
-      "toSide": "top"
-    },
-    {
-      "from": "orch",
-      "to": "api",
-      "label": "交回定义文件",
-      "variant": "emphasis",
-      "fromSide": "left",
-      "toSide": "left",
-      "via": [
-        [
-          40,
-          325
-        ],
-        [
-          40,
-          165
-        ]
-      ],
-      "labelAt": [
-        54,
-        245
-      ]
-    },
-    {
-      "from": "api",
-      "to": "exec",
-      "label": "分发定义文件",
-      "fromSide": "bottom",
-      "toSide": "top",
-      "labelAt": [
-        430,
-        224
-      ]
-    },
-    {
-      "from": "api",
-      "to": "resources",
-      "label": "直接资源指令",
-      "fromSide": "right",
-      "toSide": "top"
-    },
-    {
-      "from": "exec",
-      "to": "resources",
-      "label": "执行资源命令",
-      "fromSide": "right",
-      "toSide": "left",
-      "labelAt": [
-        554,
-        374
-      ]
-    },
-    {
-      "from": "orch",
       "to": "postgres",
-      "label": "持久化 Environment + Task + 定义文件",
+      "label": "事务写 spec / 读 status",
+      "variant": "emphasis"
+    },
+    {
+      "from": "postgres",
+      "to": "scheduler",
+      "label": "LIST/WATCH 未绑定 generation",
       "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "scheduler",
+      "to": "postgres",
+      "label": "Placement / Allocation",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "from": "postgres",
+      "to": "controllers",
+      "label": "LIST/WATCH spec/status",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "from": "controllers",
+      "to": "postgres",
+      "label": "PlanRevision / Operation / Conditions",
+      "fromSide": "top",
       "toSide": "bottom",
-      "via": [
-        [
-          180,
-          560
-        ],
-        [
-          950,
-          560
-        ]
-      ]
+      "variant": "emphasis"
     },
     {
-      "from": "resources",
+      "from": "postgres",
+      "to": "executor",
+      "label": "领取 Pending Operation",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "from": "executor",
+      "to": "resources",
+      "label": "固定目标的单资源命令",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "from": "executor",
       "to": "postgres",
-      "label": "保存 Operation / Observation",
-      "fromSide": "bottom",
-      "toSide": "left",
-      "via": [
-        [
-          720,
-          454
-        ]
-      ],
-      "labelAt": [
-        790,
-        502
-      ]
+      "label": "Operation / Resource status",
+      "fromSide": "top",
+      "toSide": "right"
     },
     {
       "from": "resources",
-      "to": "registry",
-      "label": "匹配驱动",
-      "fromSide": "right",
-      "toSide": "left",
-      "labelAt": [
-        835,
-        366
-      ]
-    },
-    {
-      "from": "registry",
       "to": "pve",
-      "label": "pve.qemu/v1",
+      "label": "PVE API / UPID poll",
       "fromSide": "right",
-      "toSide": "left",
-      "via": [
-        [
-          1070,
-          316
-        ],
-        [
-          1070,
-          92.5
-        ]
-      ],
-      "labelAt": [
-        1248,
-        140
-      ]
+      "toSide": "left"
     },
     {
-      "from": "registry",
+      "from": "resources",
       "to": "openwrt",
-      "label": "UCI 单项指令",
+      "label": "SSH / UCI",
       "fromSide": "right",
-      "toSide": "left",
-      "via": [
-        [
-          1095,
-          316
-        ],
-        [
-          1095,
-          252.5
-        ]
-      ],
-      "labelAt": [
-        1248,
-        300
-      ]
+      "toSide": "left"
     },
     {
-      "from": "registry",
+      "from": "resources",
       "to": "k8s",
-      "label": "kubeasz 安装操作",
+      "label": "API / remote job",
       "fromSide": "right",
-      "toSide": "left",
-      "via": [
-        [
-          1115,
-          316
-        ],
-        [
-          1115,
-          412.5
-        ]
-      ],
-      "labelAt": [
-        1248,
-        460
-      ]
+      "toSide": "left"
     }
   ],
   "cards": [
     {
       "dot": "cyan",
-      "title": "四层职责",
+      "title": "五个控制面角色",
       "items": [
-        "API：统一入口、鉴权、定义文件持久化与全局调度分发",
-        "编排：读模板、生成标准定义文件、分配资源，不执行",
-        "执行：消费定义文件、逐步执行资源命令、推进任务",
-        "资源管理：登记、列出、查询、指令分发与单条结果"
+        "API Server 只管理对象和授权，不调用规划器或插件",
+        "PostgreSQL 是正确性来源，通知只降低延迟",
+        "Scheduler 只做 placement/allocation，无外部副作用",
+        "Controller reconcile spec/status，并创建确定性 Operation",
+        "Executor 执行一次性 Operation，保存真实外部结果"
       ]
     },
     {
       "dot": "emerald",
-      "title": "定义文件流转",
+      "title": "对象驱动路径",
       "items": [
-        "创建/销毁：API 受理 → 编排生成定义文件 → 交回 API → 持久化 → 分发执行模块",
-        "执行模块调用资源管理执行资源命令，推进步骤与环境状态",
-        "直接资源指令：API 鉴权 → 资源服务 → operation_id"
+        "Environment.spec → Placement → PlanRevision → Operation",
+        "Operation → Resource Framework → 外部平台 → Resource.status",
+        "Environment.status/conditions 由 Controller 根据事实更新",
+        "finalizer 在 Unknown 或未释放 Allocation 时保持"
       ]
     }
   ]

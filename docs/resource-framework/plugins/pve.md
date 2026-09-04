@@ -25,12 +25,12 @@ VM 使用 resource_id 对外，绑定包含 domain、VMID、当前 node 和连�
 
 - `pve_platforms(resource_id FK,domain_id FK)`。
 - `pve_guests(binding_id FK,domain_id FK,vmid,node,guest_kind,retired_at)`。
-- 有效绑定的 `(domain_id,vmid)` 唯一；同域 `(domain_id,node,vmid)` 复合定位也建立约束。
+- 有效绑定的 `(domain_id,vmid)` 唯一；`(domain_id,node,vmid)` 可建普通查询索引，但不能作为允许重复 VMID 的身份约束。
 - `(binding_id,domain_id)` 对应 rf_bindings 的完整唯一键，保证外键一致；node 可是平台原生名称，不要求先有一条业务节点资源。
 
 这是外部身份与数据库一致性约束，不表示资源之间有生命周期依赖。VMID 身份与节点定位的区分参考 [PVE 配置与 VMID 说明](https://pve.proxmox.com/wiki/Migrate_to_Proxmox_VE)。
 
-过渡期旧 vms 表添加 pve_server_id FK、三元复合唯一及 resource_id 映射，撤销 vmid 全局唯一。旧 server→domain 映射由迁移程序明确提供。
+过渡期旧 vms 表添加 pve_server_id FK、`(pve_server_id,vmid)` 唯一及 resource_id 映射，撤销 vmid 全局唯一。node 是 locator。旧 server→domain 映射由迁移程序明确提供。
 
 ## 指令适配
 
@@ -68,7 +68,7 @@ unregister 只关闭登记，保存历史绑定以满足记录完整性。物理
 
 `PVEClient.clone_template()` 当前丢弃 clone 任务返回值；启停也提前返回完成消息。驱动需要保留 UPID 并区分提交与完成。
 
-`release_vm()` 当前包含先停止运行 VM 的逻辑，不能直接用作新 delete 的透明适配。新驱动实现直接删除调用；原业务若需要原来的停止→删除行为，应在外部编排模块分别发送两条指令。
+`release_vm()` 当前包含先停止运行 VM 的逻辑，不能直接用作新 delete 的透明适配。新驱动实现直接删除调用；原业务若需要停止→删除，由 Environment finalizer 根据 PlanRevision 分别创建两条 Operation。
 
 ## 验收
 

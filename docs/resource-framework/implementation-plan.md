@@ -1,8 +1,8 @@
 # 实施、迁移与验收计划
 
-本计划遵循[资源执行层边界](README.md)。框架实施与业务接入分别验收，不再包含内置业务编排引擎。
+本计划遵循[资源执行层边界](README.md)。框架实施与控制面接入分别验收，不包含 Environment/Scheduler/PlanRevision/finalizer。
 
-平台层的实施顺序与交接清单见 [平台实施计划](../platform-design/implementation-plan.md)。本文 M0–M6 仅描述资源子项目，不要求先实现通用编排引擎。
+平台层的实施顺序与交接清单见[平台实施计划](../platform-design/implementation-plan.md)。本文 M0–M6 仅描述资源子项目；M2 的持久化 Operation 纵向闭环先于完整 Controller。
 
 实现基线已同步至 GitHub main `64891df`。Issue #1 的 authz/security_service、audit、credential_store 和安全重试已有代码及测试，M6 应复用这些能力；资源核心和持久化单操作执行仍待实现。
 
@@ -11,12 +11,12 @@
 | 阶段 | 工作 | 完成条件 |
 |---|---|---|
 | M0 设计修订 | 收缩模型/SDK/四插件，替换蓝图为指令示例 | 所有文档采用相同边界 |
-| M1 Issue #2 | 旧 VM 服务器外键与复合唯一、显式定位、缓存隔离；应用完成鉴权/投票/页面修复 | 两服务器同 node/VMID 正确隔离 |
-| M2 最小框架 | 资源登记/列表/发现/查询、类型与驱动注册、create/execute、单条执行记录 | 不需要业务策略、资源依赖图或工作流即可调用 |
+| M1 Issue #2 | 旧 VM 服务器外键与 `(pve_server_id,vmid)` 唯一、node locator、缓存隔离；应用完成鉴权/投票/页面修复 | 两服务器同 node/VMID 隔离；同平台节点迁移身份不变 |
+| M2 最小框架 | Resource/Binding/Connection、provisional create、类型/驱动注册、Operation 快照/lease/去重/恢复 | 不需要业务策略、Environment 或 Task 即可调用 |
 | M3 VM/PVE | VM 类型、QEMU 驱动、节点/模板查询、外部任务返回、已有 VM 登记 | 明确指令正确作用于指定平台 |
 | M4 OpenWrt | 独立连接、UCI 资源、独立服务 commit/reload/restart、逐命令结果 | 无隐式网络组合、地址分配或关联清理 |
 | M5 K8s | 集群/API 查询、准备好的安装参数、kubeasz 命令执行与轮询 | 不查询 VM 业务归属或创建基础设施 |
-| M6 应用接入 | 业务模块保留权限、依赖、资源选择和补偿；外部操作调用统一框架 | 原业务功能通过集成回归，新旧入口一致 |
+| M6 控制面接入 | API/Controller 经授权创建 Operation；Executor 统一调用框架；业务模块保留权限和教学规则 | 原业务功能通过集成回归，新旧入口只有一个执行路径 |
 
 M1 可独立发布，不必等待整个框架。每类资源切换时，旧入口也调用对应框架执行器；业务控制继续在调用层完成。
 
@@ -28,7 +28,7 @@ M1 可独立发布，不必等待整个框架。每类资源切换时，旧入�
 | modules/pve_client.py | 平台查询、VM API、任务轮询 | 创建多少 VM、选择模板/服务器的规则 |
 | modules/openwrt_client.py | UCI 节读写和服务命令 | 网络规划、共享使用者检查、删除顺序 |
 | modules/k8s_manager.py | 可复用的 kubeasz 单指令执行适配 | VM/网络/K8s 的整套创建、回滚、批量业务 |
-| modules/task_queue.py | 单条资源操作执行器可复用线程形式 | 业务流程队列和跨操作依赖 |
+| modules/task_queue.py | 不复用导入即启动/吞异常行为；改为显式 Executor key queue | Controller reconcile 和跨资源 plan |
 | modules/status_cache.py | 按 resource_id 的实际状态缓存 | 实验环境聚合可用性 |
 | app.py | HTTP/旧 ID 到框架调用的适配 | 登录、鉴权、关机投票、用户可见列表 |
 | 三个 VM 页面 | 使用 resource_id 和操作结果 | 用户动作入口、业务提示、投票界面 |
@@ -57,7 +57,7 @@ M1 可独立发布，不必等待整个框架。每类资源切换时，旧入�
 
 框架/资源层：
 
-1. 过渡期 Vm 增加 pve_server_id FK，回填后非空；撤销全局 vmid unique，新增 (pve_server_id,node,vmid) 唯一。
+1. 过渡期 Vm 增加 pve_server_id FK，回填后非空；撤销全局 vmid unique，新增 `(pve_server_id,vmid)` 唯一；node 仅为可变 locator。
 2. 目标态使用 resource_id 和明确 domain/connection；PVE 插件保存域内 VMID 身份与当前 node。
 3. 查询、创建、配置、启停、删除不选择模糊默认服务器；缓存以完整身份区分。
 4. FK 保证绑定连接与 domain 对应，不能因为同名节点命中另一服务器。
@@ -66,7 +66,7 @@ M1 可独立发布，不必等待整个框架。每类资源切换时，旧入�
 
 1. find_cluster_by_vm 与权限判断按完整身份匹配真实业务 Cluster。
 2. 批量状态逐项鉴权；Socket.IO 验证提交对象与集群归属。
-3. 投票以 resource_id（过渡期完整三元组）为对象，批准后再提交 stop。
+3. 投票以 resource_id（过渡期 pve_server_id+vmid，node 仅作请求定位校验）为对象，批准后再创建 stop Operation。
 4. 首页/集群页/学生页按完整资源标识更新元素。
 5. 是否允许删除被使用的 PVE 配置由应用决定；框架连接登记采用关闭记录以保留历史 FK。
 
@@ -116,7 +116,7 @@ M1 可独立发布，不必等待整个框架。每类资源切换时，旧入�
 - 教师/学生仍只能查看和操作允许访问的资源，包含新旧 HTTP、批量查询和 Socket.IO。
 - 学生关机投票在调用框架前完成，不能通过新路由绕过原业务规则。
 - 应用正确决定 VM/网络/K8s 指令顺序，显式等待单条执行结果。
-- 资源分配、共享路由器、删除影响和补偿由对应业务/编排模块测试。
+- 资源分配、共享路由器、删除影响和补偿由 Scheduler/Controller/应用适配测试。
 - 框架返回失败或 unknown 后，应用选择的处理方式是显式逻辑，不依赖插件隐藏动作。
 
 ## 8. 下一步实现顺序

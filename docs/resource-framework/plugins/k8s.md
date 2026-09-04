@@ -60,7 +60,7 @@ Kubernetes 对象的状态和名称/UID 语义可参考 [对象模型](https://k
 
 ## 长时间命令与失败
 
-远端安装作业以 operation_id 对应的日志、执行标识和退出记录跟踪，避免只依赖一次 SSH streaming 连接。SSH 断开时返回 pending 或 unknown；存在作业标识则继续查询，不自动启动第二次安装。
+远端安装作业使用由 operation_id 派生的确定性 job id，并保存状态文件、退出码、日志路径和安装目录，避免只依赖一次 SSH streaming 连接。SSH 断开时返回 pending 或 unknown；存在作业标识则继续查询，不自动启动第二次安装。
 
 失败时返回已知的安装目录、进度、日志摘要和退出码，不删除 VM、清理网络、恢复节点或重新安装。调用方需要重试时显式提交新的 deploy；插件不推断重试是否符合业务意图。
 
@@ -68,7 +68,7 @@ unregister 仅关闭集群登记，不检查是否有工作负载或其他资源
 
 ## 当前实现拆分
 
-`k8s_manager.py:deploy_k8s` 中的平台/集群运行状态检查、从 PVE 配置推导 OpenWrt 地址、按集群名推算端口、学生账户处理移到应用编排模块。
+`k8s_manager.py:deploy_k8s` 中的平台/集群运行状态检查、从 PVE 配置推导 OpenWrt 地址、按集群名推算端口、学生账户处理移到 Scheduler、EnvironmentController 或应用适配。
 
 可复用的 SSH 文件传输、kubeasz 参数生成、命令执行与日志采集作为安装器适配。硬编码的安装源和账号由调用方配置提供，插件不选择全局业务默认值。
 

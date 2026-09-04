@@ -1,150 +1,170 @@
-# 实验模板与扩展机制
+# 实验模板、调度与 PlanRevision
 
-返回[接手指南](README.md)。状态：模板格式提案，解析器、规划器与通用前端均待实现。
+返回[接手指南](README.md)。状态：格式提案，解析器、Scheduler、PlanBuilder 与通用前端均待实现。
 
-## 1. 三种配置不能混为一谈
+## 1. 四种对象不能混为一谈
 
-| 对象 | 内容 | 管理者 |
+| 对象 | 内容 | 管理者/生成者 |
 |---|---|---|
-| 实验模板 LabTemplate | 参数、能力要求、资源声明、生命周期步骤、就绪检查、访问入口 | 管理员 |
-| 部署预设 DeploymentProfile | 允许的 domain/connection/node、镜像映射、网络池、存储和规格范围 | 管理员 |
-| PVE VM 镜像模板 | 预装系统和软件的实际虚拟机模板 | 平台运维人员 |
+| LabTemplate | 参数、能力要求、资源意图、状态配方、就绪条件、访问入口 | 管理员发布 |
+| DeploymentProfile | 允许的 domain/connection/node、镜像映射、资源池、规格范围 | 管理员发布 |
+| PVE VM 镜像模板 | 预装系统和软件的真实平台模板 | 平台运维人员 |
+| PlanRevision | 某个 Environment generation 经 Placement 固定后的不可变实例计划 | PlanController/PlanBuilder |
 
-模板描述“提供什么环境”，部署预设将它绑定到具体站点。用户选择模板与允许的预设，填写参数；不能在普通参数里任意覆盖连接凭据或扩大可分配范围。
+模板描述“提供什么”，Profile 描述“这个站点允许怎样提供”，Scheduler 回答“放在哪里”，PlanBuilder 才把三者编译成 PlanRevision。用户参数不能覆盖 connection、secretRef、资源池边界或任意执行命令。
 
-新增 Python 环境可以复用 VM 插件及预制 Python 镜像。若模板需要尚未实现的容器平台、任意远程初始化、IDE 代理或新协议，就先增加对应插件/宿主能力；上传模板不能自动产生不存在的能力。
+## 2. 首版模板格式
 
-## 2. 首版格式
-
-采用 JSON，api_version=lab.template/v1。示例见[Python 开发环境模板](examples/python-development.json)。这是后续实现的输入契约提案，当前应用不会读取执行该文件。
+采用 JSON，`api_version=lab.template/v1`。示例见[Python 开发环境模板](examples/python-development.json)。这是待实现契约，当前应用不会读取该文件。
 
 | 字段 | 必需 | 语义 |
 |---|---|---|
-| api_version、kind | 是 | 格式版本及 LabTemplate 类型 |
-| metadata.id、metadata.version、metadata.name | 是 | 模板标识、发布版本、显示名称 |
-| parameters_schema | 是 | 用户参数的 JSON Schema；首版支持对象、基础类型、必填、默认值、枚举、范围和字符串 pattern |
-| requirements | 是 | 需要的资源类型、驱动和动作；对应已加载的能力描述 |
-| resources | 是 | 逻辑资源名到类型/驱动/创建或借用方式的声明 |
-| planning | 是 | 已注册规划规则及输入；输出固定定义文件 |
-| lifecycle | 是 | 至少 create/delete；可选 start/stop，均为有限顺序步骤 |
-| failure_policy | 是 | 首版固定 retain：失败保留已产生资源并停下 |
-| access | 否 | 环境详情页可展示的访问描述，如 ssh、web |
+| api_version、kind | 是 | 格式版本和 LabTemplate |
+| metadata | 是 | id、不可变发布 version、名称和展示信息 |
+| parameters_schema | 是 | 受限 JSON Schema；对象、基础类型、默认、枚举、范围、pattern |
+| requirements | 是 | 资源类型、驱动、动作、观察和 evaluator 版本要求 |
+| resources | 是 | 逻辑资源意图、created/adopted、cleanup responsibility |
+| scheduling | 是 | Scheduler 使用的资源需求、约束和 placement rule，不含副作用 |
+| reconciliation | 是 | Running/Stopped 及 deletion cleanup 的有限 plan items |
+| readiness | 否 | Environment conditions 的 evaluator |
+| failure_policy | 是 | 首版固定 `retain_and_block` |
+| access | 否 | ssh/web 等受支持入口描述 |
 
-资源框架 action 描述负责具体动作参数 schema，模板 schema 负责结构，规划器负责补齐实际参数。插件依赖范围还应进入发布校验；任务保存实际采用的插件版本和能力摘要，不让插件升级静默改变在途命令。
+模板发布内容不可原地修改。相同版本不同内容返回冲突；停用模板只阻止新 Environment，既有 Environment 继续使用固定模板和 PlanRevision。
 
-首版的元数据编辑不改变已发布内容。重复发布同版本不同内容返回冲突；停用模板阻止新建，既有环境继续使用固定版本执行已声明生命周期。
+## 3. Scheduler 输入与 PlanBuilder 输出
 
-## 3. 参数引用
+模板 `scheduling` 只表达需求，例如 VM 数量、CPU/内存、镜像别名、访问网络和必须能力。Scheduler 将其与 DeploymentProfile、容量观察组合，执行 Filter/Score/Reserve/Bind，输出 Placement：
 
-引用使用仅含一个键的对象，例如 {"$ref":"parameters.cores"}。这是本模板格式的数据引用，不是 JSON Schema 中解析 schema 的 $ref。
+```json
+{
+  "domainId": "pve-domain-a",
+  "connectionId": "pve-connection-3",
+  "bindings": {
+    "workspace": {
+      "node": "pve01",
+      "vmid": 213,
+      "ip": "10.20.1.13",
+      "imageRevision": "python-base@2026-09-01"
+    }
+  }
+}
+```
+
+Scheduler 不展开 clone/start/delete 条目。PlanBuilder 读取固定模板、Profile 和 Placement，输出 PlanRevision 中的完整 create request、运行状态配方、cleanup recipe、readiness 和 access。
+
+规划必须是确定性的：相同规范化输入产生相同 contentDigest；任何改变 placement、模板、Profile 或资源身份的重规划都创建新 PlanRevision。旧 PlanRevision 不修改。
+
+## 4. 参数和数据引用
+
+引用采用仅含一个键的对象，例如 `{"$ref":"parameters.cores"}`，不是 JSON Schema 的 schema `$ref`。
 
 | 命名空间 | 产生者 | 示例 |
 |---|---|---|
-| parameters | 参数 schema 校验并填充默认值后的输入 | parameters.cores |
-| definition | 规划器产出的标准定义文件 | definition.workspace.create_request |
-| resources | 环境逻辑名到已登记 UUID 的绑定 | resources.workspace.resource_id |
+| parameters | 参数 schema 校验并填默认值后的输入 | parameters.cores |
+| placement | Scheduler 固定的绑定和 allocation | placement.workspace.vmid |
+| plan | PlanBuilder 的标准化创建请求和访问值 | plan.workspace.create_request |
+| resources | 运行时逻辑槽位到 resource_id 的持久绑定 | resources.workspace.resource_id |
 
-解析器递归替换引用并保留原数据类型，不能把整个对象强行转成字符串；不执行 Python、shell、Jinja 或任意表达式。普通字符串保持原值，不提供隐式插值。引用不存在时返回明确错误，不能替换为空值继续调用插件。
+解析器递归替换并保留数据类型，不执行 Python、shell、Jinja 或字符串插值。引用不存在、类型不匹配或指向未声明输出时发布/建 plan 失败，不能替换为空值继续。
 
-发布时检查根命名空间、资源声明、可解析的定义文件输出路径和步骤先后关系；依赖运行结果的资源 ID 在执行时绑定并持久化。字段中的点号用作路径分隔，首版逻辑名使用字母、数字和下划线，不包含点。
+PlanRevision spec 不回写运行时 resource_id；`resources.*` 在 reconcile 时从环境资源关联解析。引用解析结果和输入摘要写入 Operation，确保执行目标固定。
 
-## 4. 最小步骤集合
+## 5. 最小 plan item 集合
 
-| kind | 字段/行为 | 所在层 |
+| kind | 行为 | 执行者 |
 |---|---|---|
-| resource.create | resource 逻辑名、request；请求包含 type/driver_id/connection_id/parameters，由执行模块调用 ResourceService.create | 编排产定义文件 → 执行模块 → 资源 |
-| resource.register | resource 逻辑名、request；绑定已存在对象，记录 created/adopted 的来源 | 编排产定义文件 → 执行模块 → 资源 |
-| resource.action | target resource_id、action、parameters；由执行模块调用 execute | 编排产定义文件 → 执行模块 → 资源 |
-| wait.observation | target、field、equals、timeout_seconds、interval_seconds；调用 observe 并比较指定观察字段 | 执行模块 |
-| wait.endpoint | endpoint.protocol/host/port、timeout_seconds、interval_seconds；首版 TCP 探测 | 执行模块 |
+| resource.create | 为逻辑资源创建 provisional Resource 和一次性 create Operation | EnvironmentController 创建；Executor 执行 |
+| resource.register | 绑定已存在对象，保存 adopted/cleanup responsibility | EnvironmentController/资源框架 |
+| resource.action | 为固定 resource 创建一次性 Operation | EnvironmentController 创建；Executor 执行 |
+| wait.observation | 检查新鲜 Resource observation 的字段相等条件 | EnvironmentController/ObservationController |
+| wait.endpoint | 受控 TCP endpoint evaluator；只更新 condition，不产生反向清理 | Controller evaluator |
+| condition.set | 从明确输入设置 Environment condition | Controller |
 
-resource.create/action 默认等待该 Operation 成功才推进下一步，返回 pending 时持久化 waiting。register 是数据库登记动作，返回资源引用后推进。调用上下文及稳定 request_id 由执行模块分发时产生，模板与定义文件不能任意覆盖。
+plan item 有唯一 `item_key` 和有限 `dependsOn`；首版实现可以要求全序或简单静态依赖，不建设通用 DAG 调度器，也不支持运行时循环、任意表达式和用户脚本。拓扑重复由 PlanBuilder 按参数上限展开。
 
-resource.create 接受时就产生 resource_id：执行模块应立即保存关联及操作引用，而非等整个创建成功后才保存。部分创建仍可追踪；resource.register 不意味着拥有外部对象的删除权，删除责任由编排在定义文件中声明。
+Controller 对每个需要副作用的 item 使用 `environment/intentGeneration/plan/item/attempt` 生成稳定 Operation request key。重复 reconcile 只能发现原 Operation；用户从 Stopped 再改为 Running 时 generation 改变，因此可产生新的 start Operation。Failed/Unknown 默认阻塞，新 attempt 必须来自显式恢复决策并记录依据。
 
-resource.action 可显式声明 skip_if_observation={field,equals}。执行时先调用 observe（执行模块调用资源观察）；只有新鲜观察值等于定义文件给定值时，将该步骤记为 succeeded，结果带 skipped=true 和观察依据，不发送资源命令。观察失败不能当成匹配成功；默认阻塞并报告。这个受限的相等判断用于“已关机则跳过关机”等场景，不引入表达式引擎，也不成为资源插件的隐式行为。观察与命令之间仍可能发生外部状态变化，平台拒绝时如实报告。
+## 6. 幂等检查与等待
 
-wait.observation 从对应资源类型的观察结果中取字段，例如 VM 的 power_state。wait.endpoint 超时只说明就绪条件未满足，不反向删除资源。探测是执行模块的判断能力，不能变成资源层的强制准入检查。
+`resource.action` 可以声明受限 `skip_if_observation={field,equals,max_age_seconds}`。Controller 只在观察新鲜且明确相等时将 item 标为 satisfied，不创建 Operation；观察失败或 stale 不算成功。
 
-扩展 HTTP 或软件特定的就绪判断时注册新的 evaluator/版本化步骤能力，不能默默让 TCP 成功代表应用完整可用。为访问入口生成地址也不代表入口已经满足就绪条件。
+观察和命令之间仍可能发生外部变化，因此插件拒绝必须如实保存。skip 条件是减少不必要命令，不是并发锁或 exactly-once 保证。
 
-每个步骤 ID 在生命周期内唯一；执行时加入 task_id 形成全局稳定身份。首版不支持任意 DAG、用户脚本或运行时循环。节点数量扩展由规划器展开有限资源集合与顺序步骤，具体上限在模板参数与部署预设中共同校验。
+`wait.endpoint` 的目标必须来自 Profile/Placement/PlanBuilder 的受信任输出，不能由普通用户直接指定任意 host。worker 网络出口应有 allowlist，避免模板把探测器变成内网扫描能力。TCP 可达不等于软件 Ready；HTTP/K8s 等检查使用版本化 evaluator。
 
-## 5. 部署预设及规划输出
+## 7. Resource 创建和存在状态
 
-预设引用已有资源连接，包含以下非敏感配置：
+执行 `resource.create` 前，Controller/Operation service：
 
-- PVE domain、connection、允许 node/storage/bridge，及逻辑镜像名到模板 VMID/镜像修订的映射。
-- 可分配 VMID/IP/VLAN/端口范围、可借用网络和 OpenWrt router 资源引用。
-- 默认规格、允许规格上限、SSH 用户与公钥/连接凭据引用。
-- 访问地址生成规则，以及对应访问网络是否需要端口转发。
+1. 预分配 resource_id；
+2. 保存 `registrationState=active`、`existenceState=pending`；
+3. 外部 identity 可知时创建 provisional binding 并占用唯一键；
+4. 创建固定 binding/connection/plugin 快照的 Operation；
+5. 由 Executor 执行。
 
-connection/secret 的生命周期属于资源接入层；镜像用途、池分配和 PVE/OpenWrt 配对属于编排预设。修改预设生成新 revision。规划保存实际使用的镜像绑定/修订，运行任务不重新查询一个可能已经指向别的 VM 的浮动镜像别名。
+create 成功变为 present；确认未创建变为 absent；无法确认变为 unknown。resource_id 和历史不因失败删除。环境资源关联在 Operation 受理时保存，避免“外部已创建但关联丢失”。
 
-Python 示例采用规划器 pve.single_vm/v1：给定逻辑资源名、镜像别名、规格与访问网络，选择预设允许的节点并预留 VMID/IP，输出 definition.workspace：
+## 8. Python 单 VM 路径
 
-| 输出 | 内容 |
-|---|---|
-| create_request | type=compute.vm/v1、driver_id=pve.qemu/v1、connection_id，以及完整 parameters |
-| create_request.parameters | name、cpu.cores、memory_mib、nics、initialization、provider_options |
-| provider_options | node、template_vmid、vmid、storage、clone_mode 等驱动必需值 |
-| access | host、port、username；来自已分配地址和镜像约定 |
+Python 示例要求预制 Python/SSH 镜像和已存在的可访问网络：
 
-nics/initialization 的完整结构由 VM/PVE schema 定义。该示例要求预设提供已存在、客户端与 worker 均可访问的网络，预制镜像包含 Python 运行环境及 SSH 服务，地址经 cloud-init 明确设置；规划器不隐式创建路由或端口转发。站点需要新网络时，在模板中显式增加 OpenWrt 资源步骤。
+1. API 创建 Environment `desiredState=running`。
+2. Scheduler 选择 PVE domain/node，预留 VMID/IP。
+3. PlanBuilder 产生 workspace create、start、wait SSH 和 cleanup recipe。
+4. EnvironmentController 依次创建 clone/start Operation；Executor 保存 PVE UPID 并 poll。
+5. SSH evaluator 成功后设置 InfrastructureReady/Ready。
+6. `desiredState=stopped` 时产生 graceful stop Operation 并等待 power_state=stopped。
+7. `desiredState=running` 时仅在未运行时产生 start Operation。
+8. deletionTimestamp 后 finalizer 按 stop→wait→delete→release allocation 清理。
 
-## 6. Python 环境完整路径
+Python 安装正确性由镜像构建验收保证；SSH 端口只作为此模板的最低 readiness。如果提供浏览器 IDE，需要新增受控 web access adapter 和软件级 evaluator，不增加 Python 专用 API。
 
-[示例模板](examples/python-development.json)包含：
+## 9. K8s 模板路径
 
-1. create：克隆预制 Python VM → 启动 → 等待 SSH 端口。
-2. stop：若尚未停止，明确 graceful stop → 等待 power_state=stopped。
-3. start：启动 → 等待 SSH 端口。
-4. delete：若已停止则按模板跳过关机，否则明确关机 → 等待停止 → 删除这台 VM。
-5. access：输出 SSH 主机、端口、用户名和 VM resource_id，通用页面可接入 WebSSH。
+K8s Environment 使用同一控制面对象，但有更多 conditions：
 
-这个模板提供终端式 Python 开发环境。SSH 端口可达仅是此模板的最低就绪约定；Python 安装正确性由受控镜像验收保证。如果要提供浏览器 IDE，需在镜像中预装服务，并具备相应的访问转发、鉴权和就绪探测能力后添加 web 入口。
-
-销毁步骤针对该模板创建的资源。若创建中途失败，编排依据真实关联和操作结果生成针对已产生资源的清理定义文件；已确认从未产生的资源不用删除，结果不明的资源先核对。执行模块的步骤执行器不自动反转 create 步骤，也不自动删除借用资源。
-
-## 7. K8s 模板规划
-
-K8s 实验使用同一 Environment 模型及前端，内部有基础设施与软件两段生命周期。首版迁移可保留“创建基础环境后，用户再请求安装”的现有交互，以明确的 install 扩展生命周期表示，不把 VM 开机等同于 K8s 已就绪。
-
-| 阶段 | 编排职责 | 调用的资源能力 |
+| 阶段 | Scheduler/Controller 责任 | Resource 能力 |
 |---|---|---|
-| 规划 | 固定预设/镜像，预留 VMID、地址、VLAN、端口，展开 client/control-plane/worker 节点 | 平台/资源只读查询 |
-| 网络配置 | 按模板顺序创建 VLAN、接口、DHCP，处理明确的 zone 关联 | OpenWrt 单资源指令 |
-| VM 配置 | 为每个节点给出 clone、规格、网卡、cloud-init 参数 | VM/PVE create |
-| 网络绑定与应用 | 写入静态租约/转发，显式 reload/restart | OpenWrt 指令 |
-| 启动与等待 | 启动所有节点，确认安装执行节点及目标地址达到模板条件 | VM start、编排等待 |
-| 集群登记与安装 | 提供固定安装源、版本、inventory 和 execution_connection | K8s register/deploy |
-| 就绪判断 | 读取 API 和节点条件，按模板判定实验可用 | K8s observe/list_nodes、编排 evaluator |
-| 访问输出 | 生成 WebSSH、API 地址和受权限保护的 kubeconfig 访问引用 | 通用访问描述 |
-| 销毁 | 根据实际关联明确关机/删除 VM、移除自建网络配置、关闭登记、释放分配 | 多条独立资源操作 |
+| Placement | 选择 PVE/domain/node，预留 VMID/IP/VLAN/端口 | 只读容量/发现 |
+| Plan | 展开 client/control-plane/worker、网络和安装条目 | 无副作用 |
+| 网络 | 按 plan 创建 VLAN/interface/DHCP/zone member/forward | OpenWrt Operation |
+| VM | clone/configure/start 并观察 power/SSH | VM/PVE Operation + observe |
+| 集群 | register k8s Resource，以完整 inventory 创建 deploy Operation | K8s/kubeasz |
+| 就绪 | list_nodes/API evaluator 更新 SoftwareReady/KubernetesReady | K8s observe |
+| 删除 | finalizer 按 cleanup responsibility 清理并释放 allocation | 多条独立 Operation |
 
-保留分段安装交互时，基础设施创建任务可以 succeeded，但环境在完成软件就绪检查前保持 provisioning，并通过 InfrastructureReady=true、SoftwareReady=false、WaitingForInstall 条件展示进度；install 成功且就绪条件满足后才标 ready。API 返回这些条件，避免旧的“运行中”混合表示 VM 开机与 K8s 可用。
+保留“基础设施完成后再安装”的交互时，可将 `spec.installationState=requested|deferred` 作为声明式意图；Controller 不使用一次性布尔 install。基础设施完成但尚未请求安装时，Environment 保持 `InfrastructureReady=True`、`SoftwareReady=False`、reason=WaitingForInstall。
 
-该表是迁移配方要求，不是可直接执行的模板。K8s 专用规划器的输出 schema、list_nodes 就绪 evaluator 和各 OpenWrt 参数 schema 在相应实施阶段固化。Python 示例不依赖这些 K8s 专用能力。
+K8s deploy 的远端执行必须有确定性 job id、状态文件、退出码和日志定位，SSH 断线后可 poll 原作业。安装退出 0 与节点 Ready 分开。
 
-当前 OpenWrt 基础设计的 firewall_zone 只支持发现和成员调整，尚无 zone create/delete。迁移时应明确选择预设中的既有 zone，或先补充对应的单资源动作及契约，再用模板新建 zone。不能假设模板已经具备该能力，也不能保留旧客户端隐式创建/删除 zone 的组合行为。
+当前 OpenWrt `firewall_zone` 契约只有发现和成员调整。Profile 使用既有 zone，或先增加明确 zone create/delete 动作；模板不能假设不存在的能力。首版不支持 `apply_mode=none` 跨 Operation 累积 UCI 修改。
 
-K8s 基础插件当前没有通用访客系统执行、升级、扩缩容和卸载能力。需要准备密钥/账号等动作时，优先使用镜像/cloud-init 可表达的能力；无法表达的工作保留明确的宿主适配步骤，后续再抽取受控能力，不能在模板中调用任意 Python 函数。
+## 10. 删除和 cleanup recipe
 
-## 8. 发布与前端
+cleanup recipe 在 PlanRevision 创建时固定，记录每个逻辑资源的 delete/unregister/retain 责任。它不是 create items 的自动反转：Controller 必须结合实际环境资源关联和 Operation 事实，只为确认已产生或可能存在的 created 资源创建清理 Operation。
 
-发布流程：编辑草稿 → 校验结构和参数 → 校验类型/驱动/动作及规划/等待能力 → 固定版本发布。站点绑定在使用某预设或创建实例时校验，不能因模板结构合法就认为所有站点均可部署。
+Unknown 资源先观察/人工核对；借用资源默认 unregister 或 retain。任何外部删除未确认或 allocation 仍隔离时，Environment finalizer 保留。
 
-通用前端只需模板目录、参数表单、环境列表/详情、任务日志和访问入口。按 parameters_schema 渲染控件，按 lifecycle 展示允许的动作，再结合实际用户权限生成按钮。插件支持某动作并不意味着当前用户拥有该动作权限。
+模板升级不能改变既有环境的 cleanup recipe。重规划新 PlanRevision 时必须继承旧 plan 已产生资源的清理责任，直到这些资源确认清理完成。
 
-access 类型首版支持 ssh；web 可由后续访问适配注册。SSH 描述含 kind、label、resource_id、host、port、username；真实私钥由 WebSSH 的受控连接流程获取，不写进模板或普通环境输出。新入口类型需要对应渲染/访问适配，不能只靠模板让浏览器理解未知协议。
+## 11. 发布、权限与前端
 
-模板只新增现有能力的组合时无需后端专用路由或类型分支；如果缺少能力，发布或实例化返回具体缺失项，管理员补齐后再使用。
+发布流程：编辑草稿 → JSON Schema 校验 → 引用和输出类型检查 → 资源/驱动/动作/evaluator 版本检查 → 安全准入 → 固定版本发布。站点能力在绑定 Profile 和调度时再次校验。
 
-## 9. 扩展验收
+模板发布者能间接请求受控基础设施副作用，应使用独立高权限并审计。普通用户只能填写 parameters_schema 允许的字段，不能指定 secret、connection、URL、命令或任意 endpoint。
 
-- 同一模板使用不同部署预设，生成不同 domain/连接的资源，身份不串用。
-- 发布 1.1.0 不改变使用 1.0.0 的运行环境、定义文件或销毁步骤。
-- 参数和引用在外部变更前校验；未知动作、规划器或入口类型可明确报告。
-- Python 通过已有 VM/PVE 能力和预制镜像实现，无 Python 专用数据库表/API/page 分支。
-- 环境 phase、任务结果与资源事实分别展示；失败后能找回已创建资源。
-- 直接资源命令不要求存在任何 LabTemplate 或 Environment。
+通用前端展示模板目录、参数表单、Environment spec/status、conditions、Task View、Operation 日志和 access。按钮由模板支持能力、Environment 当前状态和实时权限共同决定。
+
+access 首版支持 ssh；描述包含 kind、label、resource_id、host、port、username。私钥由 WebSSH 受控流程读取，不写入模板、PlanRevision、Environment 普通输出或浏览器 API。
+
+## 12. 扩展验收
+
+- 同一模板在不同 Profile 上产生不同 Placement/PlanRevision，资源身份不串用。
+- PlanRevision v1 冲突后产生 v2；v1 immutable、Superseded，既有 Operation 可追踪。
+- Controller 重复 reconcile 不重复 clone/reboot/delete。
+- 发布模板 1.1 不改变运行于 1.0 的环境和 cleanup recipe。
+- Python 环境仅依赖 VM/PVE 能力与镜像，无专用后端分支。
+- K8s 安装成功、节点 NotReady 和 Environment Ready 三者状态分离。
+- 删除遇到 Unknown 时 finalizer 与 allocation 保留。
+- 直接资源 Operation 不要求存在 LabTemplate、Environment 或 Task。

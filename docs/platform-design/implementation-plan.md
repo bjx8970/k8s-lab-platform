@@ -1,133 +1,138 @@
 # 实施、迁移与交接计划
 
-返回[接手指南](README.md)。状态：规划，未执行代码重构/数据库迁移。核对日期：2026-09-03；实现基线：GitHub main `64891df`，已包含 Issue #1 统一授权与安全任务重试。
+返回[接手指南](README.md)。状态：规划，未执行控制面重构或数据库迁移。核对日期：2026-09-04。
 
-## 1. 当前代码与目标的差距
+## 1. 当前代码与目标差距
 
-以下基于本次只读源码检查，不表示已验证运行环境：
+以下基于本地源码只读核对，不表示已验证真实部署：
 
-| 当前入口 | 当前情况 | 后续处理 |
+| 当前入口 | 当前情况 | 目标处理 |
 |---|---|---|
-| [app.py](../../app.py) | Flask 路由已接入统一授权、CSRF/Origin 与审计，同时仍负责资源请求和投票 | 逐路由改成 API 模块/应用适配，保持既有安全契约 |
-| [modules/authz.py](../../modules/authz.py)、[security_service.py](../../modules/security_service.py) | 已有纯授权策略、主体/资源重载及服务层授权 | 复用为 API 模块的鉴权组件与宿主调用适配 |
-| [modules/audit.py](../../modules/audit.py)、[credential_store.py](../../modules/credential_store.py) | 已有脱敏审计、凭据加密和显式迁移机制 | 作为资源连接与日志的宿主适配，不重建明文存储 |
-| [modules/db.py](../../modules/db.py) | Vm.vmid 全局唯一；find_cluster_by_vm(node,vmid) 缺平台维度 | 先修完整身份，再引入资源 UUID 和环境映射 |
-| [modules/db.py](../../modules/db.py) | _create_engine 只接受 PostgreSQL 配置 | 新设计以 PostgreSQL 为基线；README/AGENTS 的 SQLite 说明有历史差异 |
-| [modules/k8s_manager.py](../../modules/k8s_manager.py) | 集中处理部署及任务；已支持服务端描述约束的安全重试，_task_store 仍在内存 | 保留现有重试/撤权语义，分离动作后迁入定义文件驱动的持久化执行 |
-| [modules/task_queue.py](../../modules/task_queue.py) | 进程内队列；导入即启动 create/delete/deploy worker | 改为显式启动，数据库记录为任务事实来源 |
-| [modules/status_cache.py](../../modules/status_cache.py) | VM 查询缓存键含 node/VMID，缺平台维度 | 过渡期完整三元组，目标使用 resource_id |
-| [modules/pve_client.py](../../modules/pve_client.py) | 现有适配需保留 UPID、区分接受与完成，并拆出隐式 stop/delete | 按 PVE/VM 插件契约迁移 |
-| [modules/openwrt_client.py](../../modules/openwrt_client.py) | UCI 方法含即时提交/重载和组合清理行为 | 拆成单资源操作及明确服务应用 |
-| [modules/ssh_terminal.py](../../modules/ssh_terminal.py) | WebSSH 会话以用户/集群关联 | 保留会话和接管规则，逐步支持 environment/resource 引用 |
+| `app.py` | Flask 路由已接入授权、CSRF/Origin 与审计，但同步调用客户端和业务 manager | 收缩为 Platform API Server/应用适配，只提交对象或 Operation |
+| `modules/authz.py`、`security_service.py` | 已有纯授权策略、主体/对象重载和 worker 再授权 | 复用到 API admission 与 ExecutionAuthorizationGate |
+| `audit.py`、`credential_store.py` | 已有脱敏审计、流式秘密抑制、Fernet 和显式迁移 | 作为 API/Executor 宿主适配，增加 versioned secret ref |
+| `modules/db.py` | Vm.vmid 全局唯一；find_cluster_by_vm(node,vmid) 缺平台维度 | 先做 P1 完整身份，再建控制面对象和 resource UUID |
+| `modules/db.py` | `_create_engine()` 只接受 PostgreSQL且会吞启动错误 | 目标生产进程 fail fast，健康检查区分未配置和连接失败 |
+| `modules/k8s_manager.py` | 集中创建/删除/部署；安全重试已存在；任务仍在内存 | 逐步拆为对象 admission、controllers 和持久化 Operation |
+| `modules/task_queue.py` | 导入即启动内存 worker，异常被吞 | 改为显式 worker 启动；进程内队列只保存对象 key |
+| `modules/status_cache.py` | 缓存缺平台维度，命令提交后会被乐观写状态 | 过渡期完整身份，目标 Resource Observation+observedAt |
+| `modules/pve_client.py` | clone 丢弃 UPID，启停提前报告完成，delete 隐式 stop | PVE Executor 保存 UPID、poll；动作单一化 |
+| `modules/openwrt_client.py` | 写入立即 commit，delete_interface 隐式改 zone | 拆为明确 Operation；domain 跨进程串行，不支持隐式级联 |
+| `modules/ssh_terminal.py` | WebSSH 以用户/Cluster 关联 | 保留接管规则，增加 Environment/Resource 映射 |
 
-目前尚无本设计中的 resource_framework、通用模板解析器、持久化部署任务和通用 Environment 实现。现有资源框架文档亦为设计稿。
+目前不存在 Platform API 对象层、Scheduler、Controller Manager、PlanRevision、持久化 Operation 或 resource_framework。`docs/` 中描述的是目标设计。
 
-仓库已经包含 `tests/` 下的授权、HTTP/Socket.IO、任务重试与秘密边界测试。[Issue #1 验收记录](../issue-1-acceptance.md)记载其基线为 152 项通过；这是该提交随附的历史验收结果，本次同步未重新运行这套测试。AGENTS 中“没有测试”的概述已落后于代码，不能作为新实现的起点。
+现有测试覆盖授权、HTTP/Socket.IO、任务安全重试和秘密边界；历史验收记录为 152 项通过。后续每阶段必须重新运行并扩展，不能把历史结果当作当前工作树验证。
 
-新增接口继续遵守已有 CSRF/Origin、原始提供器写权限、worker 再授权和浏览器秘密输出边界。现有 Job retry 仍是进程内能力，不能据此声称已实现重启恢复；详见[重试说明](../job-retry.md)和[凭据存储与迁移](../security-credentials.md)。
+## 2. 已确认决策
 
-## 2. 决策记录
-
-| ID | 首版决定 | 原因/何时重议 |
+| ID | 决定 | 说明 |
 |---|---|---|
-| D01 | API（含鉴权）、编排、执行、资源四大模块，内部组件可拆包；API 是全局中枢，编排生成标准定义文件交回 API 持久化并分发给执行模块 | 避免模块间直接互调；需要独立扩缩容时再拆服务 |
-| D02 | 资源框架及基础插件只执行明确资源指令 | 保持独立可复用；新增业务规则放调用层 |
-| D03 | 任务驱动、状态持久化，暂不持续自动修复 | 当前需求是部署与管理；自愈需求明确后增加环境协调器 |
-| D04 | PostgreSQL + API/worker，进程内服务调用 | 贴近当前代码；暂不引入 etcd/消息总线 |
-| D05 | Environment 与 Resource 分离 | 实验生命周期及教学归属不污染通用资源模型 |
-| D06 | 模板/预设版本及定义文件固定，资源身份用 UUID | 保证恢复、销毁及跨平台定位可追溯 |
-| D07 | 顺序步骤、明确等待、有限规划展开 | 先满足现有 K8s 与 Python；不预建通用 DAG 引擎 |
-| D08 | 失败默认保留，未知结果停下核对 | 避免丢失部分资源；补偿由编排生成定义文件、执行模块执行 |
-| D09 | 原始资源命令与教学业务动作分别授权 | 保持直接管理能力，同时保留学生投票等应用规则 |
-| D10 | 模板只组合已安装能力；首版插件为受信任代码 | 第三方插件隔离、动态安装和任意脚本执行需另行设计 |
+| D01 | 五个逻辑角色：API Server、PostgreSQL、Scheduler、Controller Manager、Resource Executor | 组件围绕持久对象协作，不使用 API→编排→API→执行调用链 |
+| D02 | 首版两个物理进程：API + control-plane worker | 保持部署简单；逻辑边界不等于微服务 |
+| D03 | Environment 使用 metadata/spec/status、generation/observedGeneration、conditions | 明确期望、处理进度和实际事实 |
+| D04 | PostgreSQL 是事实来源；outbox/NOTIFY 只负责唤醒，full resync 保证正确性 | 不引入 etcd/消息总线 |
+| D05 | Scheduler 只做 placement/allocation；PlanBuilder 位于 Controller Manager | Scheduler 无外部副作用 |
+| D06 | Definition 更名并重定位为不可变 PlanRevision | 重规划产生新 revision，旧版保留 |
+| D07 | 所有一次性副作用都是持久化 Operation | 防止 reconcile 重放 reboot/delete/deploy |
+| D08 | Task 是用户投影视图，不驱动控制面 | 避免演变为通用 workflow engine |
+| D09 | 删除使用 finalizer；unknown 不释放 allocation | 保持外部事实和删除状态一致 |
+| D10 | 默认 `recoveryPolicy=retain_and_block` | 首版不静默自愈外部漂移 |
+| D11 | 每条新变更 Operation 前实时再授权 | 撤权阻止新副作用，已提交操作继续跟踪事实 |
+| D12 | 资源框架及插件只执行固定目标的明确命令 | 权限、投票、placement、补偿留在控制面 |
+| D13 | 过渡期 PVE VM 唯一键 `(pve_server_id,vmid)`；node 是 locator | 与目标 `(domain_id,vmid)` 一致，支持节点迁移 |
 
-更新决策时同时修改对应契约、示例与验收项。新增资源类型不应要求修改框架核心；新增组合模板不应要求增加实验类型专用 API。
+更新决定时必须同步修改架构、契约、模板、示例、资源框架和验收。
 
 ## 3. 分阶段实施
 
-平台阶段使用 P 前缀，资源子项目的 M0–M6 仍见[资源实施计划](../resource-framework/implementation-plan.md)。每阶段交付应可独立审查，不能把表格中的目标当作现成功能。
+平台阶段使用 P 前缀；资源子项目 M0–M6 见[资源实施计划](../resource-framework/implementation-plan.md)。
 
-| 阶段 | 工作与范围 | 完成条件 |
+| 阶段 | 工作范围 | 完成条件 |
 |---|---|---|
-| P0 基线确认 | 确认此设计；记录实际部署数据库/版本；为关键现有功能整理回归场景 | 模块所有权、已知差异和迁移映射需求明确 |
-| P1 身份修复 | 资源计划 M1：VM 的 PVE FK/复合唯一、查询/缓存/页面/权限/投票完整定位 | 两平台同 node/VMID 完全隔离；可独立发布 |
-| P2 资源闭环 | M2–M3：核心资源模型、插件注册、持久化 Operation、VM/PVE 驱动 | 登记/创建/查询/启停/删除和任务恢复可独立调用 |
-| P3 API 与鉴权接入 | API 模块（统一入口、鉴权与全局调度分发），复用 Issue #1 授权/审计实现、新旧资源路由同执行路径，保留应用规则 | 批量、Socket.IO、WebSSH、日志均无跨范围访问 |
-| P4 最小编排与 Python | Environment/定义文件/Task/Step、模板/预设版本、单 VM 规划器、执行模块、通用表单/入口 | 发布 Python 模板即可创建/停止/启动/删除；任务可恢复 |
-| P5 OpenWrt 与 K8s | M4–M5：单资源动作、kubeasz 跟踪；明确补齐实际配方所需能力 | 插件可独立工作；无隐藏跨资源动作 |
-| P6 K8s 模板迁移 | M6：网络/VM/安装分段配方、旧 Cluster 映射、通用环境界面 | 原 K8s 业务行为保留，安装与环境状态可区分 |
-| P7 切换与交接 | 数据回填、旧入口兼容、在途任务处理、运维说明 | 单一写入路径、迁移验证和回退条件均明确 |
+| P0 契约固化 | 确认对象 schema、状态转换、repository 写边界、watch/resync、授权闸门、日志/保留策略 | JSON Schema/DDL 草案和状态不变量可审查；无跨进程回调歧义 |
+| P1 身份修复 | Vm.pve_server_id FK、`(pve_server_id,vmid)` 唯一、node locator、查询/缓存/页面/权限/投票完整定位 | 两平台同 node/VMID 隔离；同平台节点迁移不产生重复身份 |
+| P2 Operation 纵向闭环 | Resource/Binding/Connection、provisional identity、Operation lease/去重/快照、测试插件、显式 worker | 重启可恢复；Unknown 不重发；框架无业务模型也可运行 |
+| P3 PVE/VM 接入 | PVE domain、VM driver、UPID、poll、observe、create/start/stop/delete 单一动作 | 真实测试资源的 Operation 状态与 PVE 事实一致 |
+| P4 API 对象层 | Environment metadata/spec/status、resourceVersion、generation、admission、outbox、Task View | HTTP 只提交对象；通知丢失不影响恢复；安全回归保持 |
+| P5 Scheduler/Plan | Placement、Allocation、Filter/Score/Reserve/Bind、Template/Profile、PlanBuilder/PlanRevision | 无外部副作用完成单 VM 确定性 plan；冲突产生新 revision |
+| P6 Controller/Python | Environment/Plan/Observation/Finalizer controller、authorization gate、通用 UI | Python 模板可创建/停启/删除；重复 reconcile 不重复执行 |
+| P7 OpenWrt/K8s | domain 锁、UCI 单项动作、远端 K8s job protocol、K8s conditions | 无隐藏跨资源动作；断线/重启可恢复外部作业 |
+| P8 K8s 迁移 | 旧 Cluster 映射 Environment，网络/VM/安装 plan，WebSSH/access，旧入口适配 | 原业务行为保留，Task 降为投影，单一执行路径 |
+| P9 切换交接 | 数据回填、旧 worker 停止、在途核对、运维/备份/回退 | 无双写双执行，迁移可重跑，runbook 完整 |
 
-P3 可在 P2 的基础上逐路由进行；P4 用单 VM 先验证通用模型；P5 可以在同一契约基线上单独推进。这里描述代码依赖，不要求采用多代理或并行开发。
+P1 可独立发布。P2 先用模拟 handler 验证持久化和恢复，再接真实 PVE。P6 的 Python 单 VM 是首次完整控制面纵向切片；不要先用复杂 K8s 验证基础对象模型。
 
-## 4. 第一个可交付变更
+## 4. P0 必须固化的细节
 
-优先实施 [Issue #2](https://github.com/bjx8970/k8s-lab-platform/issues/2) 的完整身份修复，而不是一次重写 app.py：
+进入 P2/P4 前至少产出：
 
-1. 梳理 Vm→Cluster→PVE 的历史映射，报告空值、server=0 和歧义。
-2. 为 Vm 添加明确 pve_server_id 外键，回填后建立非空和 (pve_server_id,node,vmid) 唯一约束，撤销全局 VMID 唯一。
-3. 修改 find_cluster_by_vm、资源路由、缓存、批量状态、投票和页面元素定位。
-4. 用两个独立 PVE 测试连接模拟相同 node/VMID，验证查询和操作均落在正确目标。
+1. Environment、Placement、Allocation、PlanRevision、Operation、Task View 的 JSON Schema/DDL；
+2. spec/status 列级写入边界和 repository API；
+3. generation/resourceVersion/observedGeneration 更新规则；
+4. Operation target snapshot、claimRevision、lease 和 request scope；
+5. provisional Resource/Binding 与 existenceState；
+6. finalizer、cleanup responsibility 和 break-glass 政策；
+7. controller reconcile key、退避、full resync 间隔和最大并发；
+8. OpenWrt domain 锁与首版禁用 apply_mode=none；
+9. K8s 远端 job id/status/exit/log 协议；
+10. 日志大小、游标、脱敏、保留和审计保留期。
 
-之后再建立 UUID/resource binding。目标态同 PVE domain 的 VMID 唯一，node 是可变定位；同一平台多连接须明确合并 domain，不能简单把每个配置地址都当成新平台。
+## 5. 第一个可交付变更：PVE 身份修复
 
-## 5. 数据与切换策略
+不要一次重写 `app.py`。P1：
 
-- 先新增表和可空映射，再回填、校验、添加必要约束。迁移需有版本、校验和、明确错误，重跑不重新生成 UUID。
-- Cluster 保留教学关联并逐步映射 Environment；原 Vm 关联 resource_id。课程/组/学生不迁入资源框架。
-- 连接端点/凭据引用与部署预设分开，旧 PVEServer.ow_* 显式拆成 OpenWrt connection 和业务配对。现有密文通过 credential_store 读取；保留 K8S_LAB_CREDENTIAL_KEY 和显式明文迁移契约，不在框架初始化中自动迁移或复制凭据正文。
-- 模板和预设先为现有配置生成明确版本，现存资源采用 register 接管；不得对已存在 VM 再执行 create。
-- 切换某类操作入口前，暂停该类新变更，处理旧在途任务、旧 worker、投票定时器和缓存写入者。无法恢复的旧内存任务需核对外部结果。
-- 每类资源只有一个实际执行路径；旧 API 转调新服务，不能同时运行旧逻辑和新插件形成双写/双执行。
-- 外部资源变化不在数据库事务内。备份恢复只能恢复数据库记录，不能撤销已执行的删除或创建。
-- 接受跨平台重复 VMID 后，旧版全局唯一模型无法直接接管全部数据；回退前需核对兼容性和外部变化，不能只降级代码。
+1. 在数据库副本梳理 Vm→Cluster→PVEServer 映射，报告 null、server=0、无效和歧义记录；
+2. Vm 增加明确 pve_server_id FK；回填后设置非空；
+3. 撤销 vmid 全局唯一，建立 `(pve_server_id,vmid)` 唯一，node 保留为可变 locator/index；
+4. 修改 find_cluster_by_vm、资源路由、缓存、批量状态、投票、Socket.IO 和页面 DOM identity；
+5. 用两个 PVE server 模拟相同 node/VMID；再模拟同一 VM node 迁移，验证身份不变。
 
-迁移前在隔离副本验证，不通过导入 modules/db.py 来做文档检查，因为导入会读取本地数据库配置。实际迁移所需连接信息由部署流程提供，不写入设计稿。
+同一真实 PVE domain 可能有多个 connection。P1 的 pve_server 是过渡作用域；进入 P3 时必须显式合并同 domain 的连接，不能把每个 URL 当成不同平台。
 
-## 6. 验收清单
+## 6. 数据迁移与切换
 
-以下是后续实现需要执行的验证，本次文档工作没有执行这些运行时测试。
+- 使用版本化迁移工具或显式 migration runner，记录 checksum；不再依赖导入模块时的零散 ALTER TABLE。
+- 先加新表/可空列和索引，再回填、验证、添加非空/唯一约束；重跑复用 UUID。
+- Cluster 保留教学关系，逐步映射 Environment；旧 Vm 持 resource_id FK。
+- 旧 PVE/OpenWrt 密文通过 credential_store 读取；先执行显式明文迁移，再建立 versioned secret ref，不复制凭据到 plan/operation 普通 JSON。
+- 现存资源使用 register/adopt，不对其执行 create；cleanup responsibility 默认为 retain，除非人工确认。
+- 每类资源切换前暂停新变更，处理内存任务、旧 worker、投票计时器和缓存写入者；无法恢复的外部结果人工核对。
+- 相同资源类型始终只有一个实际执行路径；旧 API 转为创建新对象/Operation，不能双写或双执行。
+- 外部副作用不在数据库事务内；恢复数据库不能撤销外部创建/删除，回退前必须对账。
+- 切换 PVE 唯一键后，旧全局 vmid 版本不能无条件回退。
+
+迁移工具必须 fail fast，输出不含凭据。生产 API/worker 启动时数据库配置错误应进入明确不可用状态，不能静默创建无绑定 session。
+
+## 7. 验收矩阵
 
 | 类别 | 必测行为 |
 |---|---|
-| 模块边界 | ResourceService 不依赖 Flask、角色、课程、模板、依赖图；无业务上下文仍可执行明确指令 |
-| 插件边界 | VM delete 不自动 stop；OpenWrt delete 不自动遍历清理；K8s deploy 不创建 VM/网络 |
-| 身份隔离 | 同 node/VMID 的不同平台查询、操作、缓存、权限、Socket.IO、投票均隔离 |
-| 任务受理 | Environment+Task+去重事务提交后才返回 202；断线重发不创建第二套环境 |
-| 执行恢复 | 保存 UPID 后重启继续查询；丢失步骤关联可找回原 operation；未知提交不重复创建 |
-| 并发 | 同环境变更互斥或返回 409；分配唯一；旧租约持有者不能覆盖新状态 |
-| 部分失败 | 保留已创建资源/分配；可明确清理；failed/cancelled 不伪装成 deleted |
-| 权限 | 直接资源管理、生命周期、日志、批量、事件各有范围；学生不能绕过投票；后台撤权停止新指令 |
-| 模板 | 发布内容不可变、引用校验、能力缺失可诊断；运行环境固定模板和预设版本 |
-| 通用性 | 不改核心/前端类型分支，新增 Python 模板即可使用；K8s 用同一 Environment 展示 |
-| 状态 | 安装操作成功与 K8s Ready 分开；端口可达与软件校验分开；缓存含采样时间 |
-| 迁移 | 重跑稳定、歧义停止、无重复外部创建、旧路径关闭、回退兼容性明确 |
+| API | POST/PATCH 只写对象；事务后返回；resourceVersion 冲突 409；status 不可由用户改写 |
+| Watch | outbox 与对象同事务；丢通知后 full resync 仍收敛；旧游标重新 LIST |
+| Scheduler | Filter/Score/Reserve/Bind 无外部调用；allocation 并发唯一；unknown 不释放 |
+| Plan | 相同输入 digest 稳定；冲突产生新 PlanRevision；旧版不可变且可追踪 |
+| Reconcile | 重复、并发和重启 reconcile 不重复创建 Operation；observedGeneration 不提前更新 |
+| Operation | 固定 binding/connection/plugin；UPID 恢复 poll；未知提交不重发；旧 lease 写入失败 |
+| Resource | provisional create、present/absent/unknown 可表达；跨 domain 身份隔离 |
+| Finalizer | 删除失败/unknown 时保留；借用资源不删；allocation 确认后才释放 |
+| 权限 | 每条新副作用再授权；撤权阻断；学生不能绕过投票；批量/日志/watch 逐范围过滤 |
+| 状态 | 命令成功、资源观察和 Environment Ready 分离；K8s 节点 conditions 可诊断 |
+| OpenWrt | 写操作跨进程 domain 串行；无 apply_mode=none 泄漏；删除不隐式清理别节 |
+| K8s | 远端 job 断线和 worker 重启后继续查询；安装成功不等于节点 Ready |
+| 模板 | 发布不可变、引用类型检查、能力缺失可诊断；模板升级不改旧 cleanup recipe |
+| 迁移 | 可重跑、歧义停止、无重复外部创建、旧执行路径关闭、回退条件明确 |
 
-现有安全/重试测试使用隔离 SQLite 与模拟提供器，后续修改相应入口时继续运行并扩展；新增资源唯一约束、分配并发与持久化任务使用隔离 PostgreSQL 验证。真实平台联调只对明确的测试资源执行，发布前覆盖实际部署版本与所需动作。
+技术测试使用模拟平台和独立 PostgreSQL。SQLite 只保留适合的安全单元测试；allocation、partial unique、lease、advisory lock、LISTEN/NOTIFY 和迁移必须用 PostgreSQL 验证。
 
-同一 Environment 首版只允许一个未结束的变更任务，通过数据库约束/事务校验受理，冲突返回 409；这是编排约定，不是资源框架跨资源依赖锁。直接资源操作仍按授权入口执行，编排不能假设平台没有外部改动。
+## 8. 运维与排查
 
-## 7. 运维与排查入口
+交接至少记录 API/worker 启动方式、controller resync/退避、插件/schema/迁移版本、连接/secret 管理、日志位置、Blocked/Unknown/finalizer 处理和备份恢复。
 
-交接运行版本时至少记录：API/worker 的启动方式、插件及 schema 版本、数据库迁移版本、连接/预设管理位置、日志定位、任务 blocked/unknown 的处理方式和备份恢复步骤。
+排查顺序：request/correlation → Environment generation → Placement/Allocation → PlanRevision/item → Operation → Resource/Binding/Connection → externalTaskRef。先核对外部事实，再决定重试、重规划或清理。禁止为了让界面变绿直接改 phase、observedGeneration、finalizer 或删除去重记录。
 
-排查顺序：request/correlation → Environment → Task/Step → Operation → resource/domain/connection → 外部任务标识。先核对资源身份与实际结果，再决定是否重试。不要为了让界面变绿直接修改 phase 或删除去重记录。
+首版不承诺跨平台原子性、多 worker HA、任意自动补偿或默认自愈。扩大规模前补齐 lease fencing、每资源互斥、OpenWrt domain 锁、secret rotation 和故障注入验证。
 
-首版只承诺数据库持久化与明确恢复语义，不承诺跨平台原子部署、任意自动补偿或多个 worker 的高可用。扩大部署规模时补齐租约/互斥的故障验证。
+## 9. 每阶段交接内容
 
-## 8. 接手者需要固化的细节
-
-这些不阻止开始 P1/P2，进入对应阶段前应更新文档：
-
-| 细节 | 固化阶段 |
-|---|---|
-| 实际 PVE/OpenWrt/K8s/安装器版本及其动作参数 schema | P2/P5 |
-| 现有配置如何识别同一 domain，歧义数据如何人工映射 | P1/P2 |
-| 模板格式的正式 JSON Schema、插件能力版本约束、预设 schema | P4 |
-| K8s 规划器输出、节点集合展开和就绪 evaluator | P5/P6 |
-| OpenWrt firewall_zone 是否新增 create/delete，还是使用预设 zone | P5 |
-| 初始网络池、镜像构建/版本、Python 入口及镜像验收 | P4 |
-| SSH 凭据引用、学生账号准备与 WebSSH environment 映射 | P4/P6 |
-| 操作/日志保留期、队列间隔、并发量和服务启动配置 | P4/P7 |
-
-每次交接注明：完成的阶段、改动入口、迁移是否执行、验证结果、剩余差异和下一项工作。设计示例通过静态校验不能替代运行时验收。
+每次交接注明：完成阶段、对象/schema 版本、修改入口、迁移是否执行、运行验证、真实平台范围、剩余差异和下一项工作。静态 JSON 校验、历史测试记录或模拟 provider 通过，均不能替代对应 PostgreSQL 与真实测试资源的发布验收。

@@ -5,7 +5,7 @@
     "id": "python-development",
     "version": "1.0.0",
     "name": "Python 终端开发环境",
-    "description": "待实现的模板格式示例。依赖预制 Python/SSH 镜像和已有可访问网络，不会隐式创建网络。"
+    "description": "待实现的控制面模板示例。依赖预制 Python/SSH 镜像和已有可访问网络；Scheduler 只做 placement，Controller 通过一次性 Operation 收敛状态。"
   },
   "parameters_schema": {
     "type": "object",
@@ -49,10 +49,11 @@
     "workspace": {
       "type": "compute.vm/v1",
       "driver_id": "pve.qemu/v1",
-      "origin": "created"
+      "origin": "created",
+      "cleanup_responsibility": "delete"
     }
   },
-  "planning": {
+  "scheduling": {
     "kind": "pve.single_vm/v1",
     "resource": "workspace",
     "image": "python-base",
@@ -67,15 +68,15 @@
       "$ref": "parameters.memory_mib"
     }
   },
-  "failure_policy": "retain",
-  "lifecycle": {
-    "create": [
+  "failure_policy": "retain_and_block",
+  "reconciliation": {
+    "running": [
       {
-        "id": "create_vm",
+        "id": "ensure_vm",
         "kind": "resource.create",
         "resource": "workspace",
         "request": {
-          "$ref": "definition.workspace.create_request"
+          "$ref": "plan.workspace.create_request"
         }
       },
       {
@@ -97,47 +98,17 @@
         "endpoint": {
           "protocol": "tcp",
           "host": {
-            "$ref": "definition.workspace.access.host"
+            "$ref": "plan.workspace.access.host"
           },
           "port": {
-            "$ref": "definition.workspace.access.port"
+            "$ref": "plan.workspace.access.port"
           }
         },
         "timeout_seconds": 600,
         "interval_seconds": 5
       }
     ],
-    "start": [
-      {
-        "id": "start_vm",
-        "kind": "resource.action",
-        "target": {
-          "$ref": "resources.workspace.resource_id"
-        },
-        "action": "start",
-        "parameters": {},
-        "skip_if_observation": {
-          "field": "power_state",
-          "equals": "running"
-        }
-      },
-      {
-        "id": "wait_ssh",
-        "kind": "wait.endpoint",
-        "endpoint": {
-          "protocol": "tcp",
-          "host": {
-            "$ref": "definition.workspace.access.host"
-          },
-          "port": {
-            "$ref": "definition.workspace.access.port"
-          }
-        },
-        "timeout_seconds": 600,
-        "interval_seconds": 5
-      }
-    ],
-    "stop": [
+    "stopped": [
       {
         "id": "stop_vm",
         "kind": "resource.action",
@@ -165,7 +136,7 @@
         "interval_seconds": 5
       }
     ],
-    "delete": [
+    "deletion": [
       {
         "id": "stop_vm",
         "kind": "resource.action",
@@ -213,13 +184,13 @@
         "$ref": "resources.workspace.resource_id"
       },
       "host": {
-        "$ref": "definition.workspace.access.host"
+        "$ref": "plan.workspace.access.host"
       },
       "port": {
-        "$ref": "definition.workspace.access.port"
+        "$ref": "plan.workspace.access.port"
       },
       "username": {
-        "$ref": "definition.workspace.access.username"
+        "$ref": "plan.workspace.access.username"
       }
     }
   ]

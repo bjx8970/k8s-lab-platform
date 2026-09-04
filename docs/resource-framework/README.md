@@ -1,89 +1,86 @@
 # 统一资源管理框架设计
 
-状态：设计稿，接口与插件均待实现。  
-创建日期：2026-09-02；更新日期：2026-09-03。  
-适用项目：K8s Lab Platform；暂定包名：`resource_framework`。
+状态：设计稿，接口与插件均待实现。更新日期：2026-09-04。暂定包名：`resource_framework`。
 
-平台整体的 API（含鉴权）、编排、执行、实验模板与任务恢复设计见 [平台设计与接手指南](../platform-design/README.md)。本目录继续定义独立资源执行层。
+平台整体的 API Server、Scheduler、Controller Manager、Resource Executor、Environment、PlanRevision、finalizer 与恢复设计见[平台控制面设计](../platform-design/README.md)。本目录定义 Resource Executor 下方可独立使用的资源执行库。
 
-## 定位
+## 1. 定位
 
-框架是资源管理与指令执行层，统一提供资源登记、列出、发现、查询、状态读取、指令分发和执行结果。插件负责将标准接口映射到具体平台。
+框架统一提供 Resource/Binding/Connection 登记、发现、查询、Observation、Operation 技术执行和插件分发。插件将固定的标准指令映射到 PVE、OpenWrt、K8s 等外部平台。
 
-操作是否应当执行、会影响哪些业务、资源之间如何依赖、何时执行下一条命令，由框架外部的 API 模块（鉴权与业务）、编排模块和执行模块决定。该边界同时适用于框架核心和基础插件，不能把移出的业务逻辑藏进插件。
+操作是否应产生、资源放在哪里、业务是否允许、多个资源怎样排序、删除是否完成，由 API admission、Scheduler 和 Controller 决定。框架及基础插件不能把这些职责以“保护逻辑”或隐式级联方式收回。
 
-## 文档
-
-| 文档 | 内容 |
-|---|---|
-| [架构与插件契约](architecture.md) | 资源模型、执行接口、插件协议、执行记录、职责边界 |
-| [虚拟机插件](plugins/virtual-machine.md) | 通用 VM 类型、动作和驱动协议 |
-| [PVE 插件](plugins/pve.md) | 平台/节点/模板、QEMU 驱动、服务器隔离、外部任务 |
-| [OpenWrt 插件](plugins/openwrt.md) | 路由器和 UCI 资源的独立操作 |
-| [K8s 插件](plugins/k8s.md) | 集群登记、查询、安装指令及执行结果 |
-| [实施与迁移计划](implementation-plan.md) | Issue #2、框架实施、应用接入、数据映射、验收 |
-| [资源指令示例](examples/resource-commands.json) | 相互独立的资源查询与操作请求，不是工作流 |
-
-## 职责划分
-
-| 资源框架与插件负责 | 其他模块负责 |
-|---|---|
-| 资源身份、外部定位、登记和列表 | 资源的业务归属、用户权限、配额 |
-| 提供类型、字段和支持的动作 | 判断某个用户当前可以执行哪些动作 |
-| 参数类型/格式、目标解析、驱动匹配 | 判断操作是否合理、是否需要审批或投票 |
-| 执行明确指令并返回状态/错误 | 评估停机、删除、配置变更的后果 |
-| 跟踪一条指令的外部任务 | 多资源依赖、执行顺序、工作流和等待条件 |
-| 输出单条操作的部分结果 | 失败重试、回滚补偿、级联清理 |
-| 保存实际资源状态及采样时间 | 判断整个实验环境是否可用 |
-| 连接和传输层的必要互斥 | IP/VLAN/端口分配及冲突规划 |
-
-框架的技术校验用于准确执行指令：参数能解析、资源能唯一定位、插件支持动作、数据库记录一致。它不据此建立业务准入策略。例如，删除 VM 时不检查它是否承载 K8s，也不检查有没有学生正在使用；API 模块（调用方）决定是否发送该命令，PVE 自身拒绝则返回平台错误。
-
-## 架构
+## 2. 与控制面的关系
 
 ```mermaid
 flowchart TD
-    App[应用 API / 页面 / Socket.IO] --> API[API 模块：鉴权、定义文件持久化与调度]
-    API --> Orch[编排模块：生成标准定义文件]
-    API --> Exec[执行模块：执行资源命令]
-    Orch --> API
-    Exec --> Service[资源框架：登记、列出、查询、执行]
-    API --> Service
-    Service --> Store[(资源 / 绑定 / 执行记录)]
-    Service --> Registry[插件与驱动注册表]
-    Service --> VM[虚拟机插件]
-    VM --> PVE[PVE QEMU 驱动]
-    Service --> OW[OpenWrt 插件]
-    Service --> K8s[K8s 插件]
+    Client[用户 / API 客户端] --> API[Platform API Server]
+    API --> DB[(PostgreSQL)]
+    DB --> Scheduler[Scheduler]
+    DB --> Controllers[Controller Manager]
+    Controllers --> DB
+    API --> DB
+    DB --> Executor[Resource Executor]
+    Executor --> Service[Resource Framework]
+    Service --> Registry[插件 / 驱动注册表]
+    Registry --> VM[Virtual Machine / PVE]
+    Registry --> OW[OpenWrt]
+    Registry --> K8s[K8s]
+    Executor --> DB
 ```
 
-框架不提供工作流入口、依赖图、销毁计划或业务策略回调。API 模块调用前完成自身鉴权和决策，编排模块生成标准定义文件交回 API 持久化，再由 API 分发给执行模块；执行模块作为资源框架的主要消费方直接调用框架，API 处理直接资源指令时也调用框架。
+EnvironmentController 或直接资源 API 经授权后创建持久化 Operation；Executor 从数据库领取并调用框架。API 不同步调用插件，Controller 不直接访问后端。框架不读取 Environment、PlanRevision、Task、课程或 finalizer。
 
-## 基础插件
+## 3. 职责划分
+
+| 资源框架与插件负责 | 控制面负责 |
+|---|---|
+| resource_id、domain、binding、connection 和外部定位 | Environment spec/status、业务归属和用户权限 |
+| 类型、字段、动作和 observation schema | 模板/Profile、placement、allocation、PlanRevision |
+| 参数类型/格式、目标解析、驱动匹配 | 每条新 Operation 前的实时授权与教学规则 |
+| 执行固定目标的一条 Operation | 跨资源顺序、readiness、失败决策和 cleanup recipe |
+| 外部任务 poll、部分结果和 unknown | 是否新 attempt、重规划、补偿或人工处理 |
+| Resource 实际状态和 observedAt | Environment conditions 和聚合 Ready |
+| 单资源/单 domain 的技术互斥 | 业务影响、配额、共享使用和删除许可 |
+
+框架的技术校验只用于准确执行：参数可解析、目标唯一、绑定/连接版本匹配、动作受支持。VM 是否承载 K8s、是否有学生使用、是否通过投票，均不是框架判断。
+
+## 4. 基础插件
 
 | 插件 | 类型与实现 |
 |---|---|
-| `virtual_machine` | 定义 `compute.vm/v1`、通用 VM 指令和驱动接口 |
-| `pve` | 定义 `pve.platform/v1`、`pve.node/v1`、`pve.template/v1`，提供 `pve.qemu/v1` 驱动 |
-| `openwrt` | 定义 router、VLAN、interface、DHCP、dnsmasq、zone、转发等资源，执行单项 UCI/服务指令 |
-| `k8s` | 定义 `k8s.cluster/v1`，提供 API 查询和 `kubeasz/v1` 安装指令适配 |
+| virtual_machine | `compute.vm/v1`、通用 VM 指令和驱动协议 |
+| pve | `pve.platform/node/template`，提供 `pve.qemu/v1` 驱动和 UPID poll |
+| openwrt | router、VLAN、interface、DHCP、zone、forward 等独立 UCI 指令 |
+| k8s | `k8s.cluster/v1`、API observation 和可恢复的 kubeasz 远端作业 |
 
-同一台 VM 只有一个 `compute.vm` 记录。OpenWrt 连接独立于 PVE。K8s 插件接受准备好的节点和安装参数，不创建 VM 或网络。
+同一台外部 VM 只有一个 compute.vm 当前绑定。OpenWrt connection 独立于 PVE。K8s deploy 接受完整 inventory，不创建 VM 或网络。
 
-实验环境仍可由外部模块注册为一个自定义逻辑资源类型，但其状态和操作由提供该类型的模块实现；框架不内置 `lab.environment` 控制器。`openwrt.network` 网络组合亦由外部模块表达，基础 OpenWrt 插件只提供独立配置资源。
+## 5. 核心约定
 
-## 核心约定
+1. 对内使用 UUID resource_id；外部身份始终带 domain。PVE VM 目标态 `(domain_id,vmid)` 唯一，node 只是可变 locator。
+2. connection 是访问端点，不等同 domain；多个 connection 可以由接入层明确关联同一平台。
+3. register、create、unregister 和 delete 是四种不同语义。
+4. create 在外部调用前生成 Resource 和 provisional Binding；登记状态与外部存在状态分开。
+5. 每个外部副作用先持久化 Operation；Executor 固定 binding/connection/plugin/secret 版本快照后执行。
+6. Operation 使用 lease/claimRevision；已知 externalTaskRef 重启后继续 poll，未知提交不自动重发。
+7. request_id 只做服务端作用域内传输去重，不把业务上相似的两个命令自动合并。
+8. 单条命令内部必要的 clone→poll→configure 可以由插件完成，但不得触发其他资源动作。
+9. OpenWrt 写操作按 domain 跨进程串行；首版不支持跨 Operation 的 `apply_mode=none` 候选配置。
+10. delete 成功可关闭 Resource 当前绑定，但不会级联其他资源；finalizer 和 allocation 由控制面维护。
 
-1. 对内使用 UUID `resource_id`，对外绑定包含明确平台作用域，修复同节点名/VMID 的跨服务器冲突。
-2. 同一外部平台可以有多个连接地址；调用者提供明确 domain/connection 关联，不根据业务名称猜测。
-3. 登记资源与在外部创建资源是不同接口；遗忘登记与删除外部对象也是不同接口。
-4. 外部任务已接受、执行完成、资源实际状态分别记录。
-5. 每条指令独立执行。框架不推断它和其他指令的依赖，也不保证它们构成某个业务流程。
-6. 框架可去重同一个请求并继续查询已知外部任务；是否再次执行失败或结果不明的命令由调用方决定。
-7. 单条指令需要多个底层 API 调用时，插件可以实现协议内部顺序，但不自行触发其他资源的业务动作。
+## 6. 文档
 
-## 本次边界修订
+| 文档 | 内容 |
+|---|---|
+| [架构与插件契约](architecture.md) | 数据模型、Operation、绑定快照、Executor、插件协议 |
+| [虚拟机插件](plugins/virtual-machine.md) | VM 类型、动作和驱动协议 |
+| [PVE 插件](plugins/pve.md) | domain/VMID、QEMU 驱动、UPID 和恢复 |
+| [OpenWrt 插件](plugins/openwrt.md) | 独立 UCI 资源、apply 和 domain 锁 |
+| [K8s 插件](plugins/k8s.md) | 集群 observation、可恢复安装作业 |
+| [实施与迁移计划](implementation-plan.md) | 分阶段实现、身份迁移和验收 |
+| [资源指令示例](examples/resource-commands.json) | 相互独立的调用示例，不是工作流 |
 
-旧稿中的 owns/depends_on 关系图、DAG 调度、授权策略入口、删除保护、级联清理、自动补偿、地址分配、实验环境蓝图编译全部移出框架。旧蓝图示例由独立指令示例替代，后续实现以本稿为准。
+## 7. 首版排除项
 
-现有应用的权限和关机投票继续存在于应用层。职责迁出是代码归属调整，不是取消应用已有控制。首版以当前代码实际使用的 PostgreSQL 为存储基线。
+资源依赖图、Environment controller、Task workflow、业务 allocation、自动补偿、级联清理、地址规划、用户授权策略和模板编译均不属于资源框架。以后可以注册新资源类型，但不能通过扩张核心来绕过控制面对象契约。
