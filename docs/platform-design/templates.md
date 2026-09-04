@@ -25,7 +25,7 @@
 | parameters_schema | 是 | 用户参数的 JSON Schema；首版支持对象、基础类型、必填、默认值、枚举、范围和字符串 pattern |
 | requirements | 是 | 需要的资源类型、驱动和动作；对应已加载的能力描述 |
 | resources | 是 | 逻辑资源名到类型/驱动/创建或借用方式的声明 |
-| planning | 是 | 已注册规划规则及输入；输出固定计划 |
+| planning | 是 | 已注册规划规则及输入；输出固定定义文件 |
 | lifecycle | 是 | 至少 create/delete；可选 start/stop，均为有限顺序步骤 |
 | failure_policy | 是 | 首版固定 retain：失败保留已产生资源并停下 |
 | access | 否 | 环境详情页可展示的访问描述，如 ssh、web |
@@ -41,30 +41,30 @@
 | 命名空间 | 产生者 | 示例 |
 |---|---|---|
 | parameters | 参数 schema 校验并填充默认值后的输入 | parameters.cores |
-| plan | 规划器持久化输出 | plan.workspace.create_request |
+| definition | 规划器产出的标准定义文件 | definition.workspace.create_request |
 | resources | 环境逻辑名到已登记 UUID 的绑定 | resources.workspace.resource_id |
 
 解析器递归替换引用并保留原数据类型，不能把整个对象强行转成字符串；不执行 Python、shell、Jinja 或任意表达式。普通字符串保持原值，不提供隐式插值。引用不存在时返回明确错误，不能替换为空值继续调用插件。
 
-发布时检查根命名空间、资源声明、可解析的计划输出路径和步骤先后关系；依赖运行结果的资源 ID 在执行时绑定并持久化。字段中的点号用作路径分隔，首版逻辑名使用字母、数字和下划线，不包含点。
+发布时检查根命名空间、资源声明、可解析的定义文件输出路径和步骤先后关系；依赖运行结果的资源 ID 在执行时绑定并持久化。字段中的点号用作路径分隔，首版逻辑名使用字母、数字和下划线，不包含点。
 
 ## 4. 最小步骤集合
 
 | kind | 字段/行为 | 所在层 |
 |---|---|---|
-| resource.create | resource 逻辑名、request；请求包含 type/driver_id/connection_id/parameters，调用 ResourceService.create | 编排→资源 |
-| resource.register | resource 逻辑名、request；绑定已存在对象，记录 created/adopted 的来源 | 编排→资源 |
-| resource.action | target resource_id、action、parameters；调用 execute | 编排→资源 |
-| wait.observation | target、field、equals、timeout_seconds、interval_seconds；调用 observe 并比较指定观察字段 | 编排 |
-| wait.endpoint | endpoint.protocol/host/port、timeout_seconds、interval_seconds；首版 TCP 探测 | 编排 |
+| resource.create | resource 逻辑名、request；请求包含 type/driver_id/connection_id/parameters，由执行模块调用 ResourceService.create | 编排产定义文件 → 执行模块 → 资源 |
+| resource.register | resource 逻辑名、request；绑定已存在对象，记录 created/adopted 的来源 | 编排产定义文件 → 执行模块 → 资源 |
+| resource.action | target resource_id、action、parameters；由执行模块调用 execute | 编排产定义文件 → 执行模块 → 资源 |
+| wait.observation | target、field、equals、timeout_seconds、interval_seconds；调用 observe 并比较指定观察字段 | 执行模块 |
+| wait.endpoint | endpoint.protocol/host/port、timeout_seconds、interval_seconds；首版 TCP 探测 | 执行模块 |
 
-resource.create/action 默认等待该 Operation 成功才推进下一步，返回 pending 时持久化 waiting。register 是数据库登记动作，返回资源引用后推进。调用上下文及稳定 request_id 由执行器产生，模板不能任意覆盖。
+resource.create/action 默认等待该 Operation 成功才推进下一步，返回 pending 时持久化 waiting。register 是数据库登记动作，返回资源引用后推进。调用上下文及稳定 request_id 由执行模块分发时产生，模板与定义文件不能任意覆盖。
 
-resource.create 接受时就产生 resource_id：编排应立即保存关联及操作引用，而非等整个创建成功后才保存。部分创建仍可追踪；resource.register 不意味着拥有外部对象的删除权，责任由编排声明。
+resource.create 接受时就产生 resource_id：执行模块应立即保存关联及操作引用，而非等整个创建成功后才保存。部分创建仍可追踪；resource.register 不意味着拥有外部对象的删除权，删除责任由编排在定义文件中声明。
 
-resource.action 可显式声明 skip_if_observation={field,equals}。执行器先调用 observe；只有新鲜观察值等于模板给定值时，将该步骤记为 succeeded，结果带 skipped=true 和观察依据，不发送资源命令。观察失败不能当成匹配成功；默认阻塞并报告。这个受限的相等判断用于“已关机则跳过关机”等场景，不引入表达式引擎，也不成为资源插件的隐式行为。观察与命令之间仍可能发生外部状态变化，平台拒绝时如实报告。
+resource.action 可显式声明 skip_if_observation={field,equals}。执行时先调用 observe（执行模块调用资源观察）；只有新鲜观察值等于定义文件给定值时，将该步骤记为 succeeded，结果带 skipped=true 和观察依据，不发送资源命令。观察失败不能当成匹配成功；默认阻塞并报告。这个受限的相等判断用于“已关机则跳过关机”等场景，不引入表达式引擎，也不成为资源插件的隐式行为。观察与命令之间仍可能发生外部状态变化，平台拒绝时如实报告。
 
-wait.observation 从对应资源类型的观察结果中取字段，例如 VM 的 power_state。wait.endpoint 超时只说明就绪条件未满足，不反向删除资源。探测是编排判断能力，不能变成资源层的强制准入检查。
+wait.observation 从对应资源类型的观察结果中取字段，例如 VM 的 power_state。wait.endpoint 超时只说明就绪条件未满足，不反向删除资源。探测是执行模块的判断能力，不能变成资源层的强制准入检查。
 
 扩展 HTTP 或软件特定的就绪判断时注册新的 evaluator/版本化步骤能力，不能默默让 TCP 成功代表应用完整可用。为访问入口生成地址也不代表入口已经满足就绪条件。
 
@@ -81,7 +81,7 @@ wait.observation 从对应资源类型的观察结果中取字段，例如 VM �
 
 connection/secret 的生命周期属于资源接入层；镜像用途、池分配和 PVE/OpenWrt 配对属于编排预设。修改预设生成新 revision。规划保存实际使用的镜像绑定/修订，运行任务不重新查询一个可能已经指向别的 VM 的浮动镜像别名。
 
-Python 示例采用规划器 pve.single_vm/v1：给定逻辑资源名、镜像别名、规格与访问网络，选择预设允许的节点并预留 VMID/IP，输出 plan.workspace：
+Python 示例采用规划器 pve.single_vm/v1：给定逻辑资源名、镜像别名、规格与访问网络，选择预设允许的节点并预留 VMID/IP，输出 definition.workspace：
 
 | 输出 | 内容 |
 |---|---|
@@ -104,7 +104,7 @@ nics/initialization 的完整结构由 VM/PVE schema 定义。该示例要求预
 
 这个模板提供终端式 Python 开发环境。SSH 端口可达仅是此模板的最低就绪约定；Python 安装正确性由受控镜像验收保证。如果要提供浏览器 IDE，需在镜像中预装服务，并具备相应的访问转发、鉴权和就绪探测能力后添加 web 入口。
 
-销毁步骤针对该模板创建的资源。若创建中途失败，编排依据真实关联和操作结果生成针对已产生资源的清理任务；已确认从未产生的资源不用删除，结果不明的资源先核对。通用执行器不自动反转 create 步骤，也不自动删除借用资源。
+销毁步骤针对该模板创建的资源。若创建中途失败，编排依据真实关联和操作结果生成针对已产生资源的清理定义文件；已确认从未产生的资源不用删除，结果不明的资源先核对。执行模块的步骤执行器不自动反转 create 步骤，也不自动删除借用资源。
 
 ## 7. K8s 模板规划
 
@@ -143,7 +143,7 @@ access 类型首版支持 ssh；web 可由后续访问适配注册。SSH 描述�
 ## 9. 扩展验收
 
 - 同一模板使用不同部署预设，生成不同 domain/连接的资源，身份不串用。
-- 发布 1.1.0 不改变使用 1.0.0 的运行环境、计划或销毁步骤。
+- 发布 1.1.0 不改变使用 1.0.0 的运行环境、定义文件或销毁步骤。
 - 参数和引用在外部变更前校验；未知动作、规划器或入口类型可明确报告。
 - Python 通过已有 VM/PVE 能力和预制镜像实现，无 Python 专用数据库表/API/page 分支。
 - 环境 phase、任务结果与资源事实分别展示；失败后能找回已创建资源。

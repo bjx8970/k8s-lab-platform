@@ -6,3 +6,5 @@ __pycache__/
 .secret_key
 tmp/
 .qoder/
+.workbuddy/
+.codex/

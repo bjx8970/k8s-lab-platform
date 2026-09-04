@@ -11,7 +11,8 @@
 | environment_id | 通用实验实例 UUID，不等于 K8s 集群 ID |
 | template_id + version | 不可变的已发布实验模板版本 |
 | profile_id + revision | 管理员部署预设的固定版本 |
-| task_id / step_id | 编排生命周期任务 / 已展开步骤 |
+| definition_id | 标准定义文件 UUID，一次实验实例的不可变执行蓝图 |
+| task_id / step_id | 生命周期任务 / 定义文件展开后的步骤 |
 | operation_id | 一条资源命令的持久化记录 |
 | request_id | 调用者范围内的请求去重键 |
 | correlation_id | 跨 API、任务、步骤和资源操作的追踪标识，不授予权限 |
@@ -24,14 +25,15 @@
 
 | 表/对象 | 关键字段与约束 | 所属模块 |
 |---|---|---|
-| users、roles、sessions 等 | 沿用或适配当前身份/角色数据 | 鉴权 |
+| users、roles、sessions 等 | 沿用或适配当前身份/角色数据 | API/鉴权 |
 | classes、groups、votes 等 | 课程、成员、投票及业务关联 | 应用适配 |
 | orch_templates | template_id PK、名称、描述、展示信息、归档状态 | 编排/模板 |
 | orch_template_versions | (template_id,version) 唯一、内容、摘要、发布状态、发布者、发布时间 | 编排/模板 |
 | orch_profile_versions | (profile_id,revision) 唯一、连接/镜像/池引用、规格约束、摘要 | 编排/预设 |
 | orch_environments | UUID PK、模板版本 FK、预设版本 FK、参数快照、owner/scope 引用、目标状态、phase、revision、outputs、conditions | 编排/环境 |
-| orch_tasks | UUID PK、environment FK、生命周期动作、计划摘要、请求摘要、状态、创建主体、执行范围、lease_owner/lease_until/claim_revision、时间 | 编排/任务 |
-| orch_task_steps | UUID PK、task FK、稳定逻辑键、顺序号、类别、固定输入、attempt、state、operation_id、结果/错误、时间 | 编排/任务 |
+| orch_definitions | UUID PK、environment FK、固定模板/预设版本、参数快照、资源声明、步骤序列、就绪条件、访问入口、失败策略、执行范围；不可变 | 编排/定义文件 |
+| orch_tasks | UUID PK、environment FK、definition FK、生命周期动作、请求摘要、状态、创建主体、执行范围、lease_owner/lease_until/claim_revision、时间 | 编排/受理；执行模块推进状态 |
+| orch_task_steps | UUID PK、task FK、稳定逻辑键、顺序号、类别、固定输入、attempt、state、operation_id、结果/错误、时间 | 执行 |
 | orch_environment_resources | environment FK、logical_key、resource_id、created/adopted、所属创建任务、删除责任、登记状态 | 编排/关联 |
 | orch_allocations | scope、kind、value、environment/task、reserved/assigned/released、revision；有效占用唯一 | 编排/规划 |
 | orch_request_keys | 主体范围+入口+request_id 唯一、请求摘要、task/environment 引用 | 编排/受理 |
@@ -39,7 +41,7 @@
 
 一个环境的一个 logical_key 同时只能有一个当前资源关联；替换保留历史。分配作用域分别采用 PVE domain（VMID）、网络池（IP/子网）、路由器或网络域（VLAN/端口），不能全局混用。
 
-模板版本、预设版本、计划快照及已执行步骤的输入不可原地修改。环境详情可以显示模板的新版本，但不能自动把旧环境的销毁流程切换到新版。
+模板版本、预设版本、定义文件及已执行步骤的输入不可原地修改。环境详情可以显示模板的新版本，但不能自动把旧环境的销毁流程切换到新版。
 
 业务归属由环境/应用模型提供，rf_resources.metadata 中同名信息只能是检索投影。直接导入且不属于环境的资源，其访问范围由应用侧资源授权记录管理。资源层不存储业务权限。
 
@@ -78,7 +80,7 @@ Content-Type: application/json
 }
 ```
 
-HTTP 状态为 202；这只表示任务已持久化受理。规划或部署仍可能失败。事务未提交不得返回已受理，也不得先触发外部创建。
+HTTP 状态为 202；这只表示任务已持久化受理。之后后台编排生成标准定义文件、持久化并分发给执行模块执行，规划或部署仍可能失败。事务未提交不得返回已受理，也不得先触发外部创建。
 
 同一主体+入口+request_id 的相同规范化请求返回同一结果，正文不同返回 409 RequestConflict。正文摘要包含固定模板/预设版本和参数，不包含会话令牌或生成时间。
 
@@ -86,7 +88,7 @@ HTTP 状态为 202；这只表示任务已持久化受理。规划或部署仍�
 
 | 接口 | 处理服务/语义 |
 |---|---|
-| POST /api/auth/login；POST /api/auth/logout | 鉴权模块的登录/登出适配 |
+| POST /api/auth/login；POST /api/auth/logout | API 模块的登录/登出适配 |
 | GET /api/me | 当前身份与前端可用权限信息 |
 | GET/POST /api/lab-templates | 已授权模板目录 / 创建模板草稿 |
 | GET/PUT /api/lab-templates/{id}/versions/{version} | 读取 / 修改未发布草稿；修改需预期 revision |
@@ -95,7 +97,7 @@ HTTP 状态为 202；这只表示任务已持久化受理。规划或部署仍�
 | GET/POST /api/environments | 查询可见实例 / 受理创建 |
 | GET /api/environments/{id} | 环境、资源摘要、任务状态和访问入口 |
 | POST /api/environments/{id}/actions/{action} | start/stop/delete 等模板已声明生命周期；生成 task |
-| GET /api/tasks/{id}；GET /api/tasks/{id}/logs | 编排任务和经授权的日志，支持游标 |
+| GET /api/tasks/{id}；GET /api/tasks/{id}/logs | 任务和经授权的日志，支持游标 |
 | POST /api/tasks/{id}/cancel | 请求停止后续调度，不等于回滚 |
 | POST /api/tasks/{id}/resume | 解除可恢复阻塞；校验 revision，记录处理依据，不盲目重发未知命令 |
 | GET /api/resource-types；GET /api/resources | 类型能力 / 可见范围内的资源列表 |
@@ -104,6 +106,8 @@ HTTP 状态为 202；这只表示任务已持久化受理。规划或部署仍�
 | GET /api/resource-operations/{id} | 单条资源操作结果，与 Task 区分 |
 
 资源 API 的 observe/unregister/cancel 等补充接口沿用资源框架设计。旧路由保留适配期，但相同类型只能有一个实际执行路径。
+
+标准定义文件是编排与执行之间的内部中间产物，由 API 持久化并分发，不单独对外暴露 CRUD 接口；用户通过 environment/task 状态查看其执行进展。
 
 未登录为 401，权限不足为 403，未找到为 404，版本/身份/去重冲突为 409，格式或参数不符合 schema 为 400/422，必要插件暂不可用为 503。列表逐范围过滤；批量对象逐项授权；任务和操作 ID 本身不是访问凭证。
 
@@ -117,21 +121,21 @@ authorize(principal, action, target, scope, parameters) -> Decision
 Decision = {allow, reason_code, visible_scope?}
 ```
 
-现有 `authz.is_allowed/require_allowed` 与 `security_service` 是适配基线，以上接口为未来统一外观，不要求另建一套权限矩阵。
+鉴权是 API 模块的内建能力。现有 `authz.is_allowed/require_allowed` 与 `security_service` 是适配基线，以上接口为未来统一外观，不要求另建一套权限矩阵。
 
 Principal 与目标归属从服务端可信信息构造。visible_scope 用于生成资源查询过滤或环境查询条件，不把未经验证的客户端过滤器当成授权范围。
 
-实验创建被允许后，服务端生成限定于该环境、固定模板/预设和计划步骤的内部执行范围。用户只需拥有相应环境生命周期权限，不必同时拥有平台原始命令权限。编排适配在每次发送新的资源命令前核对执行范围以及发起主体当前是否仍有该生命周期权限；主动系统任务使用明确的服务身份和策略范围。
+实验创建被允许后，服务端生成限定于该环境、固定模板/预设和定义文件步骤的内部执行范围。用户只需拥有相应环境生命周期权限，不必同时拥有平台原始命令权限。编排生成定义文件交回 API 后，API 在把定义文件分发给执行模块前核对执行范围以及发起主体当前是否仍有该生命周期权限，并将执行范围随定义文件下发；执行模块持该范围调用资源管理，主动系统任务使用明确的服务身份和策略范围。
 
 权限撤销或执行范围失效时，任务进入 blocked，reason=AuthorizationRevoked，停止提交新命令；已被外部平台接受的命令仍由资源执行器跟踪事实，不承诺撤回或回滚。恢复必须重新授权。凭据读取位于宿主连接适配中。
 
-这些规则位于宿主鉴权/编排适配层。ResourceService 的输入仍不含角色、投票许可或授权回调。
+这些规则位于 API 模块的鉴权与调度层。ResourceService 的输入仍不含角色、投票许可或授权回调。
 
 ## 6. 规划与分配
 
-规划器读取固定版本及资源观察结果，按已注册的简单规划规则绑定 domain、connection、node、镜像和网络资源池。查询外部候选是读操作；真正的创建必须成为计划中的资源命令。
+规划器读取固定版本及资源观察结果，按已注册的简单规划规则绑定 domain、connection、node、镜像和网络资源池。查询外部候选是读操作；真正的创建必须成为定义文件中的资源命令。
 
-在短事务中为分配记录加唯一约束/行锁，保存计划和预留结果。不要持有数据库事务等待 PVE 或 SSH。平台外部管理员仍可能同时分配同一 VMID；数据库预留不等于外部平台锁，冲突应由平台返回并在编排层显式重新规划。
+在短事务中为分配记录加唯一约束/行锁，保存定义文件与预留结果。不要持有数据库事务等待 PVE 或 SSH。平台外部管理员仍可能同时分配同一 VMID；数据库预留不等于外部平台锁，冲突应由平台返回并在编排层显式重新规划。
 
 已发送可能产生资源的命令后，不能因为任务超时或 lease 到期就释放 VMID/IP。需确认未创建或已删除才释放；unknown 保留分配并记录待处理原因。借用的共享资源不取得默认删除责任。
 
@@ -143,17 +147,17 @@ Principal 与目标归属从服务端可信信息构造。visible_scope 用于�
 | Task | queued/planning/running/waiting/blocked/succeeded/failed/cancelling/cancelled | 一次生命周期流程 |
 | Operation | queued/running/pending/succeeded/failed/cancelled/unknown | 一条资源命令，沿用资源契约 |
 
-步骤使用 queued/running/waiting/succeeded/failed/blocked/cancelled，具体命令结果通过 operation_id 查询。创建任务只有完成模板要求的就绪检查后，才能将环境标为 ready。K8s 安装退出成功并不自动满足节点 Ready 条件。
+步骤使用 queued/running/waiting/succeeded/failed/blocked/cancelled，具体命令结果通过 operation_id 查询。创建任务只有完成定义文件要求的就绪检查后，才能将环境标为 ready。K8s 安装退出成功并不自动满足节点 Ready 条件。
 
 Task failed/cancelled 不表示所有资源已删除；Environment error 记录失败原因、已存在资源和待处理操作。delete 流程只有完成负责清理的资源确认及分配释放后才标 deleted。历史记录不随外部对象删除而消失。
 
 ## 8. 持久化执行与去重
 
-1. TaskController 从数据库领取可推进任务，保存 lease_owner、lease_until 和递增 claim_revision；状态更新使用领取版本条件写入。
-2. 规划后的逻辑步骤 ID、输入和 attempt 固定保存。调用资源服务时使用 caller_ref=orchestration，以及由 task_id/step_id/attempt 构成的稳定 request_id。
+1. 执行模块的 TaskController 从数据库领取可推进任务，保存 lease_owner、lease_until 和递增 claim_revision；状态更新使用领取版本条件写入。
+2. 定义文件中的步骤 ID、输入和 attempt 固定保存。执行模块按步骤分发资源命令时携带 caller_ref=execution，以及由 task_id/step_id/attempt 构成的稳定 request_id。
 3. 资源服务在事务中保存 Operation 和可领取状态，再异步提交外部动作。事务外执行网络调用。
-4. 编排保存 operation_id。若在资源受理后、保存关联前崩溃，用同一请求键再次调用可取回相同 Operation；这不等于重新执行后端命令。
-5. pending 操作按已保存 external_task_ref 轮询；编排 waiting 定期查询结果并释放调度线程。
+4. 执行模块保存 operation_id 与 step 的关联。若在资源受理后、保存关联前崩溃，用同一请求键再次调用可取回相同 Operation；这不等于重新执行后端命令。
+5. pending 操作按已保存 external_task_ref 轮询；执行模块 waiting 定期查询结果并释放调度线程。
 6. 只有当前步骤确认成功才推进后续步骤；失败或未知不推断成功。
 
 请求去重记录至少保留到任务及其恢复/审计保留期结束；历史去重键不能在仍可重试时删除后重新执行。首版不承诺跨数据库和外部平台的 exactly-once。
@@ -169,14 +173,14 @@ lease/claim_revision 能防止旧 worker 覆盖数据库状态，不能阻止已
 | Operation queued，尚未进入提交阶段 | 正常领取 |
 | 已保存 PVE UPID 或远端安装作业 ID | 恢复查询，不再次启动操作 |
 | 可能提交但未保存外部任务 ID | Operation unknown，Task blocked；查询身份/外部事实 |
-| 外部创建成功，后续配置失败 | 保存已存在对象及部分结果；编排决定补配置或清理 |
+| 外部创建成功，后续配置失败 | 保存已存在对象及部分结果；执行模块决定补配置或清理，必要时编排生成补偿定义文件 |
 | worker 租约丢失 | 拒绝旧领取者写状态；未知提交按 unknown 处理 |
 | 插件版本缺失或不兼容 | 停止推进并保留历史，不能用不兼容驱动重放 |
 | PostgreSQL 不可用 | 不受理新的变更、不提交未持久化命令；已有外部作业可能继续运行 |
 
 当前应用已经提供 `/api/k8s/tasks/<task_id>/retry`，其安全重试限制见 [Job 安全重试](../job-retry.md)。它仍使用进程内记录；这里的持久化 Task/Operation 恢复为后续目标，迁移时保留现有授权、一次直接重试子任务及拒绝重放未确认 create 的约束，不将既有 retry 等同于通用 resume。
 
-首版失败策略为保留资源并停止后续步骤。补偿是编排显式记录的新步骤/清理任务，不属于资源框架。失败的外部命令重新执行时分配新 attempt/request_id；读取旧操作结果和恢复轮询继续使用原记录。
+首版失败策略为保留资源并停止后续步骤。补偿由编排生成新的定义文件/清理任务，由执行模块执行，不属于资源框架。失败的外部命令重新执行时分配新 attempt/request_id；读取旧操作结果和恢复轮询继续使用原记录。
 
 resume 用于继续已确认可继续的任务，不允许把用户提交的 succeeded 字段当成外部执行事实。未知结果应通过查询得到足够证据并记录；无法确认时继续 blocked，由有权限的人员明确制定后续清理/重建操作。
 

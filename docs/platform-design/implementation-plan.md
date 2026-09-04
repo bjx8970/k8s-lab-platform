@@ -8,12 +8,12 @@
 
 | 当前入口 | 当前情况 | 后续处理 |
 |---|---|---|
-| [app.py](../../app.py) | Flask 路由已接入统一授权、CSRF/Origin 与审计，同时仍负责资源请求和投票 | 逐路由改成核心/应用适配，保持既有安全契约 |
-| [modules/authz.py](../../modules/authz.py)、[security_service.py](../../modules/security_service.py) | 已有纯授权策略、主体/资源重载及服务层授权 | 复用为目标鉴权模块与宿主调用适配 |
+| [app.py](../../app.py) | Flask 路由已接入统一授权、CSRF/Origin 与审计，同时仍负责资源请求和投票 | 逐路由改成 API 模块/应用适配，保持既有安全契约 |
+| [modules/authz.py](../../modules/authz.py)、[security_service.py](../../modules/security_service.py) | 已有纯授权策略、主体/资源重载及服务层授权 | 复用为 API 模块的鉴权组件与宿主调用适配 |
 | [modules/audit.py](../../modules/audit.py)、[credential_store.py](../../modules/credential_store.py) | 已有脱敏审计、凭据加密和显式迁移机制 | 作为资源连接与日志的宿主适配，不重建明文存储 |
 | [modules/db.py](../../modules/db.py) | Vm.vmid 全局唯一；find_cluster_by_vm(node,vmid) 缺平台维度 | 先修完整身份，再引入资源 UUID 和环境映射 |
 | [modules/db.py](../../modules/db.py) | _create_engine 只接受 PostgreSQL 配置 | 新设计以 PostgreSQL 为基线；README/AGENTS 的 SQLite 说明有历史差异 |
-| [modules/k8s_manager.py](../../modules/k8s_manager.py) | 集中处理部署及任务；已支持服务端描述约束的安全重试，_task_store 仍在内存 | 保留现有重试/撤权语义，分离动作后迁入持久化编排 |
+| [modules/k8s_manager.py](../../modules/k8s_manager.py) | 集中处理部署及任务；已支持服务端描述约束的安全重试，_task_store 仍在内存 | 保留现有重试/撤权语义，分离动作后迁入定义文件驱动的持久化执行 |
 | [modules/task_queue.py](../../modules/task_queue.py) | 进程内队列；导入即启动 create/delete/deploy worker | 改为显式启动，数据库记录为任务事实来源 |
 | [modules/status_cache.py](../../modules/status_cache.py) | VM 查询缓存键含 node/VMID，缺平台维度 | 过渡期完整三元组，目标使用 resource_id |
 | [modules/pve_client.py](../../modules/pve_client.py) | 现有适配需保留 UPID、区分接受与完成，并拆出隐式 stop/delete | 按 PVE/VM 插件契约迁移 |
@@ -30,14 +30,14 @@
 
 | ID | 首版决定 | 原因/何时重议 |
 |---|---|---|
-| D01 | 核心、鉴权、资源、编排四大模块，内部组件可拆包 | 避免万能核心；需要独立扩缩容时再拆服务 |
+| D01 | API（含鉴权）、编排、执行、资源四大模块，内部组件可拆包；API 是全局中枢，编排生成标准定义文件交回 API 持久化并分发给执行模块 | 避免模块间直接互调；需要独立扩缩容时再拆服务 |
 | D02 | 资源框架及基础插件只执行明确资源指令 | 保持独立可复用；新增业务规则放调用层 |
 | D03 | 任务驱动、状态持久化，暂不持续自动修复 | 当前需求是部署与管理；自愈需求明确后增加环境协调器 |
 | D04 | PostgreSQL + API/worker，进程内服务调用 | 贴近当前代码；暂不引入 etcd/消息总线 |
 | D05 | Environment 与 Resource 分离 | 实验生命周期及教学归属不污染通用资源模型 |
-| D06 | 模板/预设版本及计划固定，资源身份用 UUID | 保证恢复、销毁及跨平台定位可追溯 |
+| D06 | 模板/预设版本及定义文件固定，资源身份用 UUID | 保证恢复、销毁及跨平台定位可追溯 |
 | D07 | 顺序步骤、明确等待、有限规划展开 | 先满足现有 K8s 与 Python；不预建通用 DAG 引擎 |
-| D08 | 失败默认保留，未知结果停下核对 | 避免丢失部分资源；补偿由编排显式执行 |
+| D08 | 失败默认保留，未知结果停下核对 | 避免丢失部分资源；补偿由编排生成定义文件、执行模块执行 |
 | D09 | 原始资源命令与教学业务动作分别授权 | 保持直接管理能力，同时保留学生投票等应用规则 |
 | D10 | 模板只组合已安装能力；首版插件为受信任代码 | 第三方插件隔离、动态安装和任意脚本执行需另行设计 |
 
@@ -52,8 +52,8 @@
 | P0 基线确认 | 确认此设计；记录实际部署数据库/版本；为关键现有功能整理回归场景 | 模块所有权、已知差异和迁移映射需求明确 |
 | P1 身份修复 | 资源计划 M1：VM 的 PVE FK/复合唯一、查询/缓存/页面/权限/投票完整定位 | 两平台同 node/VMID 完全隔离；可独立发布 |
 | P2 资源闭环 | M2–M3：核心资源模型、插件注册、持久化 Operation、VM/PVE 驱动 | 登记/创建/查询/启停/删除和任务恢复可独立调用 |
-| P3 API 与鉴权接入 | 薄核心、复用 Issue #1 授权/审计实现、新旧资源路由同执行路径，保留应用规则 | 批量、Socket.IO、WebSSH、日志均无跨范围访问 |
-| P4 最小编排与 Python | Environment/Task/Step、模板/预设版本、单 VM 规划器、通用表单/入口 | 发布 Python 模板即可创建/停止/启动/删除；任务可恢复 |
+| P3 API 与鉴权接入 | API 模块（统一入口、鉴权与全局调度分发），复用 Issue #1 授权/审计实现、新旧资源路由同执行路径，保留应用规则 | 批量、Socket.IO、WebSSH、日志均无跨范围访问 |
+| P4 最小编排与 Python | Environment/定义文件/Task/Step、模板/预设版本、单 VM 规划器、执行模块、通用表单/入口 | 发布 Python 模板即可创建/停止/启动/删除；任务可恢复 |
 | P5 OpenWrt 与 K8s | M4–M5：单资源动作、kubeasz 跟踪；明确补齐实际配方所需能力 | 插件可独立工作；无隐藏跨资源动作 |
 | P6 K8s 模板迁移 | M6：网络/VM/安装分段配方、旧 Cluster 映射、通用环境界面 | 原 K8s 业务行为保留，安装与环境状态可区分 |
 | P7 切换与交接 | 数据回填、旧入口兼容、在途任务处理、运维说明 | 单一写入路径、迁移验证和回退条件均明确 |
