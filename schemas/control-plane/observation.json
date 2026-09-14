@@ -1,0 +1,8 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/observation.json",
+  "title":"Observation",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{"kind":{"const":"Observation"},"metadata":{"$ref":"definitions.json#/$defs/metadata"},"spec":{"type":"object","required":["resourceId","bindingId","bindingRevision"],"properties":{"resourceId":{"$ref":"definitions.json#/$defs/uuid"},"bindingId":{"$ref":"definitions.json#/$defs/uuid"},"bindingRevision":{"type":"integer","minimum":1}},"unevaluatedProperties":false},"status":{"type":"object","required":["resourceId","bindingRevision","observedAt","sequence","stale","observedState","error"],"properties":{"resourceId":{"$ref":"definitions.json#/$defs/uuid"},"bindingRevision":{"type":"integer","minimum":1},"observedAt":{"$ref":"definitions.json#/$defs/timestamp"},"sequence":{"type":"integer","minimum":1},"stale":{"type":"boolean"},"observedState":{"type":"object","additionalProperties":true},"error":{"anyOf":[{"type":"null"},{"$ref":"definitions.json#/$defs/error"}]}},"unevaluatedProperties":false}}}],
+  "unevaluatedProperties":false,
+  "$comment":"Observation is read-only technical fact. Binding revision and sequence prevent an old sample from overwriting a new binding or sample."
+}

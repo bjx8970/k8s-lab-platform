@@ -1,0 +1,12 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/log-chunk.json",
+  "title":"LogChunk",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{
+    "kind":{"const":"LogChunk"},"metadata":{"$ref":"definitions.json#/$defs/metadata"},
+    "spec":{"type":"object","required":["sequence","chunk","capturedAt","redacted"],"properties":{"operationRef":{"$ref":"definitions.json#/$defs/objectRef"},"taskRef":{"$ref":"definitions.json#/$defs/objectRef"},"sequence":{"type":"integer","minimum":0},"chunk":{"type":"string","maxLength":65536},"capturedAt":{"$ref":"definitions.json#/$defs/timestamp"},"redacted":{"const":true}},"oneOf":[{"required":["operationRef"],"not":{"required":["taskRef"]}},{"required":["taskRef"],"not":{"required":["operationRef"]}}],"unevaluatedProperties":false},
+    "status":{"type":"object","required":["retentionUntil"],"properties":{"retentionUntil":{"type":["string","null"],"format":"date-time"},"purged":{"type":"boolean"}},"unevaluatedProperties":false}
+  }}],
+  "unevaluatedProperties":false,
+  "$comment":"Logs are ordered, bounded, sanitized chunks. Credentials, private keys, kubeconfig, authorization refs, and complete execution descriptions must not be stored in ordinary log output."
+}

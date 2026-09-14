@@ -1,0 +1,12 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/task-view.json",
+  "title":"TaskView",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{
+    "kind":{"const":"TaskView"},"metadata":{"$ref":"definitions.json#/$defs/metadataWithGeneration"},
+    "spec":{"type":"object","required":["request","environmentRef","intentGeneration","planRef","operationRefs"],"properties":{"request":{"$ref":"definitions.json#/$defs/arbitraryObject","description":"User request projection, not an execution credential."},"environmentRef":{"$ref":"definitions.json#/$defs/objectRef"},"intentGeneration":{"$ref":"definitions.json#/$defs/generation"},"planRef":{"anyOf":[{"type":"null"},{"$ref":"definitions.json#/$defs/objectRef"}]},"operationRefs":{"type":"array","uniqueItems":true,"items":{"$ref":"definitions.json#/$defs/uuid"}}},"unevaluatedProperties":false},
+    "status":{"type":"object","required":["observedGeneration","phase","progress","conditions"],"properties":{"observedGeneration":{"$ref":"definitions.json#/$defs/observedGeneration"},"phase":{"enum":["pending","running","succeeded","failed","cancelled","unknown"]},"progress":{"type":"integer","minimum":0,"maximum":100},"conditions":{"$ref":"definitions.json#/$defs/conditions"},"currentOperationRef":{"anyOf":[{"type":"null"},{"$ref":"definitions.json#/$defs/uuid"}]},"message":{"type":"string"},"error":{"anyOf":[{"type":"null"},{"$ref":"definitions.json#/$defs/error"}]},"startedAt":{"type":["string","null"],"format":"date-time"},"completedAt":{"type":["string","null"],"format":"date-time"}},"unevaluatedProperties":false}
+  }}],
+  "unevaluatedProperties":false,
+  "$comment":"TaskView is a user projection. It aggregates Environment/PlanRevision/Operation progress and contains no steps, lease, or provider execution fact; deleting it cannot affect execution."
+}

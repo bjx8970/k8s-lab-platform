@@ -72,6 +72,7 @@ EnvironmentController 更新 conditions 与 observedGeneration
 |---|---|
 | [整体架构与控制循环](architecture.md) | 理解五个角色、对象流、spec/status、watch/resync 和首版部署 |
 | [数据、API 与并发契约](contracts.md) | 实现对象表、状态转换、授权闸门、lease、去重、finalizer 和恢复 |
+| [P0 运行与持久化契约](p0-runtime-contracts.md) | 核对 repository owner、并发默认值、domain lock、远端作业和日志保留参数 |
 | [实验模板与扩展机制](templates.md) | 实现模板发布、Scheduler 输入、PlanBuilder、PlanRevision 和访问入口 |
 | [Python 模板示例](examples/python-development.json) | 阅读单 VM 纵向切片；示例不是当前可执行配置 |
 | [实施与交接计划](implementation-plan.md) | 按阶段推进并核对当前代码、迁移和验收 |
