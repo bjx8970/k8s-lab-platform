@@ -470,68 +470,6 @@ def _cluster_to_dict(cluster):
     }
 
 
-def _ensure_db_indexes():
-    if engine is None:
-        return
-    indexes = [
-        "CREATE INDEX IF NOT EXISTS ix_clusters_group_id ON clusters (group_id)",
-        "CREATE INDEX IF NOT EXISTS ix_clusters_created_by ON clusters (created_by)",
-        "CREATE INDEX IF NOT EXISTS ix_clusters_pve_server_id ON clusters (pve_server_id)",
-        "CREATE INDEX IF NOT EXISTS ix_vms_cluster_id ON vms (cluster_id)",
-        "CREATE INDEX IF NOT EXISTS ix_vms_node ON vms (node)",
-        "CREATE INDEX IF NOT EXISTS ix_group_members_user_id ON group_members (user_id)",
-        "CREATE INDEX IF NOT EXISTS ix_group_members_group_id ON group_members (group_id)",
-        "CREATE INDEX IF NOT EXISTS ix_group_members_class_id ON group_members (class_id)",
-    ]
-    with engine.connect() as conn:
-        for stmt in indexes:
-            try:
-                conn.execute(text(stmt))
-            except Exception:
-                pass
-        conn.commit()
-
-
-def _migrate_user_name():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE users ADD COLUMN name VARCHAR(128) DEFAULT ''"))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _migrate_pve_template_vmid():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE pve_servers ADD COLUMN template_vmid INTEGER DEFAULT 9000"))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _migrate_pve_ow_fields():
-    if engine is None:
-        return
-    cols = [
-        ("ow_host", "VARCHAR(128) DEFAULT ''"),
-        ("ow_port", "INTEGER DEFAULT 22"),
-        ("ow_username", "VARCHAR(64) DEFAULT ''"),
-        ("ow_password", "VARCHAR(256) DEFAULT ''"),
-    ]
-    for col_name, col_type in cols:
-        try:
-            with engine.connect() as conn:
-                conn.execute(text(f"ALTER TABLE pve_servers ADD COLUMN {col_name} {col_type}"))
-                conn.commit()
-        except Exception:
-            pass
-
-
 def _migrate_openwrt_to_pve_servers():
     if engine is None:
         return
@@ -550,39 +488,6 @@ def _migrate_openwrt_to_pve_servers():
             s.ow_port = int(ow_cfg.get("port", 22))
             s.ow_username = ow_cfg.get("username", "")
             s.ow_password = password
-
-
-def _migrate_group_member_student_number():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE group_members ADD COLUMN student_number INTEGER"))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _migrate_group_max_students():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE groups ADD COLUMN max_students INTEGER DEFAULT 0"))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _migrate_cluster_students():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE clusters ADD COLUMN students TEXT DEFAULT '{}'"))
-            conn.commit()
-    except Exception:
-        pass
 
 
 def load_clusters():

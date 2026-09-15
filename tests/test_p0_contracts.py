@@ -47,14 +47,33 @@ class P0ContractTests(unittest.TestCase):
         self.assertIn("external_key VARCHAR(255) NOT NULL", ddl)
         self.assertIn("uq_rf_binding_identity ON rf_bindings(domain_id,driver_id,external_key)", ddl)
 
-        # Operation: operationKey, attempt in schema -> DDL + table
-        self.assertIn("operationKey", operation_schema["allOf"][1]["properties"]["spec"]["required"])
-        self.assertIn("attempt", operation_schema["allOf"][1]["properties"]["spec"]["required"])
+        # Operation: operationKey, attempt are conditionally required (plan branch)
+        spec_props = operation_schema["allOf"][1]["properties"]["spec"]
+        self.assertIn("operationKey", spec_props["properties"])
+        self.assertIn("attempt", spec_props["properties"])
+        # oneOf: plan branch requires operationKey+attempt; direct branch forbids them
+        one_of = spec_props.get("oneOf", [])
+        self.assertGreaterEqual(len(one_of), 2)
+        plan_branch = [b for b in one_of if b.get("properties", {}).get("sourceType", {}).get("const") == "plan"]
+        direct_branch = [b for b in one_of if b.get("properties", {}).get("sourceType", {}).get("const") == "direct"]
+        self.assertEqual(1, len(plan_branch))
+        self.assertEqual(1, len(direct_branch))
+        self.assertIn("operationKey", plan_branch[0]["required"])
+        self.assertIn("attempt", plan_branch[0]["required"])
         self.assertIn("operation_key VARCHAR(255)", ddl)
         self.assertIn("attempt BIGINT", ddl)
         self.assertIn("UNIQUE(operation_key,attempt)", ddl.replace(" ", ""))
         self.assertIn("operation_key", str(tables.operations.columns))
         self.assertIn("attempt", str(tables.operations.columns))
+
+        # Operation: sourceType and correlationId in schema -> DDL + table
+        self.assertIn("sourceType", operation_schema["allOf"][1]["properties"]["spec"]["required"])
+        self.assertIn("correlationId", operation_schema["allOf"][1]["properties"]["spec"]["required"])
+        self.assertIn("source_type VARCHAR(16) NOT NULL", ddl)
+        self.assertIn("correlation_id VARCHAR(255) NOT NULL", ddl)
+        self.assertIn("ck_rf_operation_source_fields", ddl)
+        self.assertIn("source_type", str(tables.operations.columns))
+        self.assertIn("correlation_id", str(tables.operations.columns))
 
         # Allocation: value is string only
         allocation = json.loads((SCHEMA_DIR / "allocation.json").read_text(encoding="utf-8"))
@@ -63,19 +82,43 @@ class P0ContractTests(unittest.TestCase):
         self.assertIn("VARCHAR(255)", ddl)
 
         # Logs: exactly-one owner
-        self.assertIn("(operation_uid IS NOT NULL) <> (task_uid IS NOT NULL)", ddl)
-        self.assertIn("redacted BOOLEAN NOT NULL CHECK(redacted)", ddl)
+        self.assertIn("ck_cp_log_exactly_one_owner", ddl)
+        self.assertIn("ck_cp_log_redacted", ddl)
+        self.assertIn("ck_cp_log_byte_count", ddl)
+        self.assertIn("cp_log_owner_counters", ddl)
+        self.assertIn("ck_cp_log_owner_quota", ddl)
 
     def test_migration_and_sql_dependency_are_both_checksummed(self):
+        migration = discover_migrations()[0]
+        original = migration.checksum
+        # Verify both SQL files are in checksum_files
+        self.assertIn("v0001_legacy_baseline.sql", migration.module.checksum_files)
+        self.assertIn("v0001_control_plane_p0.sql", migration.module.checksum_files)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            py = target / migration.path.name
+            py.write_bytes(migration.path.read_bytes())
+            for sql_name in migration.module.checksum_files:
+                (target / sql_name).write_bytes(migration.path.with_name(sql_name).read_bytes())
+            # Drift in either SQL file changes the checksum
+            (target / "v0001_control_plane_p0.sql").write_bytes(
+                migration.path.with_name("v0001_control_plane_p0.sql").read_bytes() + b"\n-- drift")
+            self.assertNotEqual(discover_migrations(target)[0].checksum, original)
+
+    def test_migration_checksum_independent_of_runtime_orm(self):
+        """Changing modules/db.py must NOT affect migration checksum."""
         migration = discover_migrations()[0]
         original = migration.checksum
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)
             py = target / migration.path.name
-            sql_name = migration.module.checksum_files[0]
             py.write_bytes(migration.path.read_bytes())
-            (target / sql_name).write_bytes(migration.path.with_name(sql_name).read_bytes() + b"\n-- drift")
-            self.assertNotEqual(discover_migrations(target)[0].checksum, original)
+            for sql_name in migration.module.checksum_files:
+                (target / sql_name).write_bytes(migration.path.with_name(sql_name).read_bytes())
+            # Simulate a runtime ORM change — should not affect checksum
+            db_py = target / "db.py"
+            db_py.write_text("# simulated ORM change\n")
+            self.assertEqual(discover_migrations(target)[0].checksum, original)
 
     def test_non_postgresql_migration_is_rejected(self):
         engine = type("Engine", (), {"dialect": type("Dialect", (), {"name": "sqlite"})()})()
@@ -103,6 +146,8 @@ class P0ContractTests(unittest.TestCase):
             "uq_rf_operation_mutation", "claim_revision", "rf_domain_locks",
             "remote_job_id", "cp_outbox", "cp_schema_migrations",
             "uq_rf_binding_identity", "operation_key", "pending_external",
+            "ck_rf_operation_source_fields", "ck_cp_log_exactly_one_owner",
+            "cp_log_owner_counters", "ck_cp_log_owner_quota",
         ):
             with self.subTest(required=required):
                 if required == "pg_":

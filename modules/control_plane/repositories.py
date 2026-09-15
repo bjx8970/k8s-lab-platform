@@ -100,8 +100,23 @@ class OperationAdmissionRepository:
     def __init__(self,session): self.session=session
 
     def create(self, *, server_scope, request_id, action, normalized_input, target_snapshot, plugin_id, plugin_version,
-               driver_id, resource_uid=None, binding_uid=None, binding_revision=None, connection_uid=None,
-               connection_revision=None, secret_version_ref=None, is_mutating=True, operation_key=None, attempt=None, uid=None):
+               driver_id, resource_uid, binding_uid, binding_revision, connection_uid,
+               connection_revision, source_type, correlation_id, secret_version_ref=None,
+               is_mutating=True, operation_key=None, attempt=None, uid=None):
+        # --- source_type validation ---
+        if source_type not in ("plan", "direct"):
+            raise ValueError("source_type 必须为 plan 或 direct")
+        if source_type == "plan":
+            if operation_key is None or attempt is None:
+                raise ValueError("plan Operation 必须提供 operation_key 和 attempt")
+            if not isinstance(attempt, int) or attempt < 0:
+                raise ValueError("attempt 必须为非负整数")
+        else:
+            if operation_key is not None or attempt is not None:
+                raise ValueError("direct Operation 不得携带 operation_key/attempt")
+        if not correlation_id:
+            raise ValueError("correlation_id 不能为空")
+
         digest=canonical_digest({"action":action,"input":normalized_input,"target":target_snapshot})
         # --- transport dedup ---
         existing=self.session.execute(select(operations).where(and_(operations.c.server_scope==server_scope,
@@ -110,33 +125,36 @@ class OperationAdmissionRepository:
             if existing["request_digest"]!=digest: raise RequestConflict(request_id)
             return dict(existing)
         # --- plan-item dedup ---
-        if operation_key is not None and attempt is not None:
+        if source_type == "plan":
             plan_existing = self.session.execute(select(operations).where(and_(
                 operations.c.operation_key==operation_key, operations.c.attempt==attempt))).mappings().one_or_none()
-            if plan_existing: return dict(plan_existing)
+            if plan_existing:
+                if plan_existing["request_digest"] != digest:
+                    raise RequestConflict(f"operation_key={operation_key}/attempt={attempt}")
+                return dict(plan_existing)
         # --- target snapshot consistency ---
-        if resource_uid is not None:
-            if None in (binding_uid,binding_revision,connection_uid,connection_revision):
-                raise ValueError("资源 Operation 必须固定 binding/connection revision")
-            resource = self.session.execute(select(resources.c.registration_state).where(
-                resources.c.uid==resource_uid)).scalar_one_or_none()
-            if resource is None: raise ValueError("Resource 不存在")
-            binding = self.session.execute(select(bindings).where(and_(
-                bindings.c.uid==binding_uid, bindings.c.active==True, bindings.c.resource_uid==resource_uid,
-                bindings.c.revision==binding_revision))).mappings().one_or_none()
-            if binding is None: raise ValueError("Binding 不存在/不活跃/不属于该 Resource/版本不匹配")
-            conn = self.session.execute(select(connections).where(and_(
-                connections.c.uid==connection_uid, connections.c.active==True,
-                connections.c.revision==connection_revision))).mappings().one_or_none()
-            if conn is None: raise ValueError("Connection 不存在/不活跃/版本不匹配")
-            if binding["connection_uid"] != connection_uid:
-                raise ValueError("Binding 不属于指定 Connection")
-            if binding["domain_id"] != conn["domain_id"]:
-                raise ValueError("Binding domain 与 Connection domain 不一致")
+        if None in (binding_uid,binding_revision,connection_uid,connection_revision):
+            raise ValueError("Operation 必须固定 binding/connection revision")
+        resource = self.session.execute(select(resources.c.registration_state).where(
+            resources.c.uid==resource_uid)).scalar_one_or_none()
+        if resource is None: raise ValueError("Resource 不存在")
+        binding = self.session.execute(select(bindings).where(and_(
+            bindings.c.uid==binding_uid, bindings.c.active==True, bindings.c.resource_uid==resource_uid,
+            bindings.c.revision==binding_revision))).mappings().one_or_none()
+        if binding is None: raise ValueError("Binding 不存在/不活跃/不属于该 Resource/版本不匹配")
+        conn = self.session.execute(select(connections).where(and_(
+            connections.c.uid==connection_uid, connections.c.active==True,
+            connections.c.revision==connection_revision))).mappings().one_or_none()
+        if conn is None: raise ValueError("Connection 不存在/不活跃/版本不匹配")
+        if binding["connection_uid"] != connection_uid:
+            raise ValueError("Binding 不属于指定 Connection")
+        if binding["domain_id"] != conn["domain_id"]:
+            raise ValueError("Binding domain 与 Connection domain 不一致")
         uid=uid or uuid4()
         statement=pg_insert(operations).values(uid=uid,resource_uid=resource_uid,action=action,phase="pending",
             is_mutating=is_mutating,normalized_input=normalized_input,server_scope=server_scope,request_id=request_id,
-            request_digest=digest,operation_key=operation_key,attempt=attempt,target_snapshot=target_snapshot,
+            request_digest=digest,operation_key=operation_key,attempt=attempt,source_type=source_type,
+            correlation_id=correlation_id,target_snapshot=target_snapshot,
             binding_uid=binding_uid,binding_revision=binding_revision,connection_uid=connection_uid,
             connection_revision=connection_revision,secret_version_ref=secret_version_ref,
             plugin_id=plugin_id,plugin_version=plugin_version,driver_id=driver_id,claim_revision=0,exec_data={},
@@ -192,14 +210,25 @@ class OperationExecutorRepository:
 
     def update_resource_fact(self,uid,*,operation_uid,worker_id,claim_revision,existence_state,status):
         if existence_state not in EXISTENCE_STATES: raise ValueError("无效 existenceState")
-        active_claim=exists(select(operations.c.uid).where(and_(operations.c.uid==operation_uid,
-            operations.c.resource_uid==uid,operations.c.lease_owner==worker_id,
-            operations.c.claim_revision==claim_revision,operations.c.lease_until>utc_now())))
-        binding_fresh=exists(select(bindings.c.uid).where(and_(
-            bindings.c.resource_uid==uid, bindings.c.active==True,
-            bindings.c.uid==operations.c.binding_uid,
-            bindings.c.revision==operations.c.binding_revision)))
-        row=self.session.execute(update(resources).where(and_(resources.c.uid==uid,active_claim,binding_fresh))
+        # Single correlated EXISTS: claim validity AND binding freshness must come from the SAME operation row.
+        # This prevents O1(old binding) from passing because O2(new binding) satisfies the binding_fresh check.
+        claim_and_fencing = exists(
+            select(operations.c.uid)
+            .select_from(operations.join(bindings, and_(
+                bindings.c.uid == operations.c.binding_uid,
+                bindings.c.revision == operations.c.binding_revision,
+                bindings.c.resource_uid == operations.c.resource_uid,
+                bindings.c.active == True
+            )))
+            .where(and_(
+                operations.c.uid == operation_uid,
+                operations.c.resource_uid == uid,
+                operations.c.lease_owner == worker_id,
+                operations.c.claim_revision == claim_revision,
+                operations.c.lease_until > utc_now()
+            ))
+        )
+        row=self.session.execute(update(resources).where(and_(resources.c.uid==uid, claim_and_fencing))
             .values(existence_state=existence_state,status=status,
             resource_version=next_resource_version(),updated_at=utc_now()).returning(resources)).mappings().one_or_none()
         if row is None: raise LeaseLost(str(operation_uid))

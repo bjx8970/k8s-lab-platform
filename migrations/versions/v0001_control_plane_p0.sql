@@ -97,22 +97,28 @@ CREATE TABLE rf_observations (
  UNIQUE(resource_uid,sample_sequence));
 
 CREATE TABLE rf_operations (
- uid UUID PRIMARY KEY, resource_uid UUID REFERENCES rf_resources(uid), action VARCHAR(128) NOT NULL,
+ uid UUID PRIMARY KEY, resource_uid UUID NOT NULL REFERENCES rf_resources(uid), action VARCHAR(128) NOT NULL,
  phase VARCHAR(24) NOT NULL DEFAULT 'pending' CHECK(phase IN('pending','running','pending_external','succeeded','failed','cancelling','cancelled','unknown')),
  is_mutating BOOLEAN NOT NULL DEFAULT TRUE, normalized_input JSONB NOT NULL, server_scope VARCHAR(255) NOT NULL,
  request_id VARCHAR(255) NOT NULL, request_digest CHAR(64) NOT NULL, operation_key VARCHAR(255), attempt BIGINT,
- target_snapshot JSONB NOT NULL, binding_uid UUID REFERENCES rf_bindings(uid), binding_revision BIGINT,
- connection_uid UUID REFERENCES rf_connections(uid), connection_revision BIGINT, secret_version_ref TEXT,
+ source_type VARCHAR(16) NOT NULL CHECK(source_type IN('plan','direct')),
+ correlation_id VARCHAR(255) NOT NULL,
+ target_snapshot JSONB NOT NULL, binding_uid UUID NOT NULL REFERENCES rf_bindings(uid), binding_revision BIGINT NOT NULL,
+ connection_uid UUID NOT NULL REFERENCES rf_connections(uid), connection_revision BIGINT NOT NULL, secret_version_ref TEXT,
  plugin_id VARCHAR(128) NOT NULL, plugin_version VARCHAR(64) NOT NULL, driver_id VARCHAR(128) NOT NULL,
  lease_owner VARCHAR(255), lease_until TIMESTAMPTZ, claim_revision BIGINT NOT NULL DEFAULT 0 CHECK(claim_revision>=0),
  external_task_ref TEXT, remote_job_id VARCHAR(255), remote_status_path TEXT, remote_exit_path TEXT, remote_log_path TEXT,
  exec_data JSONB NOT NULL DEFAULT '{}', result JSONB, error JSONB, cancellation_requested BOOLEAN NOT NULL DEFAULT FALSE,
  resource_version BIGINT NOT NULL DEFAULT nextval('cp_resource_version_seq') UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
  started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
- UNIQUE(server_scope,request_id), UNIQUE(operation_key,attempt),
- CHECK((lease_owner IS NULL AND lease_until IS NULL) OR (lease_owner IS NOT NULL AND lease_until IS NOT NULL)),
- CHECK(resource_uid IS NULL OR (binding_uid IS NOT NULL AND binding_revision IS NOT NULL AND connection_uid IS NOT NULL AND connection_revision IS NOT NULL)),
- CHECK(phase <> 'pending_external' OR external_task_ref IS NOT NULL));
+ CONSTRAINT ck_rf_operation_source_type CHECK(source_type IN('plan','direct')),
+ CONSTRAINT ck_rf_operation_source_fields CHECK(
+   (source_type='plan' AND operation_key IS NOT NULL AND attempt IS NOT NULL)
+   OR (source_type='direct' AND operation_key IS NULL AND attempt IS NULL)),
+ CONSTRAINT ck_rf_operation_attempt_nonnegative CHECK(attempt IS NULL OR attempt>=0),
+ CONSTRAINT ck_rf_operation_lease_pair CHECK((lease_owner IS NULL AND lease_until IS NULL) OR (lease_owner IS NOT NULL AND lease_until IS NOT NULL)),
+ CONSTRAINT ck_rf_operation_pending_external_ref CHECK(phase <> 'pending_external' OR external_task_ref IS NOT NULL),
+ UNIQUE(server_scope,request_id), UNIQUE(operation_key,attempt));
 CREATE UNIQUE INDEX uq_rf_operation_mutation ON rf_operations(resource_uid)
  WHERE is_mutating AND phase IN('pending','running','pending_external','cancelling');
 CREATE INDEX ix_rf_operation_claim ON rf_operations(phase,lease_until,created_at);
@@ -149,20 +155,56 @@ CREATE TABLE cp_logs (
  id BIGSERIAL PRIMARY KEY, operation_uid UUID REFERENCES rf_operations(uid), task_uid UUID REFERENCES cp_task_views(uid),
  sequence BIGINT NOT NULL CHECK(sequence>=0), chunk TEXT NOT NULL, byte_count INTEGER NOT NULL CHECK(byte_count BETWEEN 0 AND 65536),
  redacted BOOLEAN NOT NULL CHECK(redacted), created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, expires_at TIMESTAMPTZ NOT NULL,
- CHECK((operation_uid IS NOT NULL) <> (task_uid IS NOT NULL)),
- CHECK(byte_count = octet_length(chunk)));
+ CONSTRAINT ck_cp_log_exactly_one_owner CHECK((operation_uid IS NOT NULL) <> (task_uid IS NOT NULL)),
+ CONSTRAINT ck_cp_log_byte_count CHECK(byte_count = octet_length(chunk)),
+ CONSTRAINT ck_cp_log_redacted CHECK(redacted));
+CREATE TABLE cp_log_owner_counters (
+ owner_kind VARCHAR(16) NOT NULL CHECK(owner_kind IN('operation','task')),
+ owner_uid UUID NOT NULL,
+ used_bytes BIGINT NOT NULL DEFAULT 0 CHECK(used_bytes >= 0),
+ max_bytes BIGINT NOT NULL DEFAULT 16777216 CHECK(max_bytes > 0),
+ updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ PRIMARY KEY(owner_kind, owner_uid),
+ CONSTRAINT ck_cp_log_owner_quota CHECK(used_bytes <= max_bytes));
 CREATE OR REPLACE FUNCTION cp_enforce_log_quota() RETURNS trigger AS $$
-DECLARE total BIGINT; max_bytes BIGINT := 16777216;
+DECLARE v_owner_kind VARCHAR(16); v_owner_uid UUID; v_updated BIGINT;
 BEGIN
- SELECT COALESCE(SUM(byte_count),0) INTO total FROM cp_logs
- WHERE (NEW.operation_uid IS NOT NULL AND operation_uid = NEW.operation_uid)
-    OR (NEW.task_uid IS NOT NULL AND task_uid = NEW.task_uid);
- IF total + NEW.byte_count > max_bytes THEN
-  RAISE EXCEPTION 'log quota exceeded: owner total would be % bytes (max %)', total + NEW.byte_count, max_bytes;
+ IF NEW.operation_uid IS NOT NULL THEN
+  v_owner_kind := 'operation'; v_owner_uid := NEW.operation_uid;
+ ELSE
+  v_owner_kind := 'task'; v_owner_uid := NEW.task_uid;
+ END IF;
+ INSERT INTO cp_log_owner_counters(owner_kind, owner_uid, used_bytes, max_bytes)
+  VALUES(v_owner_kind, v_owner_uid, 0, 16777216)
+  ON CONFLICT(owner_kind, owner_uid) DO NOTHING;
+ UPDATE cp_log_owner_counters
+  SET used_bytes = used_bytes + NEW.byte_count, updated_at = CURRENT_TIMESTAMP
+  WHERE owner_kind = v_owner_kind AND owner_uid = v_owner_uid
+    AND used_bytes <= max_bytes - NEW.byte_count
+  RETURNING used_bytes INTO v_updated;
+ IF v_updated IS NULL THEN
+  RAISE EXCEPTION USING
+   ERRCODE = '23514',
+   CONSTRAINT_NAME = 'ck_cp_log_owner_quota',
+   MESSAGE = 'log quota exceeded for ' || v_owner_kind || ' ' || v_owner_uid;
  END IF;
  RETURN NEW;
 END; $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_cp_log_quota BEFORE INSERT ON cp_logs FOR EACH ROW EXECUTE FUNCTION cp_enforce_log_quota();
+CREATE OR REPLACE FUNCTION cp_decrement_log_counter() RETURNS trigger AS $$
+DECLARE v_owner_kind VARCHAR(16); v_owner_uid UUID;
+BEGIN
+ IF OLD.operation_uid IS NOT NULL THEN
+  v_owner_kind := 'operation'; v_owner_uid := OLD.operation_uid;
+ ELSE
+  v_owner_kind := 'task'; v_owner_uid := OLD.task_uid;
+ END IF;
+ UPDATE cp_log_owner_counters
+  SET used_bytes = GREATEST(used_bytes - OLD.byte_count, 0), updated_at = CURRENT_TIMESTAMP
+  WHERE owner_kind = v_owner_kind AND owner_uid = v_owner_uid;
+ RETURN OLD;
+END; $$ LANGUAGE plpgsql;
+CREATE TRIGGER trg_cp_log_decrement AFTER DELETE ON cp_logs FOR EACH ROW EXECUTE FUNCTION cp_decrement_log_counter();
 CREATE UNIQUE INDEX uq_cp_log_operation ON cp_logs(operation_uid,sequence) WHERE operation_uid IS NOT NULL;
 CREATE UNIQUE INDEX uq_cp_log_task ON cp_logs(task_uid,sequence) WHERE task_uid IS NOT NULL;
 
