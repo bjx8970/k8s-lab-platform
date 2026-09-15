@@ -81,12 +81,52 @@ class P0ContractTests(unittest.TestCase):
         self.assertIn("$ref", val_schema)
         self.assertIn("VARCHAR(255)", ddl)
 
-        # Logs: exactly-one owner
+        # Logs: named constraints, owner counter, append-only
         self.assertIn("ck_cp_log_exactly_one_owner", ddl)
         self.assertIn("ck_cp_log_redacted", ddl)
         self.assertIn("ck_cp_log_byte_count", ddl)
         self.assertIn("cp_log_owner_counters", ddl)
         self.assertIn("ck_cp_log_owner_quota", ddl)
+        self.assertIn("cp_reject_log_update", ddl)
+        self.assertIn("trg_cp_log_append_only", ddl)
+        self.assertIn("ck_cp_log_append_only", ddl)
+
+        # Operation unique constraints are explicitly named for conflict classification
+        self.assertIn("uq_rf_operation_transport", ddl)
+        self.assertIn("uq_rf_operation_plan_item", ddl)
+
+    def test_domain_id_is_business_string_not_uuid(self):
+        definitions = json.loads((SCHEMA_DIR / "definitions.json").read_text(encoding="utf-8"))
+        domain = definitions["$defs"]["domainId"]
+        self.assertEqual("string", domain["type"])
+        self.assertNotIn("format", domain)
+        snapshot = definitions["$defs"]["targetSnapshot"]["properties"]["domainId"]
+        self.assertEqual("#/$defs/domainId", snapshot["$ref"])
+        for name in ("binding.json", "connection.json"):
+            schema = json.loads((SCHEMA_DIR / name).read_text(encoding="utf-8"))
+            props = schema["allOf"][1]["properties"]["spec"]["properties"]
+            self.assertEqual("definitions.json#/$defs/domainId", props["domainId"]["$ref"])
+
+    def test_secret_version_ref_is_versioned_and_not_null(self):
+        ddl = (ROOT / "migrations" / "versions" / "v0001_control_plane_p0.sql").read_text(encoding="utf-8")
+        connection_schema = json.loads((SCHEMA_DIR / "connection.json").read_text(encoding="utf-8"))
+        conn_props = connection_schema["allOf"][1]["properties"]["spec"]
+        self.assertIn("secretVersionRef", conn_props["required"])
+        self.assertNotIn("secretRef", conn_props["properties"])
+        self.assertIn("secret_version_ref TEXT NOT NULL", ddl)
+        self.assertIn("Connection 缺少 secret_version_ref", (ROOT / "modules" / "control_plane" / "repositories.py").read_text(encoding="utf-8"))
+
+    def test_repository_builds_canonical_snapshot(self):
+        source = (ROOT / "modules" / "control_plane" / "repositories.py").read_text(encoding="utf-8")
+        self.assertIn("def _resolve_target", source)
+        # Callers must not be able to pass free-form snapshot JSON.
+        self.assertNotIn("target_snapshot, plugin_id", source)
+        self.assertNotIn("secret_version_ref=None", source)
+        for field in ("resourceId","bindingId","bindingRevision","domainId","connectionId",
+                      "connectionRevision","secretVersionRef","pluginId","pluginVersion","driverId"):
+            self.assertIn(f'"{field}"', source)
+        self.assertIn("uq_rf_operation_transport", source)
+        self.assertIn("uq_rf_operation_plan_item", source)
 
     def test_migration_and_sql_dependency_are_both_checksummed(self):
         migration = discover_migrations()[0]

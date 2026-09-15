@@ -37,11 +37,14 @@ outbox = Table("cp_outbox", metadata,
 bindings = Table("rf_bindings", metadata,
  Column("uid",UUID(as_uuid=True),primary_key=True), Column("resource_uid",UUID(as_uuid=True)),
  Column("connection_uid",UUID(as_uuid=True)), Column("domain_id",String(255)), Column("driver_id",String(128)),
- Column("external_key",String(255)), Column("revision",BIGINT), Column("provisional",BOOLEAN),
- Column("active",BOOLEAN), Column("resource_version",BIGINT), Column("created_at",TIMESTAMP(timezone=True)))
+ Column("external_key",String(255)), Column("external_identity",JSONB), Column("locator",JSONB),
+ Column("external_identity_digest",String(64)), Column("revision",BIGINT), Column("provisional",BOOLEAN),
+ Column("existence_state",String(16)), Column("active",BOOLEAN), Column("resource_version",BIGINT),
+ Column("created_at",TIMESTAMP(timezone=True)), Column("closed_at",TIMESTAMP(timezone=True)))
 connections = Table("rf_connections", metadata,
  Column("uid",UUID(as_uuid=True),primary_key=True), Column("domain_id",String(255)), Column("connection_type",String(128)),
- Column("revision",BIGINT), Column("active",BOOLEAN), Column("resource_version",BIGINT))
+ Column("secret_version_ref",Text), Column("configuration",JSONB), Column("revision",BIGINT), Column("active",BOOLEAN),
+ Column("resource_version",BIGINT), Column("created_at",TIMESTAMP(timezone=True)), Column("updated_at",TIMESTAMP(timezone=True)))
 
 
 def next_resource_version():

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import and_, case, exists, func, insert, or_, select, update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from .tables import bindings, connections, environments, next_resource_version, operations, outbox, resources, utc_now
 
 FINALIZER = "lab.platform/environment-cleanup"
@@ -15,6 +15,10 @@ EXECUTOR_PHASES = {"running","pending_external","succeeded","failed","cancelling
 EXISTENCE_STATES = {"pending","present","absent","unknown"}
 
 _UNSET = object()  # sentinel: distinguish "not provided" from "explicitly clear"
+
+UQ_TRANSPORT = "uq_rf_operation_transport"
+UQ_PLAN_ITEM = "uq_rf_operation_plan_item"
+UQ_MUTATION = "uq_rf_operation_mutation"
 
 
 class ResourceVersionConflict(RuntimeError): pass
@@ -25,6 +29,11 @@ class LeaseLost(RuntimeError): pass
 def canonical_digest(value):
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",",":")).encode()
     return hashlib.sha256(raw).hexdigest()
+
+
+def _constraint_name(exc):
+    diag = getattr(getattr(exc, "orig", None), "diag", None)
+    return getattr(diag, "constraint_name", None) if diag else None
 
 
 def _event(session, kind, uid, version, event_type):
@@ -99,9 +108,64 @@ class OperationAdmissionRepository:
         "secret_version_ref","plugin_id","plugin_version","driver_id","claim_revision","resource_version"})
     def __init__(self,session): self.session=session
 
-    def create(self, *, server_scope, request_id, action, normalized_input, target_snapshot, plugin_id, plugin_version,
+    def _resolve_target(self, resource_uid, binding_uid, binding_revision, connection_uid, connection_revision,
+                        driver_id, plugin_id, plugin_version, *, require_active):
+        """Load and verify Resource/Binding/Connection, then build the canonical target snapshot."""
+        if None in (resource_uid,binding_uid,binding_revision,connection_uid,connection_revision):
+            raise ValueError("Operation 必须固定 binding/connection revision")
+        if not plugin_id: raise ValueError("plugin_id 不能为空")
+        if not plugin_version: raise ValueError("plugin_version 不能为空")
+        if not driver_id: raise ValueError("driver_id 不能为空")
+
+        resource=self.session.execute(select(resources).where(
+            resources.c.uid==resource_uid).with_for_update()).mappings().one_or_none()
+        if resource is None: raise ValueError("Resource 不存在")
+        if resource["driver_id"] != driver_id:
+            raise ValueError("driver_id 与 Resource 不一致")
+
+        binding_conditions = and_(bindings.c.uid==binding_uid, bindings.c.resource_uid==resource_uid,
+            bindings.c.revision==binding_revision)
+        if require_active:
+            binding_conditions = and_(binding_conditions, bindings.c.active==True)
+        binding=self.session.execute(select(bindings).where(binding_conditions)
+            .with_for_update()).mappings().one_or_none()
+        if binding is None: raise ValueError("Binding 不存在/不属于该 Resource/版本不匹配/不活跃")
+        if binding["driver_id"] != driver_id:
+            raise ValueError("driver_id 与 Binding 不一致")
+        if binding["connection_uid"] != connection_uid:
+            raise ValueError("Binding 不属于指定 Connection")
+
+        conn_conditions = and_(connections.c.uid==connection_uid, connections.c.revision==connection_revision)
+        if require_active:
+            conn_conditions = and_(conn_conditions, connections.c.active==True)
+        conn=self.session.execute(select(connections).where(conn_conditions)
+            .with_for_update()).mappings().one_or_none()
+        if conn is None: raise ValueError("Connection 不存在/版本不匹配/不活跃")
+        if binding["domain_id"] != conn["domain_id"]:
+            raise ValueError("Binding domain 与 Connection domain 不一致")
+        if not conn["secret_version_ref"]:
+            raise ValueError("Connection 缺少 secret_version_ref")
+        if not isinstance(binding["locator"], dict):
+            raise ValueError("Binding locator 必须为对象")
+
+        return {
+            "resourceId": str(resource_uid),
+            "bindingId": str(binding_uid),
+            "bindingRevision": int(binding_revision),
+            "domainId": binding["domain_id"],
+            "connectionId": str(connection_uid),
+            "connectionRevision": int(connection_revision),
+            "secretVersionRef": conn["secret_version_ref"],
+            "pluginId": plugin_id,
+            "pluginVersion": plugin_version,
+            "driverId": driver_id,
+            "externalIdentity": {"externalKey": binding["external_key"]},
+            "locator": binding["locator"],
+        }
+
+    def create(self, *, server_scope, request_id, action, normalized_input, plugin_id, plugin_version,
                driver_id, resource_uid, binding_uid, binding_revision, connection_uid,
-               connection_revision, source_type, correlation_id, secret_version_ref=None,
+               connection_revision, source_type, correlation_id,
                is_mutating=True, operation_key=None, attempt=None, uid=None):
         # --- source_type validation ---
         if source_type not in ("plan", "direct"):
@@ -117,55 +181,57 @@ class OperationAdmissionRepository:
         if not correlation_id:
             raise ValueError("correlation_id 不能为空")
 
-        digest=canonical_digest({"action":action,"input":normalized_input,"target":target_snapshot})
+        # Historical relationship is validated first so an already-created Operation can be replayed
+        # even after its Binding was retired; active checks happen only for a real new admission.
+        snapshot=self._resolve_target(resource_uid, binding_uid, binding_revision, connection_uid,
+            connection_revision, driver_id, plugin_id, plugin_version, require_active=False)
+        digest=canonical_digest({"action":action,"input":normalized_input,"target":snapshot})
+
+        def _replay_check(existing, where):
+            if existing["request_digest"]!=digest or existing["source_type"]!=source_type:
+                raise RequestConflict(where)
+            if source_type=="plan" and (existing["operation_key"]!=operation_key or existing["attempt"]!=attempt):
+                raise RequestConflict(where)
+            return dict(existing)
+
         # --- transport dedup ---
         existing=self.session.execute(select(operations).where(and_(operations.c.server_scope==server_scope,
             operations.c.request_id==request_id))).mappings().one_or_none()
-        if existing:
-            if existing["request_digest"]!=digest: raise RequestConflict(request_id)
-            return dict(existing)
+        if existing: return _replay_check(existing, request_id)
         # --- plan-item dedup ---
         if source_type == "plan":
             plan_existing = self.session.execute(select(operations).where(and_(
                 operations.c.operation_key==operation_key, operations.c.attempt==attempt))).mappings().one_or_none()
-            if plan_existing:
-                if plan_existing["request_digest"] != digest:
-                    raise RequestConflict(f"operation_key={operation_key}/attempt={attempt}")
-                return dict(plan_existing)
-        # --- target snapshot consistency ---
-        if None in (binding_uid,binding_revision,connection_uid,connection_revision):
-            raise ValueError("Operation 必须固定 binding/connection revision")
-        resource = self.session.execute(select(resources.c.registration_state).where(
-            resources.c.uid==resource_uid)).scalar_one_or_none()
-        if resource is None: raise ValueError("Resource 不存在")
-        binding = self.session.execute(select(bindings).where(and_(
-            bindings.c.uid==binding_uid, bindings.c.active==True, bindings.c.resource_uid==resource_uid,
-            bindings.c.revision==binding_revision))).mappings().one_or_none()
-        if binding is None: raise ValueError("Binding 不存在/不活跃/不属于该 Resource/版本不匹配")
-        conn = self.session.execute(select(connections).where(and_(
-            connections.c.uid==connection_uid, connections.c.active==True,
-            connections.c.revision==connection_revision))).mappings().one_or_none()
-        if conn is None: raise ValueError("Connection 不存在/不活跃/版本不匹配")
-        if binding["connection_uid"] != connection_uid:
-            raise ValueError("Binding 不属于指定 Connection")
-        if binding["domain_id"] != conn["domain_id"]:
-            raise ValueError("Binding domain 与 Connection domain 不一致")
+            if plan_existing: return _replay_check(plan_existing, f"operation_key={operation_key}/attempt={attempt}")
+
+        # --- new admission: require a currently usable target ---
+        snapshot=self._resolve_target(resource_uid, binding_uid, binding_revision, connection_uid,
+            connection_revision, driver_id, plugin_id, plugin_version, require_active=True)
+        digest=canonical_digest({"action":action,"input":normalized_input,"target":snapshot})
+
         uid=uid or uuid4()
-        statement=pg_insert(operations).values(uid=uid,resource_uid=resource_uid,action=action,phase="pending",
+        values=dict(uid=uid,resource_uid=resource_uid,action=action,phase="pending",
             is_mutating=is_mutating,normalized_input=normalized_input,server_scope=server_scope,request_id=request_id,
             request_digest=digest,operation_key=operation_key,attempt=attempt,source_type=source_type,
-            correlation_id=correlation_id,target_snapshot=target_snapshot,
+            correlation_id=correlation_id,target_snapshot=snapshot,
             binding_uid=binding_uid,binding_revision=binding_revision,connection_uid=connection_uid,
-            connection_revision=connection_revision,secret_version_ref=secret_version_ref,
+            connection_revision=connection_revision,secret_version_ref=snapshot["secretVersionRef"],
             plugin_id=plugin_id,plugin_version=plugin_version,driver_id=driver_id,claim_revision=0,exec_data={},
             cancellation_requested=False,resource_version=next_resource_version(),created_at=utc_now(),updated_at=utc_now())
-        statement=statement.on_conflict_do_nothing(index_elements=["server_scope","request_id"]).returning(operations)
-        row=self.session.execute(statement).mappings().one_or_none()
-        if row is None:
-            existing=self.session.execute(select(operations).where(and_(operations.c.server_scope==server_scope,
-                operations.c.request_id==request_id))).mappings().one()
-            if existing["request_digest"]!=digest: raise RequestConflict(request_id)
-            return dict(existing)
+        try:
+            with self.session.begin_nested():
+                row=self.session.execute(insert(operations).values(**values).returning(operations)).mappings().one()
+        except IntegrityError as exc:
+            name=_constraint_name(exc)
+            if name==UQ_TRANSPORT:
+                existing=self.session.execute(select(operations).where(and_(operations.c.server_scope==server_scope,
+                    operations.c.request_id==request_id))).mappings().one()
+                return _replay_check(existing, request_id)
+            if name==UQ_PLAN_ITEM:
+                existing=self.session.execute(select(operations).where(and_(
+                    operations.c.operation_key==operation_key, operations.c.attempt==attempt))).mappings().one()
+                return _replay_check(existing, f"operation_key={operation_key}/attempt={attempt}")
+            raise
         result=dict(row); _event(self.session,"Operation",uid,result["resource_version"],"ADDED"); return result
 
 
