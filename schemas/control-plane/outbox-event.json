@@ -1,0 +1,12 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/outbox-event.json",
+  "title":"OutboxEvent",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{
+    "kind":{"const":"OutboxEvent"},"metadata":{"$ref":"definitions.json#/$defs/metadata"},
+    "spec":{"type":"object","required":["objectKind","objectUid","resourceVersion","eventType","payload"],"properties":{"objectKind":{"$ref":"definitions.json#/$defs/nonEmptyString"},"objectUid":{"$ref":"definitions.json#/$defs/uuid"},"resourceVersion":{"$ref":"definitions.json#/$defs/resourceVersion"},"eventType":{"$ref":"definitions.json#/$defs/nonEmptyString"},"payload":{"type":"object","additionalProperties":true}},"unevaluatedProperties":false},
+    "status":{"type":"object","required":["createdAt","deliveryState"],"properties":{"createdAt":{"$ref":"definitions.json#/$defs/timestamp"},"deliveryState":{"enum":["pending","delivered","failed"]},"deliveredAt":{"type":["string","null"],"format":"date-time"},"attempts":{"type":"integer","minimum":0},"lastError":{"anyOf":[{"type":"null"},{"$ref":"definitions.json#/$defs/error"}]}},"unevaluatedProperties":false}
+  }}],
+  "unevaluatedProperties":false,
+  "$comment":"The outbox row is committed in the same transaction as its object change. Delivery/NOTIFY is only a wake-up hint; a missed event is repaired by LIST/full resync."
+}

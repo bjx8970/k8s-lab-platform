@@ -1,0 +1,8 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/resource.json",
+  "title":"Resource",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{"kind":{"const":"Resource"},"metadata":{"$ref":"definitions.json#/$defs/metadata"},"spec":{"type":"object","required":["type","driverId","attributes","labels"],"properties":{"type":{"$ref":"definitions.json#/$defs/nonEmptyString"},"driverId":{"$ref":"definitions.json#/$defs/nonEmptyString"},"attributes":{"$ref":"definitions.json#/$defs/arbitraryObject"},"labels":{"type":"object","additionalProperties":{"type":"string"}}},"unevaluatedProperties":false},"status":{"type":"object","required":["registrationState","existenceState","revision"],"properties":{"registrationState":{"enum":["active","closed"]},"existenceState":{"enum":["pending","present","absent","unknown"]},"revision":{"type":"integer","minimum":1},"observedAt":{"type":["string","null"],"format":"date-time"},"statusRevision":{"type":"integer","minimum":0},"stale":{"type":"boolean"},"observedState":{"type":"object","additionalProperties":true},"error":{"anyOf":[{"type":"null"},{"$ref":"definitions.json#/$defs/error"}]}},"unevaluatedProperties":false}}}],
+  "unevaluatedProperties":false,
+  "$comment":"Resource identity is metadata.uid/resource_id, never a bare provider VMID. registrationState and existenceState are independent; create starts at pending and failed records remain. This framework Resource has no business desiredState or generation."
+}

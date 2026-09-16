@@ -1,0 +1,12 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/condition-set.json",
+  "title":"ConditionSet",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{
+    "kind":{"const":"ConditionSet"},"metadata":{"$ref":"definitions.json#/$defs/metadata"},
+    "spec":{"type":"object","required":["objectRef"],"properties":{"objectRef":{"$ref":"definitions.json#/$defs/objectRef"}},"unevaluatedProperties":false},
+    "status":{"type":"object","required":["conditions"],"properties":{"conditions":{"$ref":"definitions.json#/$defs/conditions"},"updatedAt":{"$ref":"definitions.json#/$defs/timestamp"}},"unevaluatedProperties":false}
+  }}],
+  "unevaluatedProperties":false,
+  "$comment":"At most one current condition of each type is allowed; condition updates belong to the corresponding controller and are not ordinary client status writes."
+}

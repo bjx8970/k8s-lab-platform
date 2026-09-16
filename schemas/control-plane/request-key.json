@@ -1,0 +1,12 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/request-key.json",
+  "title":"RequestKey",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{
+    "kind":{"const":"RequestKey"},"metadata":{"$ref":"definitions.json#/$defs/metadata"},
+    "spec":{"type":"object","required":["serverScope","principalScope","entrypoint","requestId","requestDigest"],"properties":{"serverScope":{"$ref":"definitions.json#/$defs/nonEmptyString"},"principalScope":{"$ref":"definitions.json#/$defs/nonEmptyString"},"entrypoint":{"$ref":"definitions.json#/$defs/nonEmptyString"},"requestId":{"$ref":"definitions.json#/$defs/nonEmptyString"},"requestDigest":{"$ref":"definitions.json#/$defs/digest"},"requestSummary":{"type":"object","additionalProperties":true}},"unevaluatedProperties":false},
+    "status":{"type":"object","required":["state"],"properties":{"state":{"enum":["accepted","completed","conflict"]},"resultRef":{"anyOf":[{"type":"null"},{"$ref":"definitions.json#/$defs/objectRef"}]},"result":{"type":"object","additionalProperties":true}},"unevaluatedProperties":false}
+  }}],
+  "unevaluatedProperties":false,
+  "$comment":"The deduplication scope is server-generated principal/tenant scope plus entrypoint and requestId. Same normalized digest returns the saved result; a different digest is a conflict."
+}

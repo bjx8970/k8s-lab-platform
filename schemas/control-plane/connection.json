@@ -1,0 +1,8 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/connection.json",
+  "title":"Connection",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{"kind":{"const":"Connection"},"metadata":{"$ref":"definitions.json#/$defs/metadata"},"spec":{"type":"object","required":["domainId","endpoint","secretVersionRef","revision"],"properties":{"domainId":{"$ref":"definitions.json#/$defs/domainId"},"endpoint":{"type":"object","minProperties":1,"additionalProperties":true},"secretVersionRef":{"$ref":"definitions.json#/$defs/nonEmptyString","description":"Version-pinned credential reference; rotating credentials creates a new version rather than mutating this one."},"revision":{"type":"integer","minimum":1}},"unevaluatedProperties":false},"status":{"type":"object","required":["registrationState"],"properties":{"registrationState":{"enum":["active","closed"]},"conditions":{"$ref":"definitions.json#/$defs/conditions"},"lastError":{"anyOf":[{"type":"null"},{"$ref":"definitions.json#/$defs/error"}]}},"unevaluatedProperties":false}}}],
+  "unevaluatedProperties":false,
+  "$comment":"Connection is an access endpoint for a domain, not the domain identity. Closing it does not delete resources; accepted Operations retain a connection revision snapshot."
+}

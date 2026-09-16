@@ -1,0 +1,8 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "$id":"https://k8s-lab-platform.example/schemas/control-plane/allocation.json",
+  "title":"Allocation",
+  "allOf":[{"$ref":"definitions.json#/$defs/envelope"},{"type":"object","properties":{"kind":{"const":"Allocation"},"metadata":{"$ref":"definitions.json#/$defs/metadataWithGeneration"},"spec":{"type":"object","required":["scope","kind","value","environmentRef","placementRef"],"properties":{"scope":{"$ref":"definitions.json#/$defs/nonEmptyString"},"kind":{"enum":["vmid","ip","subnet","vlan","port"]},"value":{"$ref":"definitions.json#/$defs/nonEmptyString","description":"Normalised string value; numeric IDs are decimal-coded before storage."},"environmentRef":{"$ref":"definitions.json#/$defs/objectRef"},"placementRef":{"$ref":"definitions.json#/$defs/objectRef"}},"unevaluatedProperties":false},"status":{"type":"object","required":["observedGeneration","state"],"properties":{"observedGeneration":{"$ref":"definitions.json#/$defs/observedGeneration"},"state":{"enum":["reserved","assigned","quarantined","released"]},"reservedAt":{"$ref":"definitions.json#/$defs/timestamp"},"assignedAt":{"$ref":"definitions.json#/$defs/timestamp"},"releasedAt":{"$ref":"definitions.json#/$defs/timestamp"},"reason":{"type":"string"}},"unevaluatedProperties":false}}}],
+  "unevaluatedProperties":false,
+  "$comment":"Unknown external outcomes transition to quarantined; AllocationController must not automatically return them to the pool."
+}

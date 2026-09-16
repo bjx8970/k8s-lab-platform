@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean, Column, DateTime, ForeignKey, Integer, String, Text, text, UniqueConstraint,
     create_engine, func,
 )
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, selectinload
 
 from modules.credential_store import decrypt_secret, encrypt_secret
@@ -21,13 +22,16 @@ DB_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__
 
 
 def _load_db_config():
-    if os.path.exists(DB_CONFIG_PATH):
-        try:
-            with open(DB_CONFIG_PATH, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return None
+    if not os.path.exists(DB_CONFIG_PATH):
+        return None
+    try:
+        with open(DB_CONFIG_PATH, encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("数据库配置文件无效，服务拒绝启动") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError("数据库配置必须是 JSON 对象")
+    return config
 
 
 def _save_db_config(cfg):
@@ -37,22 +41,21 @@ def _save_db_config(cfg):
 
 def _create_engine():
     cfg = _load_db_config()
-    if not cfg or cfg.get("type") != "postgresql":
+    if not cfg:
         return None
+    if cfg.get("type") != "postgresql":
+        raise RuntimeError("生产控制面仅支持 PostgreSQL")
     missing = [k for k in ("host", "user", "password", "database") if not cfg.get(k)]
     if missing:
-        return None
-    url = (f"postgresql+pg8000://{cfg['user']}:{cfg['password']}@"
-           f"{cfg['host']}:{cfg.get('port', 5432)}/{cfg['database']}")
-    try:
-        return create_engine(
-            url, echo=False,
-            pool_size=10, max_overflow=20,
-            pool_pre_ping=True, pool_recycle=3600,
-            hide_parameters=True,
-        )
-    except Exception:
-        return None
+        raise RuntimeError(f"数据库配置缺少字段: {', '.join(missing)}")
+    url = URL.create(
+        "postgresql+pg8000", username=cfg["user"], password=cfg["password"],
+        host=cfg["host"], port=int(cfg.get("port", 5432)), database=cfg["database"],
+    )
+    return create_engine(
+        url, echo=False, pool_size=10, max_overflow=20,
+        pool_pre_ping=True, pool_recycle=3600, hide_parameters=True,
+    )
 
 
 _engine_lock = threading.Lock()
@@ -413,16 +416,10 @@ def init_db():
     with _engine_lock:
         if engine is None:
             raise RuntimeError("数据库未配置")
-    Base.metadata.create_all(engine)
-    _ensure_db_indexes()
-    _migrate_user_name()
-    _migrate_pve_template_vmid()
-    _migrate_pve_ow_fields()
-    migrate_pve_config()
-    _migrate_openwrt_to_pve_servers()
-    _migrate_group_max_students()
-    _migrate_cluster_students()
-    _migrate_group_member_student_number()
+    from migrations.runner import run_migrations
+
+    # Checksum drift and any DDL/backfill failure propagate and stop startup.
+    run_migrations(engine)
 
 
 @contextmanager
@@ -473,68 +470,6 @@ def _cluster_to_dict(cluster):
     }
 
 
-def _ensure_db_indexes():
-    if engine is None:
-        return
-    indexes = [
-        "CREATE INDEX IF NOT EXISTS ix_clusters_group_id ON clusters (group_id)",
-        "CREATE INDEX IF NOT EXISTS ix_clusters_created_by ON clusters (created_by)",
-        "CREATE INDEX IF NOT EXISTS ix_clusters_pve_server_id ON clusters (pve_server_id)",
-        "CREATE INDEX IF NOT EXISTS ix_vms_cluster_id ON vms (cluster_id)",
-        "CREATE INDEX IF NOT EXISTS ix_vms_node ON vms (node)",
-        "CREATE INDEX IF NOT EXISTS ix_group_members_user_id ON group_members (user_id)",
-        "CREATE INDEX IF NOT EXISTS ix_group_members_group_id ON group_members (group_id)",
-        "CREATE INDEX IF NOT EXISTS ix_group_members_class_id ON group_members (class_id)",
-    ]
-    with engine.connect() as conn:
-        for stmt in indexes:
-            try:
-                conn.execute(text(stmt))
-            except Exception:
-                pass
-        conn.commit()
-
-
-def _migrate_user_name():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE users ADD COLUMN name VARCHAR(128) DEFAULT ''"))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _migrate_pve_template_vmid():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE pve_servers ADD COLUMN template_vmid INTEGER DEFAULT 9000"))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _migrate_pve_ow_fields():
-    if engine is None:
-        return
-    cols = [
-        ("ow_host", "VARCHAR(128) DEFAULT ''"),
-        ("ow_port", "INTEGER DEFAULT 22"),
-        ("ow_username", "VARCHAR(64) DEFAULT ''"),
-        ("ow_password", "VARCHAR(256) DEFAULT ''"),
-    ]
-    for col_name, col_type in cols:
-        try:
-            with engine.connect() as conn:
-                conn.execute(text(f"ALTER TABLE pve_servers ADD COLUMN {col_name} {col_type}"))
-                conn.commit()
-        except Exception:
-            pass
-
-
 def _migrate_openwrt_to_pve_servers():
     if engine is None:
         return
@@ -553,39 +488,6 @@ def _migrate_openwrt_to_pve_servers():
             s.ow_port = int(ow_cfg.get("port", 22))
             s.ow_username = ow_cfg.get("username", "")
             s.ow_password = password
-
-
-def _migrate_group_member_student_number():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE group_members ADD COLUMN student_number INTEGER"))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _migrate_group_max_students():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE groups ADD COLUMN max_students INTEGER DEFAULT 0"))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _migrate_cluster_students():
-    if engine is None:
-        return
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE clusters ADD COLUMN students TEXT DEFAULT '{}'"))
-            conn.commit()
-    except Exception:
-        pass
 
 
 def load_clusters():
