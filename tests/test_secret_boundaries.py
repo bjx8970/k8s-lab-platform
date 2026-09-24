@@ -173,7 +173,12 @@ class SecretBoundaryTests(unittest.TestCase):
             "token_value": token,
         })
         db.set_config("openwrt", {"host": "ow.invalid", "password": password})
-        db.save_cluster("k8s_1", {"ssh_private_key": private_key, "vms": {}})
+        server_id = db.create_pve_server({
+            "name": "secret-test-pve", "host": "pve.invalid", "user": "root@pam",
+            "token_name": "lab-token", "token_value": token,
+        })
+        db.save_cluster("k8s_1", {"pve_server_id": server_id,
+                                  "ssh_private_key": private_key, "vms": {}})
         with db.session_scope() as session:
             self.assertNotIn(token, session.get(db.Config, "pve").value)
             self.assertNotIn(password, session.get(db.Config, "openwrt").value)

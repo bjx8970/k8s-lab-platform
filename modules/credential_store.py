@@ -8,6 +8,7 @@ plaintext from an older database.
 from __future__ import annotations
 
 import os
+import re
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -26,7 +27,7 @@ def _credential_error() -> CredentialError:
 
 def _fernet() -> Fernet:
     raw_key = os.environ.get("K8S_LAB_CREDENTIAL_KEY", "")
-    if not raw_key:
+    if not raw_key or not re.fullmatch(r"[A-Za-z0-9_-]{43}=", raw_key):
         raise _credential_error()
     try:
         return Fernet(raw_key.encode("ascii"))

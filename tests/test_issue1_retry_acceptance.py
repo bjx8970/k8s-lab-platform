@@ -131,11 +131,15 @@ class Issue1RetryAcceptanceTests(unittest.TestCase):
             "created_by": self.teacher, "max_students": 1,
         })
         db.add_group_member(self.group_id, self.student)
+        self.pve_server_id = db.create_pve_server({
+            "name": "retry-pve", "host": "pve.invalid", "user": "root@pam",
+            "token_name": "test", "token_value": "fake-token",
+        })
         self.cluster_name = "k8s_retry_acceptance"
         db.save_cluster(self.cluster_name, {
             "status": "running", "created_by": self.teacher,
             "group_id": self.group_id, "class_id": self.class_id,
-            "pve_server_id": 7, "pve_node": "retry-node", "ssh_port": 50001,
+            "pve_server_id": self.pve_server_id, "pve_node": "retry-node", "ssh_port": 50001,
             "ssh_private_key": FAKE_KEY, "password": FAKE_PASSWORD,
             "students": {"student1": {"password": FAKE_PASSWORD}},
             "vms": {"client": {"node": "retry-node", "vmid": 901,

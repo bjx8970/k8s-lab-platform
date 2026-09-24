@@ -76,6 +76,7 @@
 
 
 
+<script src="/static/js/vm_identity.js"></script>
 <script>
 const API = '/api/k8s';
 const USER_ROLE = '{{ current_user.role }}';
@@ -83,6 +84,7 @@ const USER_ROLE = '{{ current_user.role }}';
 
 let _forceDeleteName = '';
 var vmStatusCache = {};
+var currentClusters = {};
 var shutdownVoteId = null;
 var shutdownVoteTimer = null;
 
@@ -107,6 +109,7 @@ async function loadClusters() {
     const el = $('cluster-list');
     try {
         const clusters = await api('GET', '/clusters');
+        currentClusters = clusters;
         const entries = Object.entries(clusters);
         if (!entries.length) { el.innerHTML = '<p class="text-gray">暂无集群</p>'; return; }
         const isAdminTeacher = USER_ROLE === 'admin' || USER_ROLE === 'teacher';
@@ -126,16 +129,9 @@ async function loadClusters() {
             let vmsHtml = '';
             if (c.vms) {
                 for (const [vmName, vmInfo] of Object.entries(c.vms)) {
-                    const _key = vmInfo.node + '_' + vmInfo.vmid;
-                    const _cached = vmStatusCache[_key];
-                    const _extra = _cached === 'running' ? ' vm-running' : (_cached === 'stopped' ? ' vm-stopped' : '');
-                    vmsHtml += '<span class="vm-tag' + _extra + '" id="vm-' + esc(name) + '-' + vmInfo.vmid + '">' +
-                        esc(vmName) + ' (VMID ' + vmInfo.vmid + ')' +
-                        (isAdminTeacher || isStudent
-                            ? '<button class="vm-btn" onclick="vmAction(\'' + esc(vmInfo.node) + '\',' + vmInfo.vmid + ',\'start\')">▶</button>' +
-                              '<button class="vm-btn" onclick="vmAction(\'' + esc(vmInfo.node) + '\',' + vmInfo.vmid + ',\'stop\',\'' + esc(name) + '\')">⏹</button>'
-                            : '') +
-                    '</span>';
+                    vmsHtml += VMIdentity.renderTag(vmInfo,
+                        vmName + ' (VMID ' + vmInfo.vmid + ')', name, vmStatusCache,
+                        isAdminTeacher || isStudent, isStudent);
                 }
             }
             html += '<div class="cluster-item">' +
@@ -156,35 +152,7 @@ async function loadClusters() {
 }
 
 async function refreshVmStatuses(clusters) {
-    const vmList = [];
-    const vmMap = {};
-    for (const [name, c] of Object.entries(clusters)) {
-        if (!c.vms) continue;
-        for (const [, vm] of Object.entries(c.vms)) {
-            const el = document.getElementById('vm-' + name + '-' + vm.vmid);
-            if (!el) continue;
-            const key = vm.node + '_' + vm.vmid;
-            vmList.push({node: vm.node, vmid: vm.vmid});
-            vmMap[key] = el;
-        }
-    }
-    if (!vmList.length) return;
-    try {
-        const res = await fetch('/api/pve/vms/status/batch', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({vms: vmList}),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'batch failed');
-        for (const [key, st] of Object.entries(data.statuses || {})) {
-            const el = vmMap[key];
-            vmStatusCache[key] = st.status;
-            if (el) el.className = 'vm-tag' + (st.status === 'running' ? ' vm-running' : ' vm-stopped');
-        }
-    } catch {
-        for (const el of Object.values(vmMap)) el.className = 'vm-tag vm-stopped';
-    }
+    await VMIdentity.refreshStatuses(clusters, vmStatusCache, document, fetch);
 }
 
 async function createCluster() {
@@ -197,7 +165,7 @@ async function createCluster() {
         const pve_node = (opt && opt.dataset && opt.dataset.node) || '';
         if (!pve_node) throw new Error('请选择 PVE 服务器');
         const base = {
-            pve_server_id: parseInt($('form-server').value) || 0,
+            pve_server_id: parseInt($('form-server').value),
             pve_node,
             master_count: parseInt($('form-master-count').value) || 1,
             node_count: parseInt($('form-node-count').value) || 1,
@@ -245,9 +213,7 @@ function closeCreateForm() {
 
 async function clusterVmAction(name, action) {
     if (action === 'stop' && USER_ROLE === 'student') {
-        stateSocket.emit('vm_shutdown_cluster_initiate', {
-            cluster_name: name,
-        });
+        stateSocket.emit('vm_shutdown_cluster_initiate', VMIdentity.clusterPayload(currentClusters, name));
         return;
     }
     const msg = action === 'start' ? '启动' : '停止';
@@ -307,37 +273,34 @@ async function forceDeleteCluster() {
     }
 }
 
-async function _doVmAction(node, vmid, action) {
+async function _doVmAction(serverId, vmid, action) {
     try {
-        const res = await fetch('/api/pve/vms/' + encodeURIComponent(node) + '/' + vmid + '/' + action, {
+        const res = await fetch(VMIdentity.actionUrl(serverId, vmid, action), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: '{}',
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || '操作失败');
-        const _key = node + '_' + vmid;
+        const _key = VMIdentity.key(serverId, vmid);
         const _st = action === 'start' ? 'running' : 'stopped';
-        vmStatusCache[_key] = _st;
-        document.querySelectorAll('[id$="-' + vmid + '"]').forEach(function(_el) {
-            if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag' + (_st === 'running' ? ' vm-running' : ' vm-stopped');
-        });
+        VMIdentity.updateStatus({pve_server_id: serverId, vmid: vmid, status: _st}, vmStatusCache);
         showToast(action === 'start' ? '已启动' : '已停止', 'success');
     } catch (e) {
         showToast('操作失败: ' + e.message, 'error');
     }
 }
 
-async function vmAction(node, vmid, action, clusterName) {
+async function vmAction(serverId, vmid, action, clusterName) {
     if (action === 'stop' && clusterName) {
         stateSocket.emit('vm_shutdown_initiate', {
-            node: node,
+            pve_server_id: serverId,
             vmid: vmid,
             cluster_name: clusterName,
         });
         return;
     }
-    return _doVmAction(node, vmid, action);
+    return _doVmAction(serverId, vmid, action);
 }
 
 function showShutdownModal(title, msg, showActions, showPending, showWaiting, voteType, vmName, vmList) {
@@ -471,6 +434,10 @@ document.addEventListener('DOMContentLoaded', async function() {
         return;
     }
 
+    stateSocket.on('vm_status_update', function(data) {
+        try { VMIdentity.updateStatus(data, vmStatusCache); }
+        catch (e) { showToast('虚拟机身份不匹配：' + e.message, 'error'); }
+    });
     stateSocket.on('vm_shutdown_request', function(data) {
         shutdownVoteId = data.vote_id;
         var vtype = data.type || 'single';
@@ -529,11 +496,8 @@ document.addEventListener('DOMContentLoaded', async function() {
             loadClusters();
         } else {
             showToast('所有同学已同意，正在关机', 'success');
-            var _key = data.node + '_' + data.vmid;
-            vmStatusCache[_key] = 'stopped';
-            document.querySelectorAll('[id$="-' + data.vmid + '"]').forEach(function(_el) {
-                if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag vm-stopped';
-            });
+            try { VMIdentity.updateStatus({...data, status: 'stopped'}, vmStatusCache); }
+            catch (e) { showToast('虚拟机身份不匹配：' + e.message, 'error'); }
         }
     });
     stateSocket.on('vm_shutdown_cancelled', function(data) {
@@ -546,11 +510,8 @@ document.addEventListener('DOMContentLoaded', async function() {
             showToast('集群全部节点已停止', 'success');
             loadClusters();
         } else {
-            var _key = data.node + '_' + data.vmid;
-            vmStatusCache[_key] = 'stopped';
-            document.querySelectorAll('[id$="-' + data.vmid + '"]').forEach(function(_el) {
-                if (_el.classList.contains('vm-tag')) _el.className = 'vm-tag vm-stopped';
-            });
+            try { VMIdentity.updateStatus({...data, status: 'stopped'}, vmStatusCache); }
+            catch (e) { showToast('虚拟机身份不匹配：' + e.message, 'error'); }
             showToast('已停止', 'success');
         }
     });

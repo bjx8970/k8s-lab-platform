@@ -34,8 +34,8 @@ class JobRetryTests(unittest.TestCase):
         self.stack.enter_context(patch.dict(manager._task_retry_reservations, {}, clear=True))
         self.mock(manager, "_task_retry_pending", new=set())
         self.clusters["k8s_1"]["vms"] = {
-            "client-k8s1": {"node": "node-test", "vmid": 101},
-            "master1-k8s1": {"node": "node-test", "vmid": 102},
+            "client-k8s1": {"pve_server_id": 7, "node": "node-test", "vmid": 101},
+            "master1-k8s1": {"pve_server_id": 7, "node": "node-test", "vmid": 102},
         }
         self.clusters["k8s_1"].update(ssh_private_key=fixture.PRIVATE_KEY,
                                       password="test-password-do-not-expose")
@@ -175,7 +175,7 @@ class JobRetryTests(unittest.TestCase):
         self.run_successful_child(child, "deploy")
 
     def test_failed_creation_never_gets_a_retry_descriptor(self):
-        source = manager.create_cluster_async(*fixture.CREATE_ARGS, created_by=2, group_id=11, class_id=10)
+        source = manager.create_cluster_async(*fixture.CREATE_ARGS, pve_server_id=7, created_by=2, group_id=11, class_id=10)
         with patch.object(manager, "create_cluster", side_effect=RuntimeError("possible leftover resources")) as create:
             self.run_queued()
             self.assertEqual(manager.get_task_status(source)["status"], "error")
@@ -186,7 +186,7 @@ class JobRetryTests(unittest.TestCase):
         self.assertEqual(len(self.queued), 1)
 
     def test_create_then_deploy_failure_retries_only_deployment(self):
-        source = manager.create_cluster_async(*fixture.CREATE_ARGS, created_by=2, group_id=11, class_id=10)
+        source = manager.create_cluster_async(*fixture.CREATE_ARGS, pve_server_id=7, created_by=2, group_id=11, class_id=10)
         with patch.object(manager, "create_cluster", return_value=("k8s_1", copy.deepcopy(self.clusters["k8s_1"]))) as create:
             self.run_queued()
             self.assertEqual(manager._task_retry_descriptions[source].operation, "deploy")
@@ -200,7 +200,7 @@ class JobRetryTests(unittest.TestCase):
     def test_creation_string_group_id_matches_persisted_integer_for_deploy_retry(self):
         returned_cluster = copy.deepcopy(self.clusters["k8s_1"])
         returned_cluster["group_id"] = "11"
-        source = manager.create_cluster_async(*fixture.CREATE_ARGS, created_by=2,
+        source = manager.create_cluster_async(*fixture.CREATE_ARGS, pve_server_id=7, created_by=2,
                                                group_id="11", class_id="10")
         with patch.object(manager, "create_cluster", return_value=("k8s_1", returned_cluster)) as create:
             self.run_queued()
@@ -225,10 +225,10 @@ class JobRetryTests(unittest.TestCase):
         self.assertEqual(manager._retry_resource_fingerprint("k8s_1", cluster), expected)
         self.assertEqual(cluster["pve_server_id"], "7")
         self.assertEqual(cluster["vms"]["client-k8s1"]["vmid"], "101")
-        cluster.update(pve_server_id="0", created_by=None, group_id=None)
-        self.assertEqual(manager._retry_resource_fingerprint("k8s_1", cluster)[1:4], (0, None, None))
-        cluster["pve_server_id"] = None
-        self.assertEqual(manager._retry_resource_fingerprint("k8s_1", cluster)[1:4], (None, None, None))
+        for invalid_server in ("0", 0, None):
+            cluster["pve_server_id"] = invalid_server
+            with self.assertRaises(manager.TaskRetryConflict):
+                manager._retry_resource_fingerprint("k8s_1", cluster)
 
     def test_fingerprint_rejects_invalid_numeric_identity_values(self):
         invalid = (True, False, 1.0, 101.9, -1, "-1", "x", "", "01", "+1", " 1", "1 ", "1.0", "１")
@@ -245,7 +245,7 @@ class JobRetryTests(unittest.TestCase):
 
     def test_batch_children_follow_the_same_creation_boundary(self):
         first, second = manager.batch_create_clusters_async([11, 12], *fixture.CREATE_ARGS,
-                                                            created_by=2, class_id=10)
+                                                            pve_server_id=7, created_by=2, class_id=10)
         with patch.object(manager, "create_cluster", return_value=("k8s_1", copy.deepcopy(self.clusters["k8s_1"]))):
             self.run_queued(0)
         with patch.object(manager, "create_cluster", side_effect=RuntimeError("create failed")):
@@ -337,9 +337,8 @@ class JobRetryTests(unittest.TestCase):
                    lambda c: c.update(created_by=3),
                    lambda c: c.update(group_id=12),
                    lambda c: c.update(name="k8s_2"),
-                   lambda c: c["vms"]["client-k8s1"].update(node="other-node"),
                    lambda c: c["vms"]["client-k8s1"].update(vmid=999),
-                   lambda c: c["vms"].update(extra={"node": "node-test", "vmid": 103}),
+                   lambda c: c["vms"].update(extra={"pve_server_id": 7, "node": "node-test", "vmid": 103}),
                    lambda c: c["vms"].pop("master1-k8s1"),
                    lambda c: c.update(status="stopped")]
         for change in changes:
@@ -358,6 +357,12 @@ class JobRetryTests(unittest.TestCase):
         with self.assertRaises(manager.TaskRetryConflict):
             manager.retry_task(source, actor_id=1)
 
+    def test_node_migration_does_not_change_retry_identity(self):
+        cluster = copy.deepcopy(self.clusters["k8s_1"])
+        before = manager._retry_resource_fingerprint("k8s_1", cluster)
+        cluster["vms"]["client-k8s1"]["node"] = "migrated-node"
+        self.assertEqual(before, manager._retry_resource_fingerprint("k8s_1", cluster))
+
     def test_cluster_ownership_change_denies_teacher_before_fingerprint_conflict(self):
         source = self.fail_source()
         self.clusters["k8s_1"]["created_by"] = 3
@@ -369,9 +374,8 @@ class JobRetryTests(unittest.TestCase):
         changes = [lambda c: c.update(pve_server_id=8),
                    lambda c: c.update(created_by=3),
                    lambda c: c.update(group_id=12),
-                   lambda c: c["vms"]["client-k8s1"].update(node="other-node"),
                    lambda c: c["vms"]["client-k8s1"].update(vmid=999),
-                   lambda c: c["vms"].update(extra={"node": "node-test", "vmid": 103}),
+                   lambda c: c["vms"].update(extra={"pve_server_id": 7, "node": "node-test", "vmid": 103}),
                    lambda c: c["vms"].pop("master1-k8s1"),
                    lambda c: c.update(status="stopped")]
         for change in changes:
@@ -478,7 +482,7 @@ class JobRetryTests(unittest.TestCase):
         description = manager._task_retry_descriptions[child]
         self.assertEqual(set(dataclasses.asdict(description)), {"operation", "cluster_name", "resource_fingerprint"})
         self.assertEqual(description.resource_fingerprint,
-                         ("k8s_1", 7, 2, 11, (("client-k8s1", "node-test", 101), ("master1-k8s1", "node-test", 102))))
+                         ("k8s_1", 7, 2, 11, (("client-k8s1", 7, 101), ("master1-k8s1", 7, 102))))
         self.assert_no_secret(dataclasses.asdict(description))
         self.assertNotIn("test-password-do-not-expose", repr(description))
         public = [manager.get_task_status(source), manager.get_task_status(child),

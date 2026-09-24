@@ -39,9 +39,9 @@ class SocketSecurityTests(unittest.TestCase):
             "k8s_10": {"name": "k8s_10", "created_by": 2, "group_id": 10, "pve_server_id": 7,
                        "status": "running", "password": "FAKE-TEACHER",
                        "students": {"student1": {"password": "FAKE-STUDENT"}},
-                       "vms": {"client": {"node": "node", "vmid": 101, "role": "client"}}},
+                       "vms": {"client": {"node": "node", "pve_server_id": 7, "vmid": 101, "role": "client"}}},
             "k8s_20": {"name": "k8s_20", "created_by": 3, "group_id": 20, "pve_server_id": 8,
-                       "status": "running", "vms": {"client": {"node": "node", "vmid": 101, "role": "client"}}},
+                       "status": "running", "vms": {"client": {"node": "node", "pve_server_id": 8, "vmid": 101, "role": "client"}}},
         }
         self.stack.enter_context(patch("modules.db.session_scope", side_effect=AssertionError("DB access forbidden")))
         self.stack.enter_context(patch("modules.ssh_terminal.db_get_config", return_value=None))
@@ -97,7 +97,8 @@ class SocketSecurityTests(unittest.TestCase):
         user = self.users[owner]
         terminal = self.manager.create_session("k8s_10", {
             "user_id": owner, "username": user.username, "role": user.role,
-        }, "mock-host", 22, "mock-user", "mock-password")
+        }, "mock-host", 22, "mock-user", "mock-password", pve_server_id=7)
+        terminal.client_vm_identity = (7, 101)
         terminal.channel = MagicMock(closed=False)
         terminal.status = "connected"
         terminal.log_buffer.append("previous output\n")
@@ -114,12 +115,12 @@ class SocketSecurityTests(unittest.TestCase):
 
     def test_vm_identity_is_bound_to_authorized_cluster_and_provider(self):
         teacher, _ = self.socket(2, "/state")
-        for data in ({"cluster_name": "k8s_20", "node": "node", "vmid": 101},
-                     {"cluster_name": "k8s_10", "node": "node", "vmid": 999}):
+        for data in ({"cluster_name": "k8s_20", "pve_server_id": 7, "node": "node", "vmid": 101},
+                     {"cluster_name": "k8s_10", "pve_server_id": 7, "node": "node", "vmid": 999}):
             teacher.emit("vm_shutdown_initiate", data, namespace="/state")
             self.assertIn("vm_shutdown_error", self.names(teacher, "/state"))
             self.get_provider.assert_not_called()
-        teacher.emit("vm_shutdown_initiate", {"cluster_name": "k8s_10", "node": "node", "vmid": 101}, namespace="/state")
+        teacher.emit("vm_shutdown_initiate", {"cluster_name": "k8s_10", "pve_server_id": 7, "node": "node", "vmid": 101}, namespace="/state")
         self.assertIn("vm_shutdown_allowed", self.names(teacher, "/state"))
         self.get_provider.assert_called_once_with(7)
         self.provider.stop_vm.assert_called_once_with("node", 101)
@@ -128,10 +129,10 @@ class SocketSecurityTests(unittest.TestCase):
 
     def test_cluster_shutdown_uses_current_owner_and_provider(self):
         other_teacher, _ = self.socket(3, "/state")
-        other_teacher.emit("vm_shutdown_cluster_initiate", {"cluster_name": "k8s_10"}, namespace="/state")
+        other_teacher.emit("vm_shutdown_cluster_initiate", {"cluster_name": "k8s_10", "pve_server_id": 7}, namespace="/state")
         self.get_provider.assert_not_called()
         teacher, _ = self.socket(2, "/state")
-        teacher.emit("vm_shutdown_cluster_initiate", {"cluster_name": "k8s_10"}, namespace="/state")
+        teacher.emit("vm_shutdown_cluster_initiate", {"cluster_name": "k8s_10", "pve_server_id": 7}, namespace="/state")
         self.assertIn("vm_shutdown_allowed", self.names(teacher, "/state"))
         self.get_provider.assert_called_once_with(7)
         self.provider.stop_vm.assert_called_once_with("node", 101)
@@ -141,7 +142,7 @@ class SocketSecurityTests(unittest.TestCase):
     def start_vote(self):
         initiator, _ = self.socket(4, "/state")
         voter, _ = self.socket(5, "/state")
-        initiator.emit("vm_shutdown_initiate", {"cluster_name": "k8s_10", "node": "node", "vmid": 101}, namespace="/state")
+        initiator.emit("vm_shutdown_initiate", {"cluster_name": "k8s_10", "pve_server_id": 7, "node": "node", "vmid": 101}, namespace="/state")
         self.assertIn("vm_shutdown_pending", self.names(initiator, "/state"))
         vote_id = next(iter(m._vm_shutdown_votes))
         self.get_provider.assert_not_called()
@@ -165,7 +166,7 @@ class SocketSecurityTests(unittest.TestCase):
 
     def test_timer_rechecks_membership_and_clears_provider_qualified_key(self):
         _initiator, _voter, vote_id = self.start_vote()
-        self.assertIn(("vm", 7, "node", 101), m._vm_shutdown_pending_vms)
+        self.assertIn(("vm", 7, 101), m._vm_shutdown_pending_vms)
         self.groups[4] = []
         m._on_vote_timeout(vote_id)
         self.get_provider.assert_not_called()
@@ -178,6 +179,14 @@ class SocketSecurityTests(unittest.TestCase):
         m._on_vote_timeout(vote_id)
         self.get_provider.assert_not_called()
         self.assert_audit("vm_shutdown.execute", "denied")
+
+    def test_node_migration_preserves_vote_identity_and_uses_current_locator(self):
+        initiator, voter, vote_id = self.start_vote()
+        self.clusters["k8s_10"]["vms"]["client"]["node"] = "node-b"
+        voter.emit("vm_shutdown_vote", {"vote_id": vote_id, "agree": True}, namespace="/state")
+        self.provider.stop_vm.assert_called_once_with("node-b", 101)
+        self.assertEqual(m._vm_shutdown_pending_vms, {})
+        self.assertIn("vm_shutdown_proceed", self.names(initiator, "/state"))
 
     def test_timer_rechecks_vm_identity(self):
         _initiator, _voter, vote_id = self.start_vote()
@@ -302,6 +311,11 @@ class SocketSecurityTests(unittest.TestCase):
     def test_teacher_cluster_reassigned_loses_existing_channel(self):
         terminal, client, sid = self.terminal(owner=2)
         self.clusters["k8s_10"]["created_by"] = 3
+        self.assert_revoked(terminal, client, sid)
+
+    def test_cluster_provider_rebind_revokes_existing_channel(self):
+        terminal, client, sid = self.terminal()
+        self.clusters["k8s_10"]["pve_server_id"] = 8
         self.assert_revoked(terminal, client, sid)
 
     def test_observer_owner_teacher_changed_loses_output_and_replay(self):

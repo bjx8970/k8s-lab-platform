@@ -158,6 +158,7 @@ class SecurityContractTests(unittest.TestCase):
 
     def test_03_provider_write_permissions(self):
         clone_payload = {
+            "pve_server_id": 7,
             "node": "pve-1",
             "vmid": 100,
             "newid": 101,
@@ -206,9 +207,8 @@ class SecurityContractTests(unittest.TestCase):
 
     def test_04_vm_scope_and_multi_pve_delete(self):
         allowed_cluster = {
-            "name": "k8s_10",
-            "group_id": 10,
-            "pve_server_id": 7,
+            "name": "k8s_10", "group_id": 10, "pve_server_id": 7,
+            "vms": {"client": {"pve_server_id": 7, "vmid": 101, "node": "pve-node"}},
         }
         pve_client = MagicMock()
         pve_client.start_vm.return_value = {"ok": True}
@@ -226,7 +226,7 @@ class SecurityContractTests(unittest.TestCase):
             patch.object(app_module, "update_vm_status"),
         ):
             response = self.request_with_csrf(
-                student, "POST", "/api/pve/vms/pve-node/101/start"
+                student, "POST", "/api/pve/servers/7/vms/101/start?node=pve-node"
             )
         self.assertEqual(response.status_code, 200)
         group_ids.assert_called_with(4)
@@ -252,7 +252,7 @@ class SecurityContractTests(unittest.TestCase):
             ) as get_client,
         ):
             response = self.request_with_csrf(
-                student, "POST", "/api/pve/vms/pve-node/102/start"
+                student, "POST", "/api/pve/servers/8/vms/102/start?node=pve-node"
             )
         self.assertEqual(response.status_code, 403)
         get_client.assert_not_called()
@@ -265,14 +265,15 @@ class SecurityContractTests(unittest.TestCase):
             patch.object(
                 app_module,
                 "find_cluster_by_vm",
-                return_value={"name": "k8s_1", "pve_server_id": 7},
+                return_value={"name": "k8s_1", "pve_server_id": 7,
+                              "vms": {"client": {"pve_server_id": 7, "vmid": 103, "node": "pve-node"}}},
             ),
             patch.object(
                 app_module, "get_pve_client", return_value=delete_client
             ) as get_client,
         ):
             response = self.request_with_csrf(
-                admin, "DELETE", "/api/pve/vms/pve-node/103"
+                admin, "DELETE", "/api/pve/servers/7/vms/103?node=pve-node"
             )
         self.assertEqual(response.status_code, 200)
         get_client.assert_called_once_with(7)
@@ -284,7 +285,7 @@ class SecurityContractTests(unittest.TestCase):
             patch.object(app_module, "get_pve_client") as get_client,
         ):
             response = self.request_with_csrf(
-                admin, "DELETE", "/api/pve/vms/pve-node/404"
+                admin, "DELETE", "/api/pve/servers/7/vms/404?node=pve-node"
             )
         self.assertEqual(response.status_code, 404)
         get_client.assert_not_called()
