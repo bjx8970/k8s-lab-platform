@@ -1,6 +1,6 @@
 # PVE VM 完整身份迁移
 
-本次升级将 VM 永久身份从裸 `vmid` / `(node, vmid)` 改为 `(pve_server_id, vmid)`。`node` 仅表示当前定位信息，VM 在同一 PVE server 内迁移节点后身份不变。
+本次升级将旧 VM 定位从裸 `vmid` / `(node, vmid)` 改为 P1 **稳定过渡身份** `(pve_server_id, vmid)`。目标态业务身份是 `(domain_id, vmid)`；connection 只是访问端点。`node` 仅表示当前 locator，同一 VM 迁移节点后身份不变。
 
 ## 上线前
 
@@ -20,7 +20,7 @@
 
 ## 迁移行为
 
-PostgreSQL 启动迁移依次执行冻结的 `v0001` 和新增的 `v0002_pve_vm_identity`。`v0002` 在一个事务中完成回填、预检、删除 `vmid` 全局唯一约束、增加外键/正整数检查和 `(pve_server_id, vmid)` 复合唯一约束。任一预检或 DDL 失败都会回滚整个版本。
+PostgreSQL 启动迁移依次执行冻结的 `v0001` 和新增的 `v0002_pve_vm_identity`。`v0002` 在一个事务中完成回填、预检、删除 `vmid` 全局唯一约束、增加外键/正整数检查和 `(pve_server_id, vmid)` 复合唯一约束；`clusters(id,pve_server_id)` candidate key 与 `vms(cluster_id,pve_server_id)` 复合外键持续约束两侧平台身份一致。SQLite 重建使用等价的复合外键。任一预检或 DDL 失败都会回滚整个版本。
 
 开发或测试使用的旧 SQLite 表通过 `modules.db.upgrade_sqlite_vm_identity()` 事务化重建；失败时原表、索引和触发器保留。上线前先在数据库备份上演练，不要让旧版应用与新身份格式并行写入。
 
@@ -60,4 +60,6 @@ podman stop k8s-lab-issue2-pg
 
 ## 下一阶段映射
 
-未来 Resource Framework 中，`pve_server_id` 对应 domain/provider 边界，`vmid` 对应外部 key，`node` 对应可变 locator。本次不创建 `(domain_id, driver_id, external_key)` 双写，也不引入新旧执行器并行。
+P1 的 `pve_server_id` 是旧系统的 server/connection 作用域，**不是**最终 domain 身份。P3 中同一真实 PVE domain 可由多个 connection 访问，目标唯一键为 `(domain_id, driver_id, external_key)`，其中 PVE VM 的 `external_key = str(vmid)`、`driver_id = pve.qemu/v1`；`node` 仍是可变 locator。
+
+本 PR 增加只读的 `modules.pve_domain_mapping.plan_pve_vm_mapping()` 契约和迁移测试：必须显式提供每个旧 server 的 `domain_id` 与 `connection_id`，以及每条旧 VM 的目标 `resource_id` 和 Cluster 所属。多个 connection 可归属同一 domain；若同 domain/VMID 的记录指向不同资源或 Cluster，则报告歧义并停止，不能依靠 URL、host、node 或默认服务器猜测。映射计划只生成供 P3 迁移审阅的结果，不创建目标表记录、双写路径或新旧执行器并行。

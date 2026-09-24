@@ -1,7 +1,8 @@
 """Canonical PVE virtual-machine identity helpers.
 
-A VM is permanently identified by ``(pve_server_id, vmid)``.  The PVE node is
-only a mutable locator and must never be used to select a provider.
+P1 uses ``(pve_server_id, vmid)`` as a stable transitional identity. P3 uses
+``(domain_id, vmid)`` for business identity; connections are access endpoints.
+The PVE node is a mutable locator and never selects a provider.
 """
 
 from __future__ import annotations

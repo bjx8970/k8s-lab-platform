@@ -83,9 +83,14 @@ BEGIN
     END LOOP;
 END $migration$;
 
+ALTER TABLE clusters
+    ADD CONSTRAINT uq_clusters_id_pve_server_id UNIQUE (id, pve_server_id);
+
 ALTER TABLE vms
     ALTER COLUMN pve_server_id SET NOT NULL,
     ADD CONSTRAINT fk_vms_pve_server_id FOREIGN KEY (pve_server_id) REFERENCES pve_servers(id),
+    ADD CONSTRAINT fk_vms_cluster_pve_server FOREIGN KEY (cluster_id, pve_server_id)
+        REFERENCES clusters(id, pve_server_id),
     ADD CONSTRAINT ck_vms_pve_server_id_positive CHECK (pve_server_id > 0),
     ADD CONSTRAINT ck_vms_vmid_positive CHECK (vmid > 0),
     ADD CONSTRAINT uq_vms_pve_server_vmid UNIQUE (pve_server_id, vmid);

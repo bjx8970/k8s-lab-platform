@@ -56,11 +56,19 @@ def _index_columns(connection, name):
 
 def _complete(connection, columns, indexes, sql):
     normalized = re.sub(r'[\s"`\[\]]', '', sql).lower()
-    fks = {(r[3], r[2], r[4]) for r in connection.exec_driver_sql("PRAGMA foreign_key_list(vms)")}
+    foreign_keys = list(connection.exec_driver_sql("PRAGMA foreign_key_list(vms)"))
+    fks = {(r[3], r[2], r[4]) for r in foreign_keys}
+    groups = {}
+    for row in foreign_keys:
+        groups.setdefault(row[0], []).append((row[1], row[2], row[3], row[4]))
+    compound = any(sorted((part[2], part[3]) for part in parts) ==
+                   [("cluster_id", "id"), ("pve_server_id", "pve_server_id")]
+                   and all(part[1] == "clusters" for part in parts)
+                   for parts in groups.values())
     return (
         all(name in columns and columns[name][3] for name in ("cluster_id", "pve_server_id", "vmid", "node"))
         and all(f"check({name}>0)" in normalized for name in ("pve_server_id", "vmid"))
-        and {("cluster_id", "clusters", "id"), ("pve_server_id", "pve_servers", "id")} <= fks
+        and ("pve_server_id", "pve_servers", "id") in fks and compound
         and any(r[2] and not r[4] and _index_columns(connection, r[1]) == ["pve_server_id", "vmid"] for r in indexes)
         and not any(r[2] and _index_columns(connection, r[1]) == ["vmid"] for r in indexes)
     )
@@ -82,9 +90,12 @@ def _replacement_sql(connection, original, columns):
         # Columns must precede table-level constraints in SQLite's grammar.
         declarations.insert(0, "pve_server_id INTEGER NOT NULL")
     existing_fks = {(r[3], r[2], r[4]) for r in connection.exec_driver_sql("PRAGMA foreign_key_list(vms)")}
-    for field, target in (("cluster_id", "clusters"), ("pve_server_id", "pve_servers")):
-        if (field, target, "id") not in existing_fks:
-            declarations.append(f"FOREIGN KEY ({field}) REFERENCES {target}(id)")
+    if ("pve_server_id", "pve_servers", "id") not in existing_fks:
+        declarations.append("FOREIGN KEY (pve_server_id) REFERENCES pve_servers(id)")
+    declarations.append(
+        "CONSTRAINT fk_vms_cluster_pve_server FOREIGN KEY (cluster_id, pve_server_id) "
+        "REFERENCES clusters(id, pve_server_id)"
+    )
     # Duplicate equivalent checks/compound uniqueness in a partial schema are
     # harmless; keep their original names rather than discarding local schema.
     normalized = re.sub(r'[\s"`\[\]]', '', original).lower()
@@ -125,6 +136,10 @@ def upgrade_sqlite_vm_identity(target_engine):
             columns = {r[1]: r for r in connection.exec_driver_sql("PRAGMA table_info(vms)")}
             indexes = connection.exec_driver_sql("PRAGMA index_list(vms)").fetchall()
             audit = require_valid_vm_identity(connection)
+            connection.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_clusters_id_pve_server_id "
+                "ON clusters(id, pve_server_id)"
+            )
             if _complete(connection, columns, indexes, original):
                 connection.commit()
                 return

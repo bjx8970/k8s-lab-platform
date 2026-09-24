@@ -6,7 +6,8 @@ from datetime import datetime
 
 from flask_login import UserMixin
 from sqlalchemy import (
-    Boolean, CheckConstraint, Column, DateTime, ForeignKey, Integer, String, Text, text, UniqueConstraint,
+    Boolean, CheckConstraint, Column, DateTime, ForeignKey, ForeignKeyConstraint,
+    Integer, String, Text, text, UniqueConstraint,
     create_engine, func,
 )
 from sqlalchemy.engine import URL
@@ -95,7 +96,14 @@ class Cluster(Base):
     class_id = Column(Integer, ForeignKey("classes.id"), nullable=True, index=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
 
-    vms = relationship("Vm", back_populates="cluster", cascade="all, delete-orphan")
+    __table_args__ = (
+        UniqueConstraint("id", "pve_server_id", name="uq_clusters_id_pve_server_id"),
+    )
+
+    vms = relationship(
+        "Vm", back_populates="cluster", cascade="all, delete-orphan",
+        foreign_keys="Vm.cluster_id",
+    )
     group_ref = relationship("Group", back_populates="clusters")
 
 
@@ -115,9 +123,14 @@ class Vm(Base):
         CheckConstraint("pve_server_id > 0", name="ck_vms_pve_server_id_positive"),
         CheckConstraint("vmid > 0", name="ck_vms_vmid_positive"),
         UniqueConstraint("pve_server_id", "vmid", name="uq_vms_pve_server_vmid"),
+        ForeignKeyConstraint(
+            ["cluster_id", "pve_server_id"],
+            ["clusters.id", "clusters.pve_server_id"],
+            name="fk_vms_cluster_pve_server",
+        ),
     )
 
-    cluster = relationship("Cluster", back_populates="vms")
+    cluster = relationship("Cluster", back_populates="vms", foreign_keys=[cluster_id])
     pve_server = relationship("PVEServer")
 
 

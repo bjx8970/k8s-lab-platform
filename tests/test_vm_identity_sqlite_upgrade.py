@@ -40,6 +40,25 @@ class SqliteVmUpgradeTests(unittest.TestCase):
             self.assertIn('ix_vm_extra', {row[1] for row in connection.exec_driver_sql("PRAGMA index_list(vms)")})
             self.assertEqual([], connection.exec_driver_sql("PRAGMA foreign_key_check").all())
 
+    def test_composite_fk_blocks_vm_and_cluster_provider_drift(self):
+        upgrade_sqlite_vm_identity(self.engine)
+        with self.engine.connect() as connection:
+            self.assertEqual(1, connection.exec_driver_sql("PRAGMA foreign_keys").scalar())
+        for sql in (
+            "UPDATE vms SET pve_server_id=8 WHERE id=1",
+            "UPDATE clusters SET pve_server_id=8 WHERE id=1",
+            "INSERT INTO vms(id,cluster_id,pve_server_id,vm_name,vmid,node) "
+            "VALUES(3,1,8,'wrong',202,'node-a')",
+        ):
+            with self.subTest(sql=sql), self.assertRaises(Exception):
+                with self.engine.begin() as connection:
+                    connection.exec_driver_sql(sql)
+        with self.engine.connect() as connection:
+            self.assertEqual((1, 7), connection.exec_driver_sql(
+                "SELECT cluster_id,pve_server_id FROM vms WHERE id=1").one())
+            self.assertEqual(7, connection.exec_driver_sql(
+                "SELECT pve_server_id FROM clusters WHERE id=1").scalar())
+
     def test_injected_ddl_failure_rolls_back_old_table_and_data(self):
         original_connect = self.engine.connect
         def connect_with_failure():

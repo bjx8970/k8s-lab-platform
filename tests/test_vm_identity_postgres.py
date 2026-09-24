@@ -81,6 +81,23 @@ class VmIdentityPostgresTests(unittest.TestCase):
                     connection.exec_driver_sql(sql)
         self.upgrade()
 
+    def test_composite_fk_blocks_vm_and_cluster_provider_drift(self):
+        self.upgrade()
+        for sql in (
+            "UPDATE vms SET pve_server_id=8 WHERE id=1",
+            "UPDATE clusters SET pve_server_id=8 WHERE id=1",
+            "INSERT INTO vms(id,cluster_id,pve_server_id,vm_name,vmid,node) "
+            "VALUES(3,1,8,'wrong',202,'node-a')",
+        ):
+            with self.subTest(sql=sql), self.assertRaises(DBAPIError):
+                with self.engine.begin() as connection:
+                    connection.exec_driver_sql(sql)
+        with self.engine.connect() as connection:
+            self.assertEqual((1, 7), connection.exec_driver_sql(
+                "SELECT cluster_id,pve_server_id FROM vms WHERE id=1").one())
+            self.assertEqual(7, connection.exec_driver_sql(
+                "SELECT pve_server_id FROM clusters WHERE id=1").scalar())
+
     def test_invalid_cluster_server_fails_with_no_partial_ddl(self):
         with self.engine.begin() as connection:
             connection.exec_driver_sql("UPDATE clusters SET pve_server_id=0 WHERE id=1")
