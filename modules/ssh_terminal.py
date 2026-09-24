@@ -23,7 +23,8 @@ class TooManyConnectionsError(Exception):
 
 
 class SSHSession:
-    def __init__(self, session_id, cluster_name, owner, host, port, ssh_user, ssh_pass):
+    def __init__(self, session_id, cluster_name, owner, host, port, ssh_user, ssh_pass,
+                 pve_server_id=None):
         self.session_id = session_id
         self.cluster_name = cluster_name
         self.owner = owner  # {user_id, username, role}
@@ -31,6 +32,8 @@ class SSHSession:
         self.port = port
         self.ssh_user = ssh_user
         self.ssh_pass = ssh_pass
+        self.pve_server_id = pve_server_id
+        self.client_vm_identity = None
 
         self.status = "disconnected"
         self.takeover_active = False
@@ -289,6 +292,7 @@ class SSHSession:
         return {
             "session_id": self.session_id,
             "cluster_name": self.cluster_name,
+            "pve_server_id": self.pve_server_id,
             "owner": self.owner,
             "status": self.status,
             "takeover_active": self.takeover_active,
@@ -420,7 +424,8 @@ class SSHManager:
                 count += 1
         return count
 
-    def create_session(self, cluster_name, owner, host, port, ssh_user, ssh_pass):
+    def create_session(self, cluster_name, owner, host, port, ssh_user, ssh_pass,
+                       pve_server_id=None):
         user_id = owner["user_id"]
         role = owner["role"]
 
@@ -448,7 +453,8 @@ class SSHManager:
 
             session_id = str(uuid.uuid4())
             session = SSHSession(
-                session_id, cluster_name, owner, host, port, ssh_user, ssh_pass
+                session_id, cluster_name, owner, host, port, ssh_user, ssh_pass,
+                pve_server_id=pve_server_id,
             )
             session.set_binding_authorizer(self._authorize_binding)
             self._sessions[session_id] = session

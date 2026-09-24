@@ -99,6 +99,7 @@ class Issue1AcceptanceTests(unittest.TestCase):
             "K8S_LAB_CREDENTIAL_KEY": Fernet.generate_key().decode("ascii"),
         }))
         db.Base.metadata.create_all(engine)
+        self.pve_server_id = db.create_pve_server(self.provider_payload("identity-provider"))
         self.stack.enter_context(patch.object(self.manager, "_task_store", {}))
         self.stack.enter_context(patch.object(self.manager, "_task_cancel_events", {}))
         self.stack.enter_context(patch.object(
@@ -139,7 +140,7 @@ class Issue1AcceptanceTests(unittest.TestCase):
         db.save_cluster(self.cluster_name, {
             "status": "running", "created_by": self.teacher,
             "group_id": self.own_group, "class_id": self.own_class,
-            "vms": {},
+            "pve_server_id": self.pve_server_id, "vms": {},
         })
 
     def client_for(self, user_id):
@@ -179,7 +180,7 @@ class Issue1AcceptanceTests(unittest.TestCase):
             with self.subTest(path=path, actor=actor, associations=associations):
                 with patch.object(self.manager.scheduler, "enqueue") as enqueue:
                     response = self.mutation(self.client_for(actor), "POST", path, {
-                        "pve_node": "test-node", **associations,
+                        "pve_server_id": self.pve_server_id, "pve_node": "test-node", **associations,
                     })
                 self.assertEqual(response.status_code, expected)
                 enqueue.assert_not_called()
@@ -193,7 +194,7 @@ class Issue1AcceptanceTests(unittest.TestCase):
             with self.subTest(path=path):
                 with patch.object(self.manager.scheduler, "enqueue") as enqueue:
                     response = self.mutation(self.client_for(self.teacher), "POST", path, {
-                        "pve_node": "test-node", "class_id": self.own_class,
+                        "pve_server_id": self.pve_server_id, "pve_node": "test-node", "class_id": self.own_class,
                         **associations,
                     })
                 self.assertEqual(response.status_code, 202)
@@ -358,7 +359,7 @@ class Issue1AcceptanceTests(unittest.TestCase):
             with patch.object(self.web, "get_pve_client", return_value=provider):
                 response = self.mutation(
                     self.client_for(self.admin), "POST", "/api/pve/clone",
-                    {"node": "test-node", "vmid": 9000, "newid": 1001,
+                    {"pve_server_id": self.pve_server_id, "node": "test-node", "vmid": 9000, "newid": 1001,
                      "name": "test-clone", "config": {"password": command_marker}},
                 )
             self.assertEqual(response.status_code, 201)

@@ -124,7 +124,7 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         run_migrations(self.engine)
         with self.engine.connect() as connection:
             rows = connection.execute(text("SELECT revision, checksum FROM cp_schema_migrations")).all()
-            self.assertEqual(1, len(rows))
+            self.assertEqual(2, len(rows))
             self.assertRegex(rows[0].checksum, re.compile(r"^[0-9a-f]{64}$"))
 
     # ---- environment boundaries ----
@@ -887,7 +887,7 @@ class PreP0MigrationTests(unittest.TestCase):
             self.assertIsNotNone(c.execute(text("SELECT value FROM config WHERE key='openwrt'")).scalar())
             self.assertEqual(1, c.execute(text("SELECT COUNT(*) FROM users")).scalar())
             revisions = c.execute(text("SELECT revision FROM cp_schema_migrations")).scalars().all()
-            self.assertEqual(["0001_control_plane_p0"], revisions)
+            self.assertEqual(["0001_control_plane_p0", "0002_pve_vm_identity"], revisions)
 
         # Ciphertext stays decryptable with the frozen protocol.
         from cryptography.fernet import Fernet as F

@@ -9,6 +9,7 @@ from typing import Any
 from modules.audit import security_audit
 from modules.authz import Actions, AuthorizationDenied, require_allowed
 from modules.db import get_class, get_group, get_student_group_ids, get_user, load_cluster
+from modules.vm_identity import cluster_vm
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -148,6 +149,12 @@ def authorize_cluster_action(actor_id: Any, action: str, cluster_name: str):
     _audit(action, "success", actor_id=actor_id,
            resource_type="cluster", resource_id=cluster_name)
     return actor, cluster
+
+
+def authorize_vm_resource(actor, action, cluster, pve_server_id, vmid, *, student_group_ids=()):
+    """Authorize a freshly loaded actor against an exact, unambiguous VM."""
+    require_allowed(actor, action, cluster, student_group_ids=student_group_ids)
+    return cluster_vm(cluster, pve_server_id, vmid)
 
 
 def reload_actor(actor_id: Any):

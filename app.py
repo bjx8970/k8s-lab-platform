@@ -28,10 +28,18 @@ from modules.openwrt_client import OpenWrtClient, OpenWrtError
 from modules.k8s_manager import create_cluster, create_cluster_async, deploy_k8s_async, delete_cluster_async, batch_create_clusters_async, list_clusters, get_cluster, delete_cluster, get_task_status, list_tasks, cancel_task, K8sError, force_delete_cluster, set_on_task_update
 from modules.k8s_manager import retry_task, TaskNotFoundError, TaskRetryConflict
 from modules.pg_client import PGClient, PGError
-from modules.status_cache import get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor, update_vm_status
+from modules.status_cache import (
+    get_vm_status as get_cached_vm_status, start_monitor as start_status_monitor,
+    update_vm_status, remove_vm_status, set_on_vm_update,
+)
 from modules.authz import Actions, AuthorizationDenied, is_allowed
 from modules.audit import sanitize, security_audit, safe_error_message as _safe_error_message, sanitize_text as _sanitize_text
 from modules.security_service import validate_cluster_creation as _validate_cluster_creation, authorize_cluster_action as _authorize_cluster_action
+from modules.vm_identity import (
+    VmIdentityError, positive_id, vm_identity, vm_identity_key, validate_node,
+    cluster_vm_entries, cluster_vm, cluster_identity_fingerprint, client_vm_identity,
+)
+from modules.security_service import authorize_vm_resource
 
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from modules.ssh_terminal import SSHManager, SSHConnectionError, SessionExistsError, TooManyConnectionsError
@@ -113,13 +121,15 @@ def _get_online_students_in_group(group_id):
     return [m for m in members if is_user_online(m["id"])]
 
 def _do_shutdown_vm(node, vmid, pve_server_id):
-    client = get_pve_client(pve_server_id)
+    server_id, vmid = vm_identity(pve_server_id, vmid)
+    node = validate_node(node)
+    client = get_pve_client(server_id)
     result = client.stop_vm(node, vmid)
-    update_vm_status(node, vmid, "stopped")
+    update_vm_status(server_id, vmid, "stopped", node=node)
     return result
 
-def _get_vm_name(node, vmid):
-    cluster = find_cluster_by_vm(node, vmid)
+def _get_vm_name(node, vmid, pve_server_id):
+    cluster = find_cluster_by_vm(pve_server_id, vmid, node=node)
     if cluster:
         for vm_name, vm_info in (cluster.get("vms") or {}).items():
             if vm_info.get("node") == node and vm_info.get("vmid") == vmid:
@@ -130,11 +140,15 @@ def _do_shutdown_cluster_vms(cluster_name, pve_server_id, cluster=None):
     cluster = cluster if cluster is not None else get_cluster(cluster_name)
     if not cluster:
         raise K8sError(f"集群 {cluster_name} 不存在")
+    entries = cluster_vm_entries(cluster)
+    pve_server_id = positive_id(pve_server_id, "PVE 服务器编号")
+    if pve_server_id != positive_id(cluster.get("pve_server_id")):
+        raise VmIdentityError("集群平台身份不匹配")
     client = get_pve_client(pve_server_id)
     ok = 0
-    for vm_name, vm_info in (cluster.get("vms") or {}).items():
+    for vm_name, vm_info in entries:
         client.stop_vm(vm_info["node"], vm_info["vmid"])
-        update_vm_status(vm_info["node"], vm_info["vmid"], "stopped")
+        update_vm_status(pve_server_id, vm_info["vmid"], "stopped", node=vm_info["node"])
         ok += 1
     return ok
 
@@ -149,7 +163,7 @@ def _cleanup_stale_votes():
                 key = (
                     ("cluster", v.get("pve_server_id"), v.get("cluster_name"))
                     if v["type"] == "cluster"
-                    else ("vm", v.get("pve_server_id"), v.get("node"), v.get("vmid"))
+                    else ("vm", v.get("pve_server_id"), v.get("vmid"))
                 )
                 _vm_shutdown_pending_vms.pop(key, None)
 
@@ -342,6 +356,8 @@ def handle_csrf_error(error):
 
 @app.after_request
 def apply_cors_and_security_audit(response):
+    if (request.endpoint or "").startswith("pve_legacy_vm_"):
+        response.headers["Deprecation"] = "true"
     origin = request.headers.get("Origin")
     if origin and _request_origin_is_allowed(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
@@ -356,6 +372,10 @@ def apply_cors_and_security_audit(response):
         "path": request.path,
         "status": response.status_code,
     }
+    if request.path.startswith("/api/pve/"):
+        vm_resource = getattr(g, "_vm_audit", None)
+        if isinstance(vm_resource, dict):
+            metadata.update(vm_resource)
     if response.status_code in (401, 403):
         security_audit(
             "http.authorization",
@@ -1012,14 +1032,10 @@ def api_remove_group_member(gid, uid):
 
 
 def get_pve_client(server_id=None):
-    if server_id:
-        cfg = get_pve_server(server_id)
-        if not cfg:
-            raise PVEError(f"PVE 服务器 (ID={server_id}) 不存在")
-    else:
-        cfg = get_config("pve")
-        if not cfg:
-            raise PVEError(f"PVE 未配置，请先在页面中保存配置")
+    server_id = positive_id(server_id, "PVE 服务器编号")
+    cfg = get_pve_server(server_id)
+    if not cfg:
+        raise PVEError(f"PVE 服务器 (ID={server_id}) 不存在")
     missing = [k for k in ("host", "user", "token_name", "token_value") if not cfg.get(k)]
     if missing:
         raise PVEError(f"PVE 配置不完整: {', '.join(missing)}")
@@ -1078,11 +1094,27 @@ def _check_cluster_access(name, action=Actions.CLUSTER_READ):
     return bool(cluster and _is_allowed(action, cluster))
 
 
-def _check_vm_access(node, vmid, action=Actions.CLUSTER_READ):
-    cluster = find_cluster_by_vm(node, vmid)
-    if cluster:
-        g._vm_cluster = cluster
-    return bool(cluster and _is_allowed(action, cluster))
+def _check_vm_access(pve_server_id, vmid, node=None, action=Actions.CLUSTER_READ):
+    server_id, vmid = vm_identity(pve_server_id, vmid)
+    validate_node(node, required=False)
+    g._vm_audit = {"pve_server_id": server_id, "vmid": vmid, "node": node}
+    g._vm_cluster = g._vm_resource = None
+    actor = _fresh_user(current_user.id)
+    if not actor:
+        return False
+    cluster = find_cluster_by_vm(server_id, vmid)
+    if not cluster:
+        return False
+    try:
+        resource = authorize_vm_resource(
+            actor, action, cluster, server_id, vmid,
+            student_group_ids=_student_groups_for(actor),
+        )
+    except (AuthorizationDenied, VmIdentityError):
+        return False
+    g._vm_cluster, g._vm_resource = cluster, resource
+    g._vm_audit["node"] = resource["node"]
+    return True
 
 
 def _session_authz_resource(session):
@@ -1104,6 +1136,19 @@ def _webssh_binding_allowed(sid, session, role):
         return False
     cluster = get_cluster(session.cluster_name)
     if not cluster:
+        return False
+    try:
+        current_server_id = positive_id(cluster.get("pve_server_id"), "PVE 服务器编号")
+        bound_server_id = positive_id(session.pve_server_id, "PVE 服务器编号")
+    except (AttributeError, ValueError):
+        return False
+    if current_server_id != bound_server_id:
+        return False
+    try:
+        current_client_identity = client_vm_identity(cluster)
+    except ValueError:
+        return False
+    if current_client_identity != getattr(session, "client_vm_identity", None):
         return False
 
     owner_id = (session.owner or {}).get("user_id")
@@ -1148,6 +1193,8 @@ def api_error_handler(f):
             return f(*args, **kwargs)
         except AuthorizationDenied:
             return jsonify({"error": "权限不足"}), 403
+        except VmIdentityError as e:
+            return jsonify({"error": str(e)}), 400
         except ValueError:
             return jsonify({"error": "请求参数无效"}), 400
         except PVEError as e:
@@ -1375,42 +1422,91 @@ def pve_get_vms():
     return jsonify(client.get_vms(node))
 
 
-@app.route("/api/pve/vms/<node>/<int:vmid>/status", methods=["GET"])
+def _vm_request_data():
+    data = request.get_json(silent=True) if request.is_json else {}
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise VmIdentityError("VM 请求必须是 JSON 对象")
+    return data
+
+
+def _vm_identity_from_request(server_id, vmid, node=None):
+    server_id, vmid = vm_identity(server_id, vmid)
+    data = _vm_request_data()
+    for supplied in (request.args.get("pve_server_id"), data.get("pve_server_id")):
+        if supplied is not None and positive_id(supplied, "PVE 服务器编号") != server_id:
+            raise VmIdentityError("请求平台身份与 URL 不匹配")
+    node = validate_node(node or data.get("node"), required=False)
+    g._vm_audit = {"pve_server_id": server_id, "vmid": vmid, "node": node}
+    return server_id, vmid, node
+
+
+def _serve_vm(server_id, vmid, operation, node=None):
+    if operation not in {"status", "config", "start", "stop", "reboot", "delete"}:
+        raise VmIdentityError("无效的虚拟机操作")
+    server_id, vmid, node = _vm_identity_from_request(server_id, vmid, node)
+    actor = _fresh_user(current_user.id)
+    if operation == "delete" and (not actor or actor.role != "admin"):
+        return _forbidden()
+    action = Actions.CLUSTER_READ if operation in {"status", "config", "delete"} else Actions.CLUSTER_VM_ACTION
+    if not _check_vm_access(server_id, vmid, node=node, action=action):
+        return jsonify({"error": "虚拟机不存在或无权访问"}), 404 if operation == "delete" else 403
+    vm = g._vm_resource
+    node = vm["node"]
+    if operation == "status":
+        return jsonify(get_cached_vm_status(server_id, vmid, node=node))
+    client = get_pve_client(server_id)
+    if operation == "config":
+        return jsonify(sanitize(client.get_vm_config(node, vmid)))
+    data = _vm_request_data()
+    if operation == "delete":
+        result = client.release_vm(node, vmid, data.get("purge", True))
+        remove_vm_status(server_id, vmid)
+    else:
+        if operation == "start":
+            result = client.start_vm(node, vmid)
+        elif operation == "stop":
+            result = client.stop_vm(node, vmid, data.get("force", False))
+        else:
+            result = client.reboot_vm(node, vmid)
+        update_vm_status(server_id, vmid, "stopped" if operation == "stop" else "running", node=node)
+    return jsonify(sanitize(result))
+
+
+@app.route("/api/pve/servers/<int:server_id>/vms/<int:vmid>/status", methods=["GET"])
 @login_required
 @api_error_handler
-def pve_get_vm_status(node, vmid):
-    if not _check_vm_access(node, vmid):
-        return jsonify({"error": "无权访问该虚拟机"}), 403
-    return jsonify(get_cached_vm_status(node, vmid))
+def pve_server_vm_status(server_id, vmid):
+    return _serve_vm(server_id, vmid, "status", request.args.get("node"))
 
 
 @app.route("/api/pve/vms/status/batch", methods=["POST"])
 @login_required
 @api_error_handler
 def pve_get_vms_status_batch():
-    data = request.get_json() or {}
-    vms = data.get("vms", [])
+    vms = _vm_request_data().get("vms", [])
+    if not isinstance(vms, list) or len(vms) > 1000:
+        raise VmIdentityError("vms 必须是最多 1000 项的列表")
+    identities = []
+    for item in vms:
+        if not isinstance(item, dict):
+            raise VmIdentityError("批量状态项缺少完整 VM 身份")
+        server_id, vmid = vm_identity(item.get("pve_server_id"), item.get("vmid"))
+        identities.append((server_id, vmid, validate_node(item.get("node"), required=False)))
     results = {}
-    for vm in vms:
-        node = vm.get("node")
-        vmid = vm.get("vmid")
-        if not node or not vmid:
-            continue
-        if not _check_vm_access(node, vmid, Actions.CLUSTER_READ):
-            continue
-        key = f"{node}_{vmid}"
-        results[key] = get_cached_vm_status(node, vmid)
+    for server_id, vmid, node in identities:
+        if _check_vm_access(server_id, vmid, node=node):
+            key = vm_identity_key(server_id, vmid)
+            results[key] = get_cached_vm_status(server_id, vmid, node=g._vm_resource["node"])
     return jsonify({"statuses": results})
 
 
-@app.route("/api/pve/vms/<node>/<int:vmid>/config", methods=["GET"])
+@app.route("/api/pve/servers/<int:server_id>/vms/<int:vmid>/config", methods=["GET"])
 @login_required
 @api_error_handler
-def pve_get_vm_config(node, vmid):
-    if not _check_vm_access(node, vmid):
-        return jsonify({"error": "无权访问该虚拟机"}), 403
-    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
-    return jsonify(client.get_vm_config(node, vmid))
+def pve_server_vm_config(server_id, vmid):
+    return _serve_vm(server_id, vmid, "config", request.args.get("node"))
 
 
 @app.route("/api/pve/templates", methods=["GET"])
@@ -1427,7 +1523,8 @@ def pve_get_templates():
 @login_required
 @api_error_handler
 def pve_get_nextid():
-    client = get_pve_client()
+    server_id = positive_id(request.args.get("pve_server_id"), "PVE 服务器编号")
+    client = get_pve_client(server_id)
     return jsonify({"nextid": client.get_next_vmid()})
 
 
@@ -1444,9 +1541,10 @@ def pve_clone_vm():
     newid = data.get("newid")
     name = data.get("name")
     config = data.get("config")
+    server_id = positive_id(data.get("pve_server_id"), "PVE 服务器编号")
     if not all([node, vmid, newid, name]):
         return jsonify({"error": "Missing required fields: node, vmid, newid, name"}), 400
-    client = get_pve_client()
+    client = get_pve_client(server_id)
     result = client.clone_template(node, vmid, newid, name, config)
     return jsonify({"message": "VM cloned successfully", "newid": result}), 201
 
@@ -1462,51 +1560,85 @@ def pve_create_vm():
     node = data.get("node")
     template_vmid = data.get("template_vmid")
     config = data.get("config")
+    server_id = positive_id(data.get("pve_server_id"), "PVE 服务器编号")
     if not all([node, template_vmid]):
         return jsonify({"error": "Missing required fields: node, template_vmid"}), 400
-    client = get_pve_client()
+    client = get_pve_client(server_id)
     result = client.create_vm(node, template_vmid, config)
     return jsonify({"message": "VM created successfully", "newid": result}), 201
 
 
-@app.route("/api/pve/vms/<node>/<int:vmid>/start", methods=["POST"])
+@app.route("/api/pve/servers/<int:server_id>/vms/<int:vmid>/start", methods=["POST"])
 @login_required
 @api_error_handler
-def pve_start_vm(node, vmid):
-    if not _check_vm_access(node, vmid, Actions.CLUSTER_VM_ACTION):
-        return jsonify({"error": "无权访问该虚拟机"}), 403
-    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
-    result = client.start_vm(node, vmid)
-    update_vm_status(node, vmid, "running")
-    return jsonify(result)
+def pve_server_vm_start(server_id, vmid):
+    return _serve_vm(server_id, vmid, "start", request.args.get("node"))
 
 
-@app.route("/api/pve/vms/<node>/<int:vmid>/stop", methods=["POST"])
+@app.route("/api/pve/servers/<int:server_id>/vms/<int:vmid>/stop", methods=["POST"])
 @login_required
 @api_error_handler
-def pve_stop_vm(node, vmid):
-    if not _check_vm_access(node, vmid, Actions.CLUSTER_VM_ACTION):
-        return jsonify({"error": "无权访问该虚拟机"}), 403
-    data = request.get_json() or {}
-    force = data.get("force", False)
-    client = get_pve_client(getattr(g, "_vm_cluster", {}).get("pve_server_id"))
-    result = client.stop_vm(node, vmid, force)
-    update_vm_status(node, vmid, "stopped")
-    return jsonify(result)
+def pve_server_vm_stop(server_id, vmid):
+    return _serve_vm(server_id, vmid, "stop", request.args.get("node"))
 
 
+@app.route("/api/pve/servers/<int:server_id>/vms/<int:vmid>/reboot", methods=["POST"])
+@login_required
+@api_error_handler
+def pve_server_vm_reboot(server_id, vmid):
+    return _serve_vm(server_id, vmid, "reboot", request.args.get("node"))
+
+
+@app.route("/api/pve/servers/<int:server_id>/vms/<int:vmid>", methods=["DELETE"])
+@login_required
+@admin_required
+@api_error_handler
+def pve_server_vm_release(server_id, vmid):
+    return _serve_vm(server_id, vmid, "delete", request.args.get("node"))
+
+
+def _legacy_server_id():
+    raw = request.args.get("pve_server_id")
+    if raw is None:
+        raw = _vm_request_data().get("pve_server_id")
+    if raw is None:
+        raise VmIdentityError("旧 VM 路由已弃用，必须显式提供 pve_server_id")
+    return positive_id(raw, "PVE 服务器编号")
+
+
+@app.route("/api/pve/vm/<node>/<int:vmid>/status", methods=["GET"])
+@app.route("/api/pve/vms/<node>/<int:vmid>/status", methods=["GET"])
+@login_required
+@api_error_handler
+def pve_legacy_vm_status(node, vmid):
+    return _serve_vm(_legacy_server_id(), vmid, "status", node)
+
+
+@app.route("/api/pve/vm/<node>/<int:vmid>/config", methods=["GET"])
+@app.route("/api/pve/vms/<node>/<int:vmid>/config", methods=["GET"])
+@login_required
+@api_error_handler
+def pve_legacy_vm_config(node, vmid):
+    return _serve_vm(_legacy_server_id(), vmid, "config", node)
+
+
+@app.route("/api/pve/vm/<node>/<int:vmid>/<action>", methods=["POST"])
+@app.route("/api/pve/vms/<node>/<int:vmid>/<action>", methods=["POST"])
+@login_required
+@api_error_handler
+def pve_legacy_vm_action(node, vmid, action):
+    if action not in {"start", "stop", "reboot"}:
+        raise VmIdentityError("无效的虚拟机操作")
+    return _serve_vm(_legacy_server_id(), vmid, action, node)
+
+
+@app.route("/api/pve/vm/<node>/<int:vmid>", methods=["DELETE"])
 @app.route("/api/pve/vms/<node>/<int:vmid>", methods=["DELETE"])
 @login_required
 @admin_required
 @api_error_handler
-def pve_release_vm(node, vmid):
-    if not _check_vm_access(node, vmid, Actions.CLUSTER_READ):
-        return jsonify({"error": "虚拟机不存在"}), 404
-    data = request.get_json(silent=True) or {}
-    purge = data.get("purge", True)
-    client = get_pve_client(g._vm_cluster["pve_server_id"])
-    result = client.release_vm(node, vmid, purge)
-    return jsonify(result)
+def pve_legacy_vm_release(node, vmid):
+    return _serve_vm(_legacy_server_id(), vmid, "delete", node)
 
 
 @app.route("/openwrt")
@@ -1954,8 +2086,7 @@ def k8s_list_clusters():
             _ow_cfg = get_pve_server(_pve_sid) or {}
             entry["ssh_host"] = _ow_cfg.get("ow_host", "")
         else:
-            _ow_cfg = get_config("openwrt") or {}
-            entry["ssh_host"] = _ow_cfg.get("host", "")
+            entry["ssh_host"] = ""
         entry.pop("ssh_private_key", None)
         safe[name] = sanitize(entry)
     return jsonify(safe)
@@ -1976,7 +2107,7 @@ def k8s_create_cluster():
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
     password = data.get("password", "k8s.1234")
-    pve_server_id = int(data.get("pve_server_id", 0))
+    pve_server_id = positive_id(data.get("pve_server_id"), "PVE 服务器编号")
     _validate_cluster_creation(
         current_user,
         group_ids=[data["group_id"]] if data.get("group_id") is not None else [],
@@ -2041,7 +2172,6 @@ def k8s_create_cluster_async_route():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    pve_server_id = int(data.get("pve_server_id", 0))
     group_id = data.get("group_id")
     class_id = data.get("class_id")
     _validate_cluster_creation(
@@ -2049,6 +2179,7 @@ def k8s_create_cluster_async_route():
         group_ids=[group_id] if group_id is not None else [],
         class_id=class_id,
     )
+    pve_server_id = positive_id(data.get("pve_server_id"), "PVE 服务器编号")
 
     if master_count < 1:
         return jsonify({"error": "主节点数量至少为 1"}), 400
@@ -2087,9 +2218,9 @@ def k8s_batch_create_clusters():
     node_cores = int(data.get("node_cores", 4))
     node_memory = int(data.get("node_memory", 4096))
     pve_node = data.get("pve_node", "")
-    pve_server_id = int(data.get("pve_server_id", 0))
     class_id = data.get("class_id")
     _validate_cluster_creation(current_user, group_ids=group_ids, class_id=class_id)
+    pve_server_id = positive_id(data.get("pve_server_id"), "PVE 服务器编号")
 
     task_ids = batch_create_clusters_async(
         group_ids, master_count, node_count,
@@ -2169,25 +2300,25 @@ def k8s_deploy_cluster(name):
 @login_required
 @k8s_api_error_handler
 def k8s_cluster_vm_action_all(name):
-    if not _check_cluster_access(name, Actions.CLUSTER_VM_ACTION):
-        return _forbidden("无权操作该集群")
+    actor = _fresh_user(current_user.id)
     cluster = get_cluster(name)
-    if not cluster:
-        return jsonify({"error": "集群不存在"}), 404
+    if not cluster or not _is_allowed_for_user(actor, Actions.CLUSTER_VM_ACTION, cluster):
+        return _forbidden("无权操作该集群")
+    entries = cluster_vm_entries(cluster)
     data = request.get_json() or {}
     action = data.get("action", "")
     if action not in ("start", "stop"):
         return jsonify({"error": "无效操作"}), 400
     client = get_pve_client(server_id=cluster.get("pve_server_id"))
     results = []
-    for vm_name, vm_info in cluster.get("vms", {}).items():
+    for vm_name, vm_info in entries:
         try:
             if action == "start":
                 client.start_vm(vm_info["node"], vm_info["vmid"])
-                update_vm_status(vm_info["node"], vm_info["vmid"], "running")
+                update_vm_status(cluster.get("pve_server_id"), vm_info["vmid"], "running", node=vm_info["node"])
             else:
                 client.stop_vm(vm_info["node"], vm_info["vmid"])
-                update_vm_status(vm_info["node"], vm_info["vmid"], "stopped")
+                update_vm_status(cluster.get("pve_server_id"), vm_info["vmid"], "stopped", node=vm_info["node"])
             results.append({"vm": vm_name, "status": "ok"})
         except Exception as e:
             results.append({"vm": vm_name, "status": "failed", "error": "虚拟机操作失败"})
@@ -2197,6 +2328,7 @@ def k8s_cluster_vm_action_all(name):
 
 @app.route("/api/classes/<int:cid>/vm-action-all", methods=["POST"])
 @login_required
+@k8s_api_error_handler
 def api_class_vm_action_all(cid):
     cls = get_class(cid)
     if not cls:
@@ -2214,26 +2346,32 @@ def api_class_vm_action_all(cid):
     if not cluster_names:
         return jsonify({"error": "该课程下没有集群"}), 400
 
-    results = []
-    client_cache = {}
+    actor = _fresh_user(current_user.id)
+    assignments = []
     for name in cluster_names:
         cluster = get_cluster(name)
-        if not cluster or not cluster.get("vms"):
-            continue
-        server_id = cluster.get("pve_server_id")
+        if not cluster:
+            raise VmIdentityError("课程中的集群不存在")
+        if not _is_allowed_for_user(actor, Actions.CLUSTER_VM_ACTION, cluster):
+            return _forbidden("无权操作该集群")
+        entries = cluster_vm_entries(cluster)
+        assignments.append((name, positive_id(cluster["pve_server_id"]), entries))
+    results = []
+    client_cache = {}
+    for name, server_id, entries in assignments:
         if server_id not in client_cache:
-            client_cache[server_id] = get_pve_client(server_id=server_id)
+            client_cache[server_id] = get_pve_client(server_id)
         client = client_cache[server_id]
-        for vm_name, vm_info in cluster["vms"].items():
+        for vm_name, vm_info in entries:
             try:
                 if action == "start":
                     client.start_vm(vm_info["node"], vm_info["vmid"])
-                    update_vm_status(vm_info["node"], vm_info["vmid"], "running")
                 else:
                     client.stop_vm(vm_info["node"], vm_info["vmid"])
-                    update_vm_status(vm_info["node"], vm_info["vmid"], "stopped")
+                update_vm_status(server_id, vm_info["vmid"],
+                                 "running" if action == "start" else "stopped", node=vm_info["node"])
                 results.append({"cluster": name, "vm": vm_name, "status": "ok"})
-            except Exception as e:
+            except Exception:
                 results.append({"cluster": name, "vm": vm_name, "status": "failed", "error": "虚拟机操作失败"})
 
     ok = sum(1 for r in results if r["status"] == "ok")
@@ -2390,16 +2528,20 @@ def webssh_session_create(data, actor):
         raise AuthorizationDenied("无权访问该集群")
     if cluster.get("status") != "running":
         raise ValueError("集群未运行")
-    if not any(info.get("role") == "client" for info in (cluster.get("vms") or {}).values()):
-        raise ValueError("客户端虚拟机不存在")
+    client_identity = client_vm_identity(cluster)
+    requested_server_id = data.get("pve_server_id")
+    if requested_server_id is not None and positive_id(requested_server_id) != client_identity[0]:
+        raise AuthorizationDenied("客户端平台身份不匹配")
     sid = request.sid
     now = time.time()
     if now - _webssh_connect_times.get(sid, 0) < 10:
         raise ValueError("操作过于频繁")
     _webssh_connect_times[sid] = now
-    server_id = cluster.get("pve_server_id")
-    host_config = (get_pve_server(server_id) or {}) if server_id else (get_config("openwrt") or {})
-    host = host_config.get("ow_host" if server_id else "host", "")
+    server_id = client_identity[0]
+    host_config = get_pve_server(server_id)
+    if not host_config:
+        raise VmIdentityError("PVE 服务器不存在")
+    host = host_config.get("ow_host", "")
     username = "teacher"
     password = cluster.get("password", "")
     if actor.role == "student":
@@ -2412,8 +2554,10 @@ def webssh_session_create(data, actor):
         password = credential.get("password", "")
     owner = {"user_id": actor.id, "username": actor.username, "role": actor.role}
     terminal = ssh_manager.create_session(
-        cluster_name, owner, host, cluster.get("ssh_port", 22), username, password
+        cluster_name, owner, host, cluster.get("ssh_port", 22), username, password,
+        pve_server_id=server_id,
     )
+    terminal.client_vm_identity = client_identity
     try:
         if not ssh_manager.bind_ws(sid, terminal.session_id, role="owner"):
             raise AuthorizationDenied("权限已失效")
@@ -2623,15 +2767,11 @@ def state_heartbeat(*args):
 def _shutdown_key(vote):
     if vote["type"] == "cluster":
         return ("cluster", vote["pve_server_id"], vote["cluster_name"])
-    return ("vm", vote["pve_server_id"], vote["node"], vote["vmid"])
+    return ("vm", vote["pve_server_id"], vote["vmid"])
 
 
 def _shutdown_identity(cluster):
-    return (
-        cluster.get("pve_server_id"), cluster.get("created_by"), cluster.get("group_id"),
-        tuple(sorted((name, info.get("node"), info.get("vmid"))
-                     for name, info in (cluster.get("vms") or {}).items())),
-    )
+    return cluster_identity_fingerprint(cluster)
 
 
 def _authorize_shutdown(actor_id, cluster_name, node=None, vmid=None, expected=None):
@@ -2639,14 +2779,15 @@ def _authorize_shutdown(actor_id, cluster_name, node=None, vmid=None, expected=N
     cluster = get_cluster(cluster_name) if cluster_name else None
     if not actor or not cluster or not _is_allowed_for_user(actor, Actions.CLUSTER_VM_ACTION, cluster):
         raise AuthorizationDenied("无权操作该集群")
-    if node is not None or vmid is not None:
-        if not isinstance(node, str) or not node or type(vmid) is not int:
-            raise ValueError("虚拟机参数无效")
-        if not any(info.get("node") == node and info.get("vmid") == vmid
-                   for info in (cluster.get("vms") or {}).values()):
-            raise AuthorizationDenied("虚拟机不属于指定集群")
-    if expected is not None and _shutdown_identity(cluster) != expected:
-        raise AuthorizationDenied("资源身份已变化")
+    try:
+        identity = _shutdown_identity(cluster)
+        if expected is not None and identity != expected:
+            raise AuthorizationDenied("资源身份已变化")
+        validate_node(node, required=False)
+        if vmid is not None:
+            cluster_vm(cluster, cluster["pve_server_id"], vmid)
+    except VmIdentityError:
+        raise AuthorizationDenied("虚拟机身份无效或已变化") from None
     return actor, cluster
 
 
@@ -2657,7 +2798,7 @@ def _audit_shutdown(action, outcome, vote, actor=None, reason=None):
         resource_id=vote.get("cluster_name"), reason=reason,
         metadata={
             "actor_id": (vote.get("initiator") or {}).get("id"),
-            "provider_id": vote.get("pve_server_id"),
+            "pve_server_id": vote.get("pve_server_id"),
             "node": vote.get("node"), "vmid": vote.get("vmid"), "vote_id": vote.get("id"),
         },
     )
@@ -2695,8 +2836,15 @@ def _emit_vote_event(vote, event, data):
         return
     if not cluster:
         return
+    try:
+        if _shutdown_identity(cluster) != vote.get("identity"):
+            return
+    except ValueError:
+        return
     participants = set(vote.get("voters", {}))
     participants.add(vote.get("initiator", {}).get("id"))
+    data = {**data, "pve_server_id": vote["pve_server_id"],
+            "vmid": vote.get("vmid"), "node": vote.get("node"), "vm_key": vote.get("vm_key")}
     _emit_state(event, data, lambda user: (
         (user.role == "admin" or user.id in participants)
         and _is_allowed_for_user(user, Actions.CLUSTER_VM_ACTION, cluster)
@@ -2747,7 +2895,9 @@ def _execute_vote_action(vote_id, vote):
             ):
                 raise AuthorizationDenied("参与者权限已变化")
         if vote["type"] == "single":
-            _do_shutdown_vm(vote["node"], vote["vmid"], cluster.get("pve_server_id"))
+            current_vm = cluster_vm(cluster, vote["pve_server_id"], vote["vmid"])
+            vote["node"] = current_vm["node"]
+            _do_shutdown_vm(vote["node"], vote["vmid"], vote["pve_server_id"])
         else:
             _do_shutdown_cluster_vms(vote["cluster_name"], cluster.get("pve_server_id"), cluster=cluster)
         vote["executed"] = True
@@ -2755,7 +2905,9 @@ def _execute_vote_action(vote_id, vote):
         if vote_id:
             _emit_vote_event(vote, "vm_shutdown_proceed", {
                 "vote_id": vote_id, "type": vote["type"],
-                "cluster_name": vote["cluster_name"], "node": vote.get("node"), "vmid": vote.get("vmid"),
+                "cluster_name": vote["cluster_name"], "pve_server_id": vote.get("pve_server_id"),
+                "node": vote.get("node"), "vmid": vote.get("vmid"),
+                "vm_key": vm_identity_key(vote["pve_server_id"], vote["vmid"]) if vote.get("vmid") is not None else None,
             })
     except Exception as exc:
         _audit_shutdown(
@@ -2817,7 +2969,8 @@ def _create_vote(vote, online_students):
     payload = {
         "vote_id": vote_id, "type": vote["type"], "cluster_name": vote["cluster_name"],
         "initiator_name": vote["initiator"]["name"], "remaining": 30,
-        "node": vote.get("node"), "vmid": vote.get("vmid"),
+        "pve_server_id": vote.get("pve_server_id"), "node": vote.get("node"), "vmid": vote.get("vmid"),
+        "vm_key": vm_identity_key(vote["pve_server_id"], vote["vmid"]) if vote.get("vmid") is not None else None,
         "vm_name": vote.get("vm_name"), "vm_list": vote.get("vm_list", []),
     }
     _emit_vote_event(vote, "vm_shutdown_request", payload)
@@ -2836,13 +2989,21 @@ def _initiate_shutdown(data, actor, vote_type):
     cluster_name = data.get("cluster_name")
     node = data.get("node") if vote_type == "single" else None
     vmid = data.get("vmid") if vote_type == "single" else None
-    if vote_type == "single" and (node is None or vmid is None):
-        raise ValueError("虚拟机参数无效")
+    requested_server_id = positive_id(data.get("pve_server_id"), "PVE 服务器编号")
+    if vote_type == "single":
+        vmid = positive_id(vmid, "VMID")
     actor, cluster = _authorize_shutdown(actor.id, cluster_name, node, vmid)
+    server_id = positive_id(cluster.get("pve_server_id"), "PVE 服务器编号")
+    if requested_server_id != server_id:
+        raise AuthorizationDenied("虚拟机平台身份不匹配")
+    if vote_type == "single":
+        node = cluster_vm(cluster, server_id, vmid)["node"]
     vote = {
         "type": vote_type, "cluster_name": cluster_name,
-        "pve_server_id": cluster.get("pve_server_id"), "group_id": cluster.get("group_id"),
-        "node": node, "vmid": vmid, "identity": _shutdown_identity(cluster),
+        "pve_server_id": server_id, "group_id": cluster.get("group_id"),
+        "node": node, "vmid": vmid,
+        "vm_key": vm_identity_key(server_id, vmid) if vmid is not None else None,
+        "identity": _shutdown_identity(cluster),
         "initiator": {"id": actor.id, "role": actor.role,
                       "name": getattr(actor, "name", None) or actor.username},
         "voters": {},
@@ -2867,7 +3028,9 @@ def _initiate_shutdown(data, actor, vote_type):
     else:
         _execute_vote_action(None, vote)
         emit("vm_shutdown_allowed", {
-            "type": vote_type, "cluster_name": cluster_name, "node": node, "vmid": vmid,
+            "type": vote_type, "cluster_name": cluster_name, "pve_server_id": server_id,
+            "node": node, "vmid": vmid,
+            "vm_key": vm_identity_key(server_id, vmid) if vmid is not None else None,
             "vm_name": vote["vm_name"], "vm_list": vote["vm_list"],
         })
 
@@ -2896,6 +3059,8 @@ def handle_vm_shutdown_vote(data, actor):
     actor, _cluster = _authorize_shutdown(
         actor.id, vote["cluster_name"], vote.get("node"), vote.get("vmid"), expected=vote["identity"],
     )
+    if vote["type"] == "single":
+        vote["node"] = cluster_vm(_cluster, vote["pve_server_id"], vote["vmid"])["node"]
     if actor.role != "student" or actor.id not in vote["voters"]:
         raise AuthorizationDenied("无权投票")
     if type(data.get("agree")) is not bool:
@@ -2947,6 +3112,26 @@ def _emit_task_update(task_id, status, progress, message, created_by, queue):
 
 
 set_on_task_update(_emit_task_update)
+
+
+def _emit_vm_status_update(data):
+    try:
+        vm_identity(data.get("pve_server_id"), data.get("vmid"))
+        if data.get("key") != vm_identity_key(data["pve_server_id"], data["vmid"]):
+            return
+        cluster = find_cluster_by_vm(data["pve_server_id"], data["vmid"])
+        if not cluster:
+            return
+        current_vm = cluster_vm(cluster, data["pve_server_id"], data["vmid"])
+        if current_vm["node"] != data.get("node"):
+            return
+        _emit_state("vm_status_update", sanitize(data),
+                    lambda user: _is_allowed_for_user(user, Actions.CLUSTER_READ, cluster))
+    except Exception:
+        return
+
+
+set_on_vm_update(_emit_vm_status_update)
 ssh_manager.set_on_session_terminated(lambda cluster_name, user_id: _emit_session_update(cluster_name, user_id, "terminated"))
 ssh_manager.set_on_owner_disconnect(lambda cluster_name, user_id: _emit_session_update(cluster_name, user_id, "disconnected"))
 

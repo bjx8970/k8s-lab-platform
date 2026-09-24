@@ -28,6 +28,7 @@ from modules.security_service import (
     validate_cluster_creation,
 )
 from modules.task_queue import scheduler, Task
+from modules.vm_identity import positive_id, validate_node, cluster_vm_entries
 
 
 class K8sError(Exception):
@@ -329,25 +330,22 @@ def _retry_identity_id(value, *, optional=False, allow_zero=False):
 
 
 def _retry_resource_fingerprint(name, cluster):
-    """Copy only stable resource identities, never credentials or settings."""
+    """Copy stable provider-qualified VM identities, never credentials/settings."""
     if not isinstance(name, str) or not name or not isinstance(cluster, dict):
         raise TaskRetryConflict()
     if cluster.get("name", name) != name:
         raise TaskRetryConflict()
+    provider_id = _retry_identity_id(cluster.get("pve_server_id"))
     values = (
-        _retry_identity_id(cluster.get("pve_server_id"), optional=True, allow_zero=True),
+        provider_id,
         _retry_identity_id(cluster.get("created_by"), optional=True),
         _retry_identity_id(cluster.get("group_id"), optional=True),
     )
-    vms = cluster.get("vms")
-    if not isinstance(vms, dict):
-        raise TaskRetryConflict()
-    identities = []
-    for vm_name, vm in vms.items():
-        if (not isinstance(vm_name, str) or not vm_name or not isinstance(vm, dict)
-                or not isinstance(vm.get("node"), str) or not vm["node"]):
-            raise TaskRetryConflict()
-        identities.append((vm_name, vm["node"], _retry_identity_id(vm.get("vmid"))))
+    try:
+        entries = cluster_vm_entries(cluster)
+    except ValueError:
+        raise TaskRetryConflict() from None
+    identities = [(vm_name, vm["pve_server_id"], vm["vmid"]) for vm_name, vm in entries]
     return (name, *values, tuple(sorted(identities)))
 
 
@@ -522,12 +520,13 @@ def retry_task(task_id, actor_id=None):
 
 
 def _openwrt_lock(server_id=None):
-    if server_id:
-        cfg = get_pve_server(server_id)
-        host = cfg.get("ow_host", "_default_") if cfg else "_default_"
-    else:
-        cfg = get_config("openwrt")
-        host = cfg.get("host", "_default_") if cfg else "_default_"
+    server_id = positive_id(server_id, "PVE 服务器编号")
+    cfg = get_pve_server(server_id)
+    if not cfg:
+        raise K8sError("PVE 服务器不存在")
+    host = cfg.get("ow_host")
+    if not host:
+        raise K8sError("PVE 服务器缺少 OpenWrt 配置")
     with _openwrt_locks_lock:
         if host not in _openwrt_locks:
             _openwrt_locks[host] = threading.Lock()
@@ -727,43 +726,24 @@ def _wait_for_vms_ssh(ssh, vm_ips, timeout=120, log_callback=None):
 
 
 def _openwrt_client(server_id=None):
-    if server_id:
-        cfg = get_pve_server(server_id)
-        if not cfg:
-            raise K8sError(f"PVE 服务器 (ID={server_id}) 不存在")
-        ow_host = cfg.get("ow_host", "")
-        ow_username = cfg.get("ow_username", "")
-        ow_password = cfg.get("ow_password", "")
-    else:
-        cfg = get_config("openwrt")
-        if not cfg:
-            raise K8sError(f"OpenWrt 未配置，请先在页面中保存配置")
-        ow_host = cfg.get("host", "")
-        ow_username = cfg.get("username", "")
-        ow_password = cfg.get("password", "")
-    missing = []
-    if not ow_host: missing.append("host")
-    if not ow_username: missing.append("username")
-    if not ow_password: missing.append("password")
+    server_id = positive_id(server_id, "PVE 服务器编号")
+    cfg = get_pve_server(server_id)
+    if not cfg:
+        raise K8sError("PVE 服务器不存在")
+    missing = [key for key in ("ow_host", "ow_username", "ow_password") if not cfg.get(key)]
     if missing:
-        raise K8sError(f"OpenWrt 配置不完整: {', '.join(missing)}")
+        raise K8sError("PVE 服务器缺少 OpenWrt 配置")
     return OpenWrtClient(
-        host=ow_host,
-        username=ow_username,
-        password=ow_password,
-        port=int(cfg.get("ow_port", 22) if server_id else cfg.get("port", 22)),
+        host=cfg["ow_host"], username=cfg["ow_username"],
+        password=cfg["ow_password"], port=int(cfg.get("ow_port", 22)),
     )
 
 
 def _pve_client(server_id=None):
-    if server_id:
-        cfg = get_pve_server(server_id)
-        if not cfg:
-            raise K8sError(f"PVE 服务器 (ID={server_id}) 不存在")
-    else:
-        cfg = get_config("pve")
-        if not cfg:
-            raise K8sError(f"PVE 未配置，请先在页面中保存配置")
+    server_id = positive_id(server_id, "PVE 服务器编号")
+    cfg = get_pve_server(server_id)
+    if not cfg:
+        raise K8sError(f"PVE 服务器 (ID={server_id}) 不存在")
     missing = [k for k in ("host", "user", "token_name", "token_value") if not cfg.get(k)]
     if missing:
         raise K8sError(f"PVE 配置不完整: {', '.join(missing)}")
@@ -799,9 +779,9 @@ def delete_cluster(name, status_callback=None, log_callback=None, *, actor_id=No
     report(5, "正在加载集群信息...")
     cluster = authorized_cluster
     _num = name.split("_")[1]
+    _vms = cluster_vm_entries(cluster)
     pve = _pve_client(server_id=cluster.get("pve_server_id"))
     pve.connect()
-    _vms = list(cluster.get("vms", {}).items())
     _total = len(_vms)
     report(10, f"正在释放虚拟机 (共 {_total} 台)...")
     for i, (vm_name, vm_info) in enumerate(_vms):
@@ -887,6 +867,7 @@ def delete_cluster_async(name, created_by=None):
     actor, cluster = authorize_cluster_action(
         created_by, Actions.CLUSTER_DELETE, name
     )
+    fingerprint = _retry_resource_fingerprint(name, cluster)
     owner_teacher_id = _cluster_owner_teacher_id(cluster)
     task_id = _new_task_id()
     _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
@@ -904,7 +885,9 @@ def delete_cluster_async(name, created_by=None):
     def _run():
         _update_task(task_id, status="running", progress=0, message="正在初始化删除...")
         try:
-            authorize_cluster_action(actor.id, Actions.CLUSTER_DELETE, name)
+            _, current = authorize_cluster_action(actor.id, Actions.CLUSTER_DELETE, name)
+            if _retry_resource_fingerprint(name, current) != fingerprint:
+                raise TaskRetryConflict()
             delete_cluster(name, status_callback=_cb, log_callback=_log,
                            actor_id=actor.id)
             _update_task(task_id, status="completed", progress=100, message="集群已删除")
@@ -921,7 +904,7 @@ def delete_cluster_async(name, created_by=None):
 @_audited_operation(Actions.CLUSTER_CREATE, "created_by")
 def create_cluster(master_count, node_count, master_cores, master_memory,
                    node_cores, node_memory, pve_node,
-                   pve_server_id=0, group_id=None,
+                   pve_server_id=None, group_id=None,
                    class_id=None, created_by=None,
                    status_callback=None, log_callback=None, cancel_event=None):
     actor = reload_actor(created_by)
@@ -940,6 +923,11 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         if log_callback:
             log_callback(_sanitize_text(msg))
 
+    pve_server_id = positive_id(pve_server_id, "PVE 服务器编号")
+    pve_node = validate_node(pve_node)
+    pve_cfg = get_pve_server(pve_server_id)
+    if not pve_cfg:
+        raise K8sError("PVE 服务器不存在")
     password = secrets.token_urlsafe(16)
 
     _log(f"开始创建集群: master={master_count}, node={node_count}, "
@@ -972,7 +960,6 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
     _log(f"SSH 公钥: {pub_key[:80]}...")
     _log(f"SSH 私钥长度: {len(priv_key)} 字节")
 
-    pve_cfg = get_pve_server(pve_server_id) if pve_server_id else get_config("pve")
     template_vmid = pve_cfg.get("template_vmid") if pve_cfg else None
     if not template_vmid:
         template_vmid = 9000
@@ -1036,11 +1023,11 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
         try: ow.exec("/etc/init.d/network restart", tolerant=True)
         except Exception: pass
 
-    ow_lock = _openwrt_lock(server_id=pve_server_id if pve_server_id else None)
+    ow_lock = _openwrt_lock(server_id=pve_server_id)
     if not ow_lock.acquire(timeout=30):
         raise K8sError("OpenWrt 操作超时，系统繁忙，请稍后重试")
     try:
-        ow = _openwrt_client(server_id=pve_server_id if pve_server_id else None)
+        ow = _openwrt_client(server_id=pve_server_id)
 
         try:
             if cancel_event and cancel_event.is_set():
@@ -1101,7 +1088,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
     _log(f"PVE: 正在连接 {pve_cfg.get('host', '?') if pve_cfg else '?'}:{pve_cfg.get('port', 8006) if pve_cfg else '?'}")
     report(45, "正在连接 PVE...")
-    pve = _pve_client(server_id=pve_server_id if pve_server_id else None)
+    pve = _pve_client(server_id=pve_server_id)
     version = pve.connect()
     _log(f"PVE: 连接成功, 版本 {version.get('version', '?') if isinstance(version, dict) else version}")
 
@@ -1161,7 +1148,8 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
             newid = pve.create_vm(pve_node, template_vmid, cfg)
             _log(f"VM {vm_name}: 创建成功, VMID = {newid}")
-            vms[vm_name] = {"node": pve_node, "vmid": newid, "mac": mac, "role": role}
+            vms[vm_name] = {"pve_server_id": pve_server_id, "node": pve_node,
+                            "vmid": newid, "mac": mac, "role": role}
             created_vms.append((vm_name, pve_node, newid))
 
         # ── 预分配 IP（开机前写入 DHCP 静态绑定，不依赖 Guest Agent）──
@@ -1177,11 +1165,11 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
         _log("批量写入 DHCP 静态绑定和端口转发...")
         try:
-            _dhcp_lock = _openwrt_lock(server_id=pve_server_id if pve_server_id else None)
+            _dhcp_lock = _openwrt_lock(server_id=pve_server_id)
             if not _dhcp_lock.acquire(timeout=30):
                 raise K8sError("OpenWrt 操作超时，系统繁忙，请稍后重试")
             try:
-                _ow_dhcp = _openwrt_client(server_id=pve_server_id if pve_server_id else None)
+                _ow_dhcp = _openwrt_client(server_id=pve_server_id)
                 _ow_dhcp.connect()
                 try:
                     for _vm_name, _vi in vms.items():
@@ -1354,7 +1342,7 @@ def create_cluster(master_count, node_count, master_cores, master_memory,
 
 def create_cluster_async(master_count, node_count, master_cores, master_memory,
                          node_cores, node_memory, pve_node,
-                         pve_server_id=0,
+                         pve_server_id=None,
                          group_id=None, class_id=None, created_by=None):
     actor = reload_actor(created_by)
     validate_cluster_creation(
@@ -1362,6 +1350,8 @@ def create_cluster_async(master_count, node_count, master_cores, master_memory,
         group_ids=[group_id] if group_id is not None else (),
         class_id=class_id,
     )
+    pve_server_id = positive_id(pve_server_id, "PVE 服务器编号")
+    pve_node = validate_node(pve_node)
     owner_teacher_id = _cluster_owner_teacher_id({
         "created_by": actor.id,
         "group_id": group_id,
@@ -1478,13 +1468,12 @@ def deploy_k8s(name, status_callback=None, log_callback=None, *, actor_id=None):
 
     _log(f"开始部署 K8s: 集群 {name}")
 
-    _pve_sid = cluster.get("pve_server_id")
-    if _pve_sid:
-        _ow_cfg = get_pve_server(_pve_sid) or {}
-        _ssh_host = _ow_cfg.get("ow_host", "")
-    else:
-        _ow_cfg = get_config("openwrt") or {}
-        _ssh_host = _ow_cfg.get("host", "")
+    _pve_sid = positive_id(cluster.get("pve_server_id"), "PVE 服务器编号")
+    cluster_vm_entries(cluster)
+    _ow_cfg = get_pve_server(_pve_sid)
+    if not _ow_cfg:
+        raise K8sError("PVE 服务器不存在")
+    _ssh_host = _ow_cfg.get("ow_host", "")
     _ssh_port = cluster.get("ssh_port") or 50000 + int(name.split("_")[1])
     _priv_key = cluster.get("ssh_private_key", "")
     _pub_key = cluster.get("ssh_public_key", "")
@@ -1876,6 +1865,7 @@ def deploy_k8s_async(name, created_by=None):
     actor, cluster = authorize_cluster_action(
         created_by, Actions.CLUSTER_DEPLOY, name
     )
+    fingerprint = _retry_resource_fingerprint(name, cluster)
     owner_teacher_id = _cluster_owner_teacher_id(cluster)
     task_id = _new_task_id()
     _update_task(task_id, status="running", progress=0, message="排队中，等待资源...",
@@ -1894,7 +1884,9 @@ def deploy_k8s_async(name, created_by=None):
         _update_task(task_id, status="running", progress=0, message="正在初始化 K8s 部署...")
         try:
             worker_actor = reload_actor(actor.id)
-            authorize_cluster_action(worker_actor.id, Actions.CLUSTER_DEPLOY, name)
+            _, current = authorize_cluster_action(worker_actor.id, Actions.CLUSTER_DEPLOY, name)
+            if _retry_resource_fingerprint(name, current) != fingerprint:
+                raise TaskRetryConflict()
             deploy_k8s(name, status_callback=_cb, log_callback=_log,
                        actor_id=worker_actor.id)
             _update_task(task_id, status="completed", progress=100,
@@ -1913,7 +1905,7 @@ def batch_create_clusters(group_ids, master_count, node_count,
                           master_cores, master_memory,
                           node_cores, node_memory,
                           pve_node,
-                          pve_server_id=0,
+                          pve_server_id=None,
                           created_by=None,
                           status_callback=None, log_callback=None,
                           cancel_event=None, class_id=None):
@@ -1975,11 +1967,13 @@ def batch_create_clusters_async(group_ids, master_count, node_count,
                                 master_cores, master_memory,
                                 node_cores, node_memory,
                                 pve_node,
-                                pve_server_id=0,
+                                pve_server_id=None,
                                 created_by=None,
                                 class_id=None):
     actor = reload_actor(created_by)
     validate_cluster_creation(actor, group_ids=group_ids, class_id=class_id)
+    pve_server_id = positive_id(pve_server_id, "PVE 服务器编号")
+    pve_node = validate_node(pve_node)
     task_ids = []
     for gid in group_ids:
         tid = create_cluster_async(

@@ -159,14 +159,14 @@ class JobSecurityTests(unittest.TestCase):
             with self.subTest(groups=groups, class_id=class_id):
                 with self.assertRaises(error):
                     manager.batch_create_clusters_async(groups, *CREATE_ARGS,
-                                                        created_by=2, class_id=class_id)
+                                                        pve_server_id=7, created_by=2, class_id=class_id)
                 self.assertEqual(self.queued, [])
                 self.assertEqual(manager._task_store, {})
         self.assert_no_providers()
 
     def test_legal_batch_records_creator_and_owner_before_queueing(self):
         task_ids = manager.batch_create_clusters_async([11, 12], *CREATE_ARGS,
-                                                       created_by=2, class_id=10)
+                                                       pve_server_id=7, created_by=2, class_id=10)
         self.assertEqual(len(task_ids), 2)
         self.assertEqual(len(self.queued), 2)
         for task_id in task_ids:
@@ -199,7 +199,7 @@ class JobSecurityTests(unittest.TestCase):
                 self.users[2].is_active = True
                 self.groups[11].update(created_by=2, class_id=10)
                 self.classes[10]["created_by"] = 2
-                task_id = manager.create_cluster_async(*CREATE_ARGS, created_by=2,
+                task_id = manager.create_cluster_async(*CREATE_ARGS, pve_server_id=7, created_by=2,
                                                        group_id=11, class_id=10)
                 if change == "disabled":
                     self.users[2].is_active = False
@@ -240,7 +240,7 @@ class JobSecurityTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.users[2].is_active = True
                 self.clusters["k8s_1"]["created_by"] = 2
-                task_id = manager.create_cluster_async(*CREATE_ARGS, created_by=2,
+                task_id = manager.create_cluster_async(*CREATE_ARGS, pve_server_id=7, created_by=2,
                                                        group_id=11, class_id=10)
                 self.run_queued(len(self.queued) - 1)
                 self.assertEqual(self.queued[-1][0], "deploy")
@@ -264,7 +264,7 @@ class JobSecurityTests(unittest.TestCase):
                 self.assertEqual(manager.get_task_status(task_id)["status"], "completed")
         with patch.object(manager, "create_cluster", return_value=("k8s_1", self.clusters["k8s_1"])) as create:
             with patch.object(manager, "deploy_k8s") as deploy:
-                task_id = manager.create_cluster_async(*CREATE_ARGS, created_by=2)
+                task_id = manager.create_cluster_async(*CREATE_ARGS, pve_server_id=7, created_by=2)
                 self.run_queued(len(self.queued) - 1)
                 self.run_queued(len(self.queued) - 1)
                 self.assertEqual(create.call_args.kwargs["created_by"], 2)
@@ -286,7 +286,7 @@ class JobSecurityTests(unittest.TestCase):
             self.assertTrue(manager.cancel_task(task_id, actor_id=2))
 
     def test_admin_creating_for_teacher_group_records_owner(self):
-        task_id = manager.create_cluster_async(*CREATE_ARGS, created_by=1,
+        task_id = manager.create_cluster_async(*CREATE_ARGS, pve_server_id=7, created_by=1,
                                                group_id=21, class_id=20)
         self.assertEqual(manager.get_task_status(task_id)["owner_teacher_id"], 3)
 
@@ -301,12 +301,12 @@ class JobSecurityTests(unittest.TestCase):
     def test_synchronous_batch_checks_all_groups_before_any_operation(self):
         with patch.object(manager, "create_cluster") as create:
             with self.assertRaises(AuthorizationDenied):
-                manager.batch_create_clusters([11, 21], *CREATE_ARGS, created_by=2)
+                manager.batch_create_clusters([11, 21], *CREATE_ARGS, pve_server_id=7, created_by=2)
             create.assert_not_called()
         self.assert_no_providers()
 
     def test_direct_synchronous_failures_have_safe_actor_audits(self):
-        cases = [(lambda: manager.create_cluster(*CREATE_ARGS, created_by=2), "session_scope", Actions.CLUSTER_CREATE),
+        cases = [(lambda: manager.create_cluster(*CREATE_ARGS, pve_server_id=7, created_by=2), "get_pve_server", Actions.CLUSTER_CREATE),
                  (lambda: manager.delete_cluster("k8s_1", actor_id=2), "_pve_client", Actions.CLUSTER_DELETE),
                  (lambda: manager.deploy_k8s("k8s_1", actor_id=2), "get_pve_server", Actions.CLUSTER_DEPLOY)]
         for operation, boundary, action in cases:
@@ -377,7 +377,7 @@ class JobSecurityTests(unittest.TestCase):
 
     def test_raw_database_exceptions_never_enter_job_state_or_callback(self):
         error = RuntimeError("database failed [parameters: " + PRIVATE_KEY + "]")
-        cases = [(lambda: manager.create_cluster_async(*CREATE_ARGS, created_by=2), "create_cluster"),
+        cases = [(lambda: manager.create_cluster_async(*CREATE_ARGS, pve_server_id=7, created_by=2), "create_cluster"),
                  (lambda: manager.delete_cluster_async("k8s_1", created_by=2), "delete_cluster"),
                  (lambda: manager.deploy_k8s_async("k8s_1", created_by=2), "deploy_k8s")]
         for enqueue, operation in cases:
@@ -394,7 +394,7 @@ class JobSecurityTests(unittest.TestCase):
 
     def test_cascaded_deploy_exception_is_safe(self):
         with patch.object(manager, "create_cluster", return_value=("k8s_1", self.clusters["k8s_1"])):
-            task_id = manager.create_cluster_async(*CREATE_ARGS, created_by=2)
+            task_id = manager.create_cluster_async(*CREATE_ARGS, pve_server_id=7, created_by=2)
             self.run_queued(len(self.queued) - 1)
         with patch.object(manager, "deploy_k8s", side_effect=RuntimeError(PRIVATE_KEY)):
             self.run_queued(len(self.queued) - 1)
