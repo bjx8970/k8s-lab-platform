@@ -120,6 +120,8 @@ class OperationAdmissionRepository:
         resource=self.session.execute(select(resources).where(
             resources.c.uid==resource_uid).with_for_update()).mappings().one_or_none()
         if resource is None: raise ValueError("Resource 不存在")
+        if require_active and resource["registration_state"]!="active":
+            raise ValueError("Resource 已关闭登记")
         if resource["driver_id"] != driver_id:
             raise ValueError("driver_id 与 Resource 不一致")
 
@@ -181,14 +183,16 @@ class OperationAdmissionRepository:
         if not correlation_id:
             raise ValueError("correlation_id 不能为空")
 
-        # Historical relationship is validated first so an already-created Operation can be replayed
-        # even after its Binding was retired; active checks happen only for a real new admission.
-        snapshot=self._resolve_target(resource_uid, binding_uid, binding_revision, connection_uid,
-            connection_revision, driver_id, plugin_id, plugin_version, require_active=False)
-        digest=canonical_digest({"action":action,"input":normalized_input,"target":snapshot})
-
         def _replay_check(existing, where):
-            if existing["request_digest"]!=digest or existing["source_type"]!=source_type:
+            digest=canonical_digest({"action":action,"input":normalized_input,
+                "target":existing["target_snapshot"]})
+            if (existing["request_digest"]!=digest or existing["source_type"]!=source_type
+                    or existing["resource_uid"]!=resource_uid or existing["binding_uid"]!=binding_uid
+                    or existing["binding_revision"]!=binding_revision
+                    or existing["connection_uid"]!=connection_uid
+                    or existing["connection_revision"]!=connection_revision
+                    or existing["plugin_id"]!=plugin_id or existing["plugin_version"]!=plugin_version
+                    or existing["driver_id"]!=driver_id or existing["is_mutating"]!=is_mutating):
                 raise RequestConflict(where)
             if source_type=="plan" and (existing["operation_key"]!=operation_key or existing["attempt"]!=attempt):
                 raise RequestConflict(where)
@@ -204,7 +208,6 @@ class OperationAdmissionRepository:
                 operations.c.operation_key==operation_key, operations.c.attempt==attempt))).mappings().one_or_none()
             if plan_existing: return _replay_check(plan_existing, f"operation_key={operation_key}/attempt={attempt}")
 
-        # --- new admission: require a currently usable target ---
         snapshot=self._resolve_target(resource_uid, binding_uid, binding_revision, connection_uid,
             connection_revision, driver_id, plugin_id, plugin_version, require_active=True)
         digest=canonical_digest({"action":action,"input":normalized_input,"target":snapshot})
@@ -284,6 +287,26 @@ class OperationExecutorRepository:
         _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
         return dict(row)
 
+    def _release_cancelled_create(self, operation):
+        if operation["action"]!="create": return
+        is_provisional=self.session.execute(select(bindings.c.provisional).where(
+            bindings.c.uid==operation["binding_uid"])).scalar_one()
+        if not is_provisional: return
+        resource=self.session.execute(update(resources).where(and_(
+            resources.c.uid==operation["resource_uid"],resources.c.existence_state=="pending"))
+            .values(existence_state="absent",resource_version=next_resource_version(),
+                updated_at=utc_now()).returning(resources)).mappings().one_or_none()
+        binding=self.session.execute(update(bindings).where(and_(
+            bindings.c.uid==operation["binding_uid"],
+            bindings.c.revision==operation["binding_revision"],
+            bindings.c.active.is_(True), bindings.c.provisional.is_(True)))
+            .values(active=False,existence_state="absent",closed_at=utc_now(),
+                resource_version=next_resource_version()).returning(bindings)).mappings().one_or_none()
+        if binding is None or resource is None:
+            raise ValueError("provisional create 未确认未提交，不能释放外部身份")
+        _event(self.session,"Binding",binding["uid"],binding["resource_version"],"MODIFIED")
+        _event(self.session,"Resource",resource["uid"],resource["resource_version"],"MODIFIED")
+
     def request_cancel(self, uid):
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
             operations.c.phase.in_(("pending","running","pending_external"))))
@@ -293,6 +316,7 @@ class OperationExecutorRepository:
                 resource_version=next_resource_version(), updated_at=utc_now())
             .returning(operations)).mappings().one_or_none()
         if row is not None:
+            if row["phase"]=="cancelled": self._release_cancelled_create(row)
             _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
             return dict(row)
         return None
@@ -306,6 +330,7 @@ class OperationExecutorRepository:
                 finished_at=utc_now(), resource_version=next_resource_version(), updated_at=utc_now())
             .returning(operations)).mappings().one_or_none()
         if row is not None:
+            self._release_cancelled_create(row)
             _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
             return dict(row)
         return None

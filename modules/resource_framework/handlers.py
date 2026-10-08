@@ -36,6 +36,7 @@ class HandlerRegistry:
 
 class FakeHandler:
     actions = frozenset({"create", "observe", "start", "stop", "delete"})
+    read_only_actions = frozenset({"observe"})
 
     def __init__(self):
         self.calls = []

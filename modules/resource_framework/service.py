@@ -85,7 +85,6 @@ class ResourceService:
     def create(self, *, connection_uid, resource_type, plugin_id, plugin_version,
                driver_id, external_key, locator, identity_evidence, attributes,
                normalized_input, server_scope, request_id, correlation_id):
-        self._handler(plugin_id, plugin_version, driver_id, "create")
         self._input(normalized_input)
         self.session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(
             str(len(server_scope)) + ":" + server_scope + request_id, 0)))).scalar_one()
@@ -96,7 +95,10 @@ class ResourceService:
             resource = self.get_resource(existing["resource_uid"])
             binding = self.session.execute(select(bindings).where(
                 bindings.c.uid == existing["binding_uid"])).mappings().one()
-            if (existing["action"] != "create" or target["connectionId"] != str(connection_uid)
+            if (existing["source_type"] != "direct" or existing["action"] != "create"
+                    or existing["request_digest"] != canonical_digest({"action": "create",
+                        "input": normalized_input, "target": target})
+                    or target["connectionId"] != str(connection_uid)
                     or target["driverId"] != driver_id or target["pluginId"] != plugin_id
                     or target["pluginVersion"] != plugin_version
                     or target["externalIdentity"]["externalKey"] != external_key
@@ -105,6 +107,7 @@ class ResourceService:
                     or existing["normalized_input"] != normalized_input):
                 raise RequestConflict(request_id)
             return dict(existing)
+        self._handler(plugin_id, plugin_version, driver_id, "create")
         connection = self._connection(connection_uid)
         if (not external_key or not isinstance(locator, dict) or not isinstance(identity_evidence, dict)
                 or not identity_evidence or not isinstance(attributes, dict)
@@ -136,21 +139,23 @@ class ResourceService:
                 connection_uid=existing["connection_uid"],
                 connection_revision=existing["connection_revision"], plugin_id=plugin_id,
                 plugin_version=plugin_version, driver_id=existing["driver_id"],
-                action=action, normalized_input=normalized_input)
+                action=action, normalized_input=normalized_input,
+                is_mutating=existing["is_mutating"])
         resource = self.get_resource(resource_uid)
         if resource["registration_state"] != "active":
             raise ValueError("Resource 已关闭登记")
         binding = self.session.execute(select(bindings).where(and_(
             bindings.c.resource_uid == resource_uid, bindings.c.active.is_(True)))).mappings().one()
         connection = self._connection(binding["connection_uid"])
-        self._handler(plugin_id, plugin_version, resource["driver_id"], action)
+        handler = self._handler(plugin_id, plugin_version, resource["driver_id"], action)
         return OperationAdmissionRepository(self.session).create(
             server_scope=server_scope, request_id=request_id, correlation_id=correlation_id,
             source_type="direct", resource_uid=resource_uid, binding_uid=binding["uid"],
             binding_revision=binding["revision"], connection_uid=connection["uid"],
             connection_revision=connection["revision"], plugin_id=plugin_id,
             plugin_version=plugin_version, driver_id=resource["driver_id"],
-            action=action, normalized_input=normalized_input)
+            action=action, normalized_input=normalized_input,
+            is_mutating=action not in handler.read_only_actions)
 
     def get_resource(self, uid):
         row = self.session.execute(select(resources).where(resources.c.uid == uid)).mappings().one_or_none()
@@ -172,12 +177,27 @@ class ResourceService:
             .order_by(resources.c.created_at, resources.c.uid).limit(limit)).mappings()]
 
     def unregister(self, uid):
-        row = self.session.execute(update(resources).where(and_(resources.c.uid == uid,
-            resources.c.registration_state == "active"))
+        resource = self.session.execute(select(resources).where(
+            resources.c.uid == uid).with_for_update()).mappings().one_or_none()
+        if resource is None or resource["registration_state"] != "active":
+            raise KeyError(str(uid))
+        binding = self.session.execute(select(bindings).where(and_(
+            bindings.c.resource_uid == uid, bindings.c.active.is_(True)))
+            .with_for_update()).mappings().one_or_none()
+        in_flight = self.session.execute(select(operations.c.uid).where(and_(
+            operations.c.resource_uid == uid, operations.c.is_mutating.is_(True),
+            operations.c.phase.in_(("pending", "running", "pending_external", "cancelling", "unknown"))))
+            .limit(1)).first()
+        if in_flight or resource["existence_state"] in ("pending", "unknown"):
+            raise ValueError("外部结果未确认，不能关闭登记")
+        row = self.session.execute(update(resources).where(resources.c.uid == uid)
             .values(registration_state="closed", revision=resources.c.revision + 1,
                 resource_version=next_resource_version(), updated_at=utc_now())
-            .returning(resources)).mappings().one_or_none()
-        if row is None:
-            raise KeyError(str(uid))
+            .returning(resources)).mappings().one()
+        if binding is not None:
+            retired = self.session.execute(update(bindings).where(bindings.c.uid == binding["uid"])
+                .values(active=False, closed_at=utc_now(),
+                    resource_version=next_resource_version()).returning(bindings)).mappings().one()
+            _event(self.session, "Binding", retired["uid"], retired["resource_version"], "MODIFIED")
         _event(self.session, "Resource", uid, row["resource_version"], "MODIFIED")
         return dict(row)

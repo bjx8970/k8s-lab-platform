@@ -2,6 +2,7 @@
 
 import re
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, select, update
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Session
 from modules.audit import sanitize
 from modules.control_plane.repositories import LeaseLost, OperationExecutorRepository, _event
 from modules.control_plane.tables import bindings, connections, next_resource_version, operations, resources, utc_now
-from .handlers import OutcomeUnknown
+from .handlers import ExecutionResult, OutcomeUnknown
 
 
 class OperationWorker:
@@ -68,18 +69,39 @@ class OperationWorker:
             if response.phase == "pending_external" and not (
                     response.external_task_ref or op["external_task_ref"]):
                 raise ValueError("异步任务缺少 externalTaskRef")
+            expected = {"create": "present", "delete": "absent"}.get(op["action"])
+            if response.phase == "succeeded" and expected and response.existence_state != expected:
+                response = replace(response, phase="unknown", error_code="ExistenceUnconfirmed")
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+            current_binding = (binding["active"] and binding["revision"] == op["binding_revision"]
+                and binding["resource_uid"] == op["resource_uid"]
+                and binding["connection_uid"] == op["connection_uid"]
+                and binding["external_key"] == op["target_snapshot"]["externalIdentity"]["externalKey"])
+            result = sanitize(response.output or {})
             if response.existence_state is not None:
+                result["existenceState"] = response.existence_state
+            if response.existence_state is not None and op["action"] != "observe" and current_binding:
                 repo.update_resource_fact(op["resource_uid"], operation_uid=uid,
                     worker_id=self.worker_id, claim_revision=claim_revision,
                     existence_state=response.existence_state, status=sanitize(response.output or {}))
-                binding = session.execute(update(bindings).where(and_(
+                deleting = op["action"] == "delete" and response.phase == "succeeded"
+                updated_binding = session.execute(update(bindings).where(and_(
                     bindings.c.uid == op["binding_uid"], bindings.c.revision == op["binding_revision"],
                     bindings.c.active.is_(True)))
                     .values(existence_state=response.existence_state,
-                        provisional=False if op["action"] == "create" and response.phase == "succeeded"
+                        provisional=False if deleting or (op["action"] == "create" and response.phase == "succeeded")
                             else bindings.c.provisional,
+                        active=False if deleting else bindings.c.active,
+                        closed_at=utc_now() if deleting else bindings.c.closed_at,
                         resource_version=next_resource_version()).returning(bindings)).mappings().one()
-                _event(session, "Binding", binding["uid"], binding["resource_version"], "MODIFIED")
+                _event(session, "Binding", updated_binding["uid"], updated_binding["resource_version"], "MODIFIED")
+                if deleting:
+                    resource = session.execute(update(resources).where(resources.c.uid == op["resource_uid"])
+                        .values(registration_state="closed", revision=resources.c.revision + 1,
+                            resource_version=next_resource_version(), updated_at=utc_now())
+                        .returning(resources)).mappings().one()
+                    _event(session, "Resource", resource["uid"], resource["resource_version"], "MODIFIED")
             options = {}
             if response.external_task_ref is not None:
                 options["external_task_ref"] = response.external_task_ref
@@ -89,7 +111,7 @@ class OperationWorker:
             if code and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", code):
                 code = "ProviderError"
             return repo.update_execution(uid, worker_id=self.worker_id, claim_revision=claim_revision,
-                phase=response.phase, result=sanitize(response.output) if response.output else None,
+                phase=response.phase, result=result or None,
                 error={"code": code} if code else None, **options)
 
     def run_once(self):
@@ -105,25 +127,25 @@ class OperationWorker:
                 continue
             claim_revision = op["claim_revision"]
             try:
-                with Session(self.engine) as session, session.begin():
-                    if OperationExecutorRepository(session).cancel_before_submit(uid,
-                            worker_id=self.worker_id, claim_revision=claim_revision):
-                        return uid
-                    valid = self._target_valid(session, op)
-                if not valid:
-                    phase = "unknown" if op["external_task_ref"] else "failed"
+                if not op["external_task_ref"]:
                     with Session(self.engine) as session, session.begin():
-                        OperationExecutorRepository(session).update_execution(uid,
-                            worker_id=self.worker_id, claim_revision=claim_revision, phase=phase,
-                            error={"code":"TargetRevisionConflict"})
-                    return uid
+                        if OperationExecutorRepository(session).cancel_before_submit(uid,
+                                worker_id=self.worker_id, claim_revision=claim_revision):
+                            return uid
+                        valid = self._target_valid(session, op)
+                    if not valid:
+                        with Session(self.engine) as session, session.begin():
+                            OperationExecutorRepository(session).update_execution(uid,
+                                worker_id=self.worker_id, claim_revision=claim_revision, phase="failed",
+                                error={"code":"TargetRevisionConflict"})
+                        return uid
                 try:
                     handler = self.registry.get(op["plugin_id"], op["plugin_version"], op["driver_id"])
                 except ValueError:
                     with Session(self.engine) as session, session.begin():
                         OperationExecutorRepository(session).update_execution(uid,
                             worker_id=self.worker_id, claim_revision=claim_revision,
-                            phase="unknown" if op["external_task_ref"] else "failed",
+                            phase="pending_external" if op["external_task_ref"] else "failed",
                             error={"code":"PluginUnavailable"})
                     return uid
                 stop, lost = threading.Event(), threading.Event()
@@ -136,10 +158,10 @@ class OperationWorker:
                     else:
                         response = handler.execute(op["target_snapshot"], op["action"], op["normalized_input"])
                 except OutcomeUnknown:
-                    from .handlers import ExecutionResult
-                    response = ExecutionResult("unknown", error_code="ExecutionOutcomeUnknown")
+                    response = ExecutionResult("pending_external" if op["external_task_ref"] else "unknown",
+                        external_task_ref=op["external_task_ref"],
+                        error_code="PollUnavailable" if op["external_task_ref"] else "ExecutionOutcomeUnknown")
                 except Exception:
-                    from .handlers import ExecutionResult
                     response = ExecutionResult("unknown" if not op["external_task_ref"] else "pending_external",
                         external_task_ref=op["external_task_ref"],
                         error_code="ExecutionOutcomeUnknown" if not op["external_task_ref"] else "PollUnavailable")

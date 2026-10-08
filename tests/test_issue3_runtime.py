@@ -129,6 +129,26 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertEqual("present", registered["existence_state"])
         self.assertEqual([], self.fake.calls)
 
+    def test_create_request_replays_after_revisions_change_and_plugin_unloads(self):
+        key, external = uuid4().hex, uuid4().hex
+        op = self.create(request_id=key, external_key=external)
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(bindings).where(bindings.c.uid == op["binding_uid"])
+                .values(revision=2))
+            session.execute(update(connections).where(connections.c.uid == self.connection_uid)
+                .values(revision=2, secret_version_ref="secret/v2", active=False))
+        with Session(self.engine) as session, session.begin():
+            replay = ResourceService(session, HandlerRegistry()).create(
+                connection_uid=self.connection_uid, resource_type="compute.vm/v1",
+                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                external_key=external, locator={"node": "n1"},
+                identity_evidence={"source": "test"}, attributes={"image": "x"},
+                normalized_input={"image": "x"}, server_scope="test/issue3",
+                request_id=key, correlation_id="replayed")
+        self.assertEqual(op["uid"], replay["uid"])
+        self.assertEqual(op["correlation_id"], replay["correlation_id"])
+        self.assertEqual([], self.fake.calls)
+
     def test_registration_identity_scoped_by_domain(self):
         external = uuid4().hex
         with Session(self.engine) as session, session.begin():
@@ -161,9 +181,9 @@ class Issue3PostgresTests(unittest.TestCase):
         self.worker.run_once()
         with Session(self.engine) as session, session.begin():
             session.execute(update(bindings).where(bindings.c.uid == op["binding_uid"])
-                .values(active=False))
+                .values(active=False, revision=2))
             session.execute(update(connections).where(connections.c.uid == self.connection_uid)
-                .values(active=False))
+                .values(active=False, revision=2, secret_version_ref="secret/v2"))
         with Session(self.engine) as session, session.begin():
             replay = ResourceService(session, HandlerRegistry()).execute(resource["uid"],
                 action="start", normalized_input={}, plugin_id="fake", plugin_version="1",
@@ -171,6 +191,35 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertEqual(op["uid"], replay["uid"])
         self.assertEqual("first", replay["correlation_id"])
         self.assertEqual(1, len(self.fake.calls))
+
+    def test_unregister_retires_identity_only_after_pending_work_is_resolved(self):
+        external = uuid4().hex
+        with Session(self.engine) as session, session.begin():
+            resource = ResourceService(session, self.registry).register(
+                connection_uid=self.connection_uid, resource_type="compute.vm/v1",
+                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                external_key=external, locator={}, identity_evidence={"source": "test"})
+            op = ResourceService(session, self.registry).execute(resource["uid"],
+                action="start", normalized_input={}, plugin_id="fake", plugin_version="1",
+                server_scope="test/issue3", request_id=uuid4().hex, correlation_id="corr")
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaises(ValueError):
+                ResourceService(session, self.registry).unregister(resource["uid"])
+        self.fake.execute_results = [ExecutionResult("succeeded")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            service.unregister(resource["uid"])
+            replacement = service.register(connection_uid=self.connection_uid,
+                resource_type="compute.vm/v1", plugin_id="fake", plugin_version="1",
+                driver_id="fake.vm/v1", external_key=external, locator={},
+                identity_evidence={"source": "test"})
+        self.assertNotEqual(resource["uid"], replacement["uid"])
+        with Session(self.engine) as session:
+            old_binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertFalse(old_binding["active"])
+        self.assertIsNotNone(old_binding["closed_at"])
 
     def test_mutating_operation_is_serial_per_resource(self):
         op = self.create()
@@ -205,6 +254,44 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertEqual("present", resource["existence_state"])
         self.assertEqual("present", binding["existence_state"])
         self.assertEqual(1, len([call for call in self.fake.calls if call[0] == "execute"]))
+
+    def test_create_success_requires_confirmed_existence(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("succeeded")]
+        self.worker.run_once()
+        result = self.read(op["uid"])
+        self.assertEqual("unknown", result["phase"])
+        self.assertEqual("ExistenceUnconfirmed", result["error"]["code"])
+        with Session(self.engine) as session:
+            resource = session.execute(select(resources).where(
+                resources.c.uid == op["resource_uid"])).mappings().one()
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertEqual("pending", resource["existence_state"])
+        self.assertTrue(binding["provisional"])
+        self.assertTrue(binding["active"])
+        self.assertIsNone(self.worker.run_once())
+
+    def test_observe_is_read_only_and_does_not_overwrite_resource_state(self):
+        create_op = self.create()
+        with Session(self.engine) as session, session.begin():
+            observation = ResourceService(session, self.registry).execute(create_op["resource_uid"],
+                action="observe", normalized_input={}, plugin_id="fake", plugin_version="1",
+                server_scope="test/issue3", request_id=uuid4().hex, correlation_id="observe")
+        self.assertFalse(observation["is_mutating"])
+        self.assertEqual("pending", self.read(create_op["uid"])["phase"])
+        with Session(self.engine) as session, session.begin():
+            OperationExecutorRepository(session).claim(create_op["uid"], worker_id="other",
+                lease_until=datetime.now(timezone.utc) + timedelta(minutes=1))
+        self.fake.execute_results = [ExecutionResult("succeeded", existence_state="present",
+            output={"power": "on"})]
+        self.assertEqual(observation["uid"], self.worker.run_once())
+        self.assertEqual("succeeded", self.read(observation["uid"])["phase"])
+        with Session(self.engine) as session:
+            resource = session.execute(select(resources).where(
+                resources.c.uid == create_op["resource_uid"])).mappings().one()
+        self.assertEqual("pending", resource["existence_state"])
+        self.assertEqual({}, resource["status"])
 
     def test_expired_running_becomes_unknown_without_reexecution(self):
         op = self.create()
@@ -258,11 +345,94 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertEqual("failed", self.read(op["uid"])["phase"])
         self.assertEqual([], self.fake.calls)
 
+    def test_delete_success_releases_binding_and_allows_registration(self):
+        external = uuid4().hex
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            resource = service.register(connection_uid=self.connection_uid,
+                resource_type="compute.vm/v1", plugin_id="fake", plugin_version="1",
+                driver_id="fake.vm/v1", external_key=external, locator={},
+                identity_evidence={"source": "test"})
+            delete_op = service.execute(resource["uid"], action="delete", normalized_input={},
+                plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                request_id=uuid4().hex, correlation_id="delete")
+        self.fake.execute_results = [ExecutionResult("succeeded", existence_state="absent")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            old = service.get_resource(resource["uid"])
+            replacement = service.register(connection_uid=self.connection_uid,
+                resource_type="compute.vm/v1", plugin_id="fake", plugin_version="1",
+                driver_id="fake.vm/v1", external_key=external, locator={},
+                identity_evidence={"source": "test"})
+        self.assertEqual("closed", old["registration_state"])
+        self.assertEqual("absent", old["existence_state"])
+        self.assertNotEqual(resource["uid"], replacement["uid"])
+        with Session(self.engine) as session:
+            old_binding = session.execute(select(bindings).where(
+                bindings.c.uid == delete_op["binding_uid"])).mappings().one()
+        self.assertFalse(old_binding["active"])
+        self.assertIsNotNone(old_binding["closed_at"])
+
+    def test_delete_without_absence_fact_keeps_identity_reserved(self):
+        external = uuid4().hex
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            resource = service.register(connection_uid=self.connection_uid,
+                resource_type="compute.vm/v1", plugin_id="fake", plugin_version="1",
+                driver_id="fake.vm/v1", external_key=external, locator={},
+                identity_evidence={"source": "test"})
+            delete_op = service.execute(resource["uid"], action="delete", normalized_input={},
+                plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                request_id=uuid4().hex, correlation_id="delete")
+        self.fake.execute_results = [ExecutionResult("succeeded")]
+        self.worker.run_once()
+        self.assertEqual("unknown", self.read(delete_op["uid"])["phase"])
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaises(ValueError):
+                ResourceService(session, self.registry).unregister(resource["uid"])
+        with Session(self.engine) as session:
+            old_binding = session.execute(select(bindings).where(
+                bindings.c.uid == delete_op["binding_uid"])).mappings().one()
+        self.assertTrue(old_binding["active"])
+
     def test_cancel_pending_is_terminal_and_does_not_call_handler(self):
-        op = self.create()
+        external = uuid4().hex
+        op = self.create(external_key=external)
         with Session(self.engine) as session, session.begin():
             OperationExecutorRepository(session).request_cancel(op["uid"])
         self.assertIsNone(self.worker.run_once())
+        self.assertEqual("cancelled", self.read(op["uid"])["phase"])
+        with Session(self.engine) as session, session.begin():
+            replacement = ResourceService(session, self.registry).register(
+                connection_uid=self.connection_uid, resource_type="compute.vm/v1",
+                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                external_key=external, locator={}, identity_evidence={"source": "test"})
+        self.assertNotEqual(op["resource_uid"], replacement["uid"])
+        with Session(self.engine) as session:
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertFalse(binding["active"])
+        self.assertEqual("absent", binding["existence_state"])
+        self.assertEqual([], self.fake.calls)
+
+    def test_cancel_after_claim_but_before_submit_releases_identity(self):
+        external = uuid4().hex
+        op = self.create(external_key=external)
+        with Session(self.engine) as session, session.begin():
+            claim = OperationExecutorRepository(session).claim(op["uid"], worker_id="waiting",
+                lease_until=datetime.now(timezone.utc) + timedelta(minutes=1))
+        with Session(self.engine) as session, session.begin():
+            OperationExecutorRepository(session).request_cancel(op["uid"])
+        with Session(self.engine) as session, session.begin():
+            OperationExecutorRepository(session).cancel_before_submit(op["uid"], worker_id="waiting",
+                claim_revision=claim["claim_revision"])
+        with Session(self.engine) as session, session.begin():
+            replacement = ResourceService(session, self.registry).register(
+                connection_uid=self.connection_uid, resource_type="compute.vm/v1",
+                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                external_key=external, locator={}, identity_evidence={"source": "test"})
+        self.assertNotEqual(op["resource_uid"], replacement["uid"])
         self.assertEqual("cancelled", self.read(op["uid"])["phase"])
         self.assertEqual([], self.fake.calls)
 
@@ -280,6 +450,76 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertEqual("succeeded", result["phase"])
         self.assertTrue(result["cancellation_requested"])
         self.assertEqual(1, len(self.fake.calls))
+
+    def test_saved_external_task_polls_frozen_target_after_credential_rotation(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="remote-1")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(connections).where(connections.c.uid == self.connection_uid)
+                .values(revision=2, secret_version_ref="secret/v2"))
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+
+        def poll_frozen(target, external_ref, _):
+            self.assertEqual("remote-1", external_ref)
+            self.assertEqual(1, target["connectionRevision"])
+            self.assertEqual("secret/v1", target["secretVersionRef"])
+            return ExecutionResult("succeeded", existence_state="present")
+
+        self.fake.poll_results = [poll_frozen]
+        restarted = OperationWorker(self.engine, self.registry,
+            worker_id="rotated-" + uuid4().hex, lease_seconds=6)
+        restarted.run_once()
+        self.assertEqual("succeeded", self.read(op["uid"])["phase"])
+        self.assertEqual(1, len([call for call in self.fake.calls if call[0] == "execute"]))
+
+    def test_poll_after_rebind_preserves_newer_resource_fact(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="remote-1")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(bindings).where(bindings.c.uid == op["binding_uid"])
+                .values(revision=2, locator={"node": "n2"}))
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+
+        def poll_old_locator(target, _, __):
+            self.assertEqual({"node": "n1"}, target["locator"])
+            return ExecutionResult("succeeded", existence_state="present")
+
+        self.fake.poll_results = [poll_old_locator]
+        self.worker.run_once()
+        self.assertEqual("succeeded", self.read(op["uid"])["phase"])
+        with Session(self.engine) as session:
+            resource = session.execute(select(resources).where(
+                resources.c.uid == op["resource_uid"])).mappings().one()
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertEqual("pending", resource["existence_state"])
+        self.assertEqual("pending", binding["existence_state"])
+        self.assertEqual(2, binding["revision"])
+
+    def test_missing_plugin_keeps_known_external_task_recoverable(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="remote-1")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        missing = OperationWorker(self.engine, HandlerRegistry(), worker_id="missing", lease_seconds=6)
+        missing.run_once()
+        pending = self.read(op["uid"])
+        self.assertEqual("pending_external", pending["phase"])
+        self.assertEqual("remote-1", pending["external_task_ref"])
+        self.assertEqual("PluginUnavailable", pending["error"]["code"])
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        self.fake.poll_results = [ExecutionResult("succeeded", existence_state="present")]
+        self.worker.run_once()
+        self.assertEqual("succeeded", self.read(op["uid"])["phase"])
+        self.assertEqual(1, len([call for call in self.fake.calls if call[0] == "execute"]))
 
     def test_saved_external_acceptance_then_poll_failure_preserves_ref(self):
         op = self.create()

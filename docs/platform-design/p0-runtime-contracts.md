@@ -46,11 +46,11 @@ externalIdentity     ← 由 rf_bindings.external_key 构造
 locator              ← rf_bindings.locator
 ```
 
-digest 基于 `action + normalizedInput + canonical target snapshot` 计算。先按 UID/revision 校验历史关系，再进行 transport/plan 去重；只有确定要创建新 Operation 时才要求 Binding/Connection 仍 active。因此已 retired Binding 上的历史相同请求仍可幂等重放，但不能创建新 Operation。并发插入依赖显式命名的 `uq_rf_operation_transport` 与 `uq_rf_operation_plan_item` 唯一约束分类处理，不吞并 mutating Operation 冲突。
+digest 基于 `action + normalizedInput + canonical target snapshot` 计算。已存在的 transport/plan key 先使用原 Operation 冻结的 snapshot、拆分列和 digest 验证请求，完全一致返回原结果；重放不要求当前 Binding/Connection revision、active 状态或插件仍可用。只有新 Operation 才读取并验证当前 Resource/Binding/Connection，再生成快照；已退役 Binding 不得受理新命令。并发插入依赖显式命名的 `uq_rf_operation_transport` 与 `uq_rf_operation_plan_item` 唯一约束分类处理，不吞并 mutating Operation 冲突。
 
-Executor 用 `leaseOwner + leaseUntil + claimRevision` 领取；每次成功领取递增 claimRevision，全部后续更新比较 owner/revision，旧 claimant 更新为零行即 `LeaseLost`。已保存 externalTaskRef 只 poll；可能已提交但未保存外部标识进入 Unknown，不自动重发。
+Executor 用 `leaseOwner + leaseUntil + claimRevision` 领取；每次成功领取递增 claimRevision，全部后续更新比较 owner/revision，旧 claimant 更新为零行即 `LeaseLost`。未提交命令执行前验证当前版本；已保存 externalTaskRef 的 Operation 使用冻结目标继续 poll，不重新提交，旧版插件/凭据暂不可用时保留 ref 与 pending_external 供恢复。可能已提交但未保存外部标识进入 Unknown，不自动重发。
 
-create admission 同事务预分配 Resource 与 provisional Binding，初始 existenceState=pending。确认创建后转 present/provisional=false；确认未创建转 absent；无法确认转 unknown。unknown 不能释放 allocation。Resource 登记状态 active/closed 与 existenceState 分离。
+create admission 同事务预分配 Resource 与 provisional Binding，初始 existenceState=pending。create/delete 仅在存在性事实分别确认为 present/absent 时记为 succeeded；不能确认则 Unknown 且保留身份。未提交即取消的 provisional create 确认 absent 后释放 Binding 身份；delete 确认 absent、或无在途/Unknown 操作的显式 unregister，才可退役 Binding。只读 observe 不占用变更 Operation 唯一键，未做采样序号 fencing 前不直接写 Resource 事实。unknown 不能释放 allocation。Resource 登记状态 active/closed 与 existenceState 分离。
 
 ## 删除与 finalizer
 
