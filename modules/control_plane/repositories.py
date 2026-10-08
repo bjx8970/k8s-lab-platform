@@ -243,6 +243,12 @@ class OperationExecutorRepository:
     owned_resource_columns=frozenset({"existence_state","status","resource_version","updated_at"})
     def __init__(self,session): self.session=session
 
+    def candidates(self, limit=32):
+        return self.session.execute(select(operations.c.uid).where(and_(
+            operations.c.phase.in_(("pending", "running", "pending_external")),
+            or_(operations.c.lease_until.is_(None), operations.c.lease_until < utc_now())))
+            .order_by(operations.c.created_at, operations.c.uid).limit(limit)).scalars().all()
+
     def claim(self,uid,*,worker_id,lease_until):
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
             operations.c.phase.in_(("pending","running","pending_external")),
@@ -254,6 +260,55 @@ class OperationExecutorRepository:
             .returning(operations)).mappings().one_or_none()
         if row is None: return None
         result=dict(row); _event(self.session,"Operation",uid,result["resource_version"],"MODIFIED"); return result
+
+    def recover_uncertain(self, uid):
+        row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
+            operations.c.phase=="running",
+            or_(operations.c.lease_until.is_(None), operations.c.lease_until<utc_now())))
+            .values(phase="unknown", lease_owner=None, lease_until=None,
+                error={"code":"ExecutionOutcomeUnknown"}, finished_at=utc_now(),
+                resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is not None:
+            _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+            return dict(row)
+        return None
+
+    def renew(self, uid, *, worker_id, claim_revision, lease_until):
+        row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
+            operations.c.lease_owner==worker_id, operations.c.claim_revision==claim_revision,
+            operations.c.lease_until>utc_now(), operations.c.phase.in_(("running","pending_external"))))
+            .values(lease_until=lease_until, resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is None: raise LeaseLost(str(uid))
+        _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+        return dict(row)
+
+    def request_cancel(self, uid):
+        row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
+            operations.c.phase.in_(("pending","running","pending_external"))))
+            .values(cancellation_requested=True,
+                phase=case((operations.c.phase=="pending","cancelled"),else_=operations.c.phase),
+                finished_at=case((operations.c.phase=="pending",utc_now()),else_=operations.c.finished_at),
+                resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is not None:
+            _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+            return dict(row)
+        return None
+
+    def cancel_before_submit(self, uid, *, worker_id, claim_revision):
+        row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
+            operations.c.phase=="running", operations.c.external_task_ref.is_(None),
+            operations.c.cancellation_requested.is_(True), operations.c.lease_owner==worker_id,
+            operations.c.claim_revision==claim_revision, operations.c.lease_until>utc_now()))
+            .values(phase="cancelled", lease_owner=None, lease_until=None,
+                finished_at=utc_now(), resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is not None:
+            _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+            return dict(row)
+        return None
 
     def update_execution(self,uid,*,worker_id,claim_revision,phase,external_task_ref=_UNSET,exec_data=_UNSET,
                          result=None,error=None,remote_job=None):
@@ -269,7 +324,8 @@ class OperationExecutorRepository:
             values.update(remote_job)
         if phase in TERMINAL_PHASES: values.update(finished_at=utc_now(),lease_owner=None,lease_until=None)
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,operations.c.lease_owner==worker_id,
-            operations.c.claim_revision==claim_revision,operations.c.lease_until>utc_now()))
+            operations.c.claim_revision==claim_revision,operations.c.lease_until>utc_now(),
+            operations.c.phase.in_(("running","pending_external"))))
             .values(**values).returning(operations)).mappings().one_or_none()
         if row is None: raise LeaseLost(str(uid))
         out=dict(row); _event(self.session,"Operation",uid,out["resource_version"],"MODIFIED"); return out
