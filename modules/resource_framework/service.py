@@ -9,8 +9,11 @@ from modules.control_plane.repositories import (
     OperationAdmissionRepository, OperationExecutorRepository, RequestConflict, _event, canonical_digest,
 )
 from modules.control_plane.tables import (
-    bindings, connections, next_resource_version, operations, resources, utc_now,
+    bindings, connections, next_resource_version, operations, request_keys, resources, utc_now,
 )
+
+
+CREATE_ENTRYPOINT = "resource.create"
 
 
 class ResourceService:
@@ -86,27 +89,23 @@ class ResourceService:
                driver_id, external_key, locator, identity_evidence, attributes,
                normalized_input, server_scope, request_id, correlation_id):
         self._input(normalized_input)
+        request_digest = canonical_digest({"connectionId": str(connection_uid),
+            "resourceType": resource_type, "pluginId": plugin_id, "pluginVersion": plugin_version,
+            "driverId": driver_id, "externalKey": external_key, "locator": locator,
+            "identityEvidence": identity_evidence, "attributes": attributes, "input": normalized_input})
         self.session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(
             str(len(server_scope)) + ":" + server_scope + request_id, 0)))).scalar_one()
-        existing = self.session.execute(select(operations).where(and_(
-            operations.c.server_scope == server_scope, operations.c.request_id == request_id))).mappings().one_or_none()
-        if existing is not None:
-            target = existing["target_snapshot"]
-            resource = self.get_resource(existing["resource_uid"])
-            binding = self.session.execute(select(bindings).where(
-                bindings.c.uid == existing["binding_uid"])).mappings().one()
-            if (existing["source_type"] != "direct" or existing["action"] != "create"
-                    or existing["request_digest"] != canonical_digest({"action": "create",
-                        "input": normalized_input, "target": target})
-                    or target["connectionId"] != str(connection_uid)
-                    or target["driverId"] != driver_id or target["pluginId"] != plugin_id
-                    or target["pluginVersion"] != plugin_version
-                    or target["externalIdentity"]["externalKey"] != external_key
-                    or target["locator"] != locator or binding["external_identity"] != identity_evidence
-                    or resource["resource_type"] != resource_type or resource["attributes"] != attributes
-                    or existing["normalized_input"] != normalized_input):
+        saved_request = self.session.execute(select(request_keys).where(and_(
+            request_keys.c.server_scope == server_scope, request_keys.c.entrypoint == CREATE_ENTRYPOINT,
+            request_keys.c.request_id == request_id))).mappings().one_or_none()
+        if saved_request is not None:
+            if saved_request["request_digest"] != request_digest:
                 raise RequestConflict(request_id)
-            return dict(existing)
+            return self.get_operation(saved_request["result_uid"])
+        existing = self.session.execute(select(operations.c.uid).where(and_(
+            operations.c.server_scope == server_scope, operations.c.request_id == request_id))).first()
+        if existing is not None:
+            raise RequestConflict(request_id)
         self._handler(plugin_id, plugin_version, driver_id, "create")
         connection = self._connection(connection_uid)
         if (not external_key or not isinstance(locator, dict) or not isinstance(identity_evidence, dict)
@@ -117,13 +116,17 @@ class ResourceService:
         resource, binding = self._bind(connection=connection, resource_type=resource_type,
             driver_id=driver_id, external_key=external_key, locator=locator,
             identity_evidence=identity_evidence, attributes=attributes, provisional=True)
-        return OperationAdmissionRepository(self.session).create(
+        operation = OperationAdmissionRepository(self.session).create(
             server_scope=server_scope, request_id=request_id, correlation_id=correlation_id,
             source_type="direct", resource_uid=resource["uid"], binding_uid=binding["uid"],
             binding_revision=binding["revision"], connection_uid=connection_uid,
             connection_revision=connection["revision"], plugin_id=plugin_id,
             plugin_version=plugin_version, driver_id=driver_id,
             action="create", normalized_input=normalized_input)
+        self.session.execute(insert(request_keys).values(server_scope=server_scope,
+            entrypoint=CREATE_ENTRYPOINT, request_id=request_id, request_digest=request_digest,
+            result_kind="Operation", result_uid=operation["uid"], created_at=utc_now()))
+        return operation
 
     def execute(self, resource_uid, *, action, normalized_input, plugin_id,
                 plugin_version, server_scope, request_id, correlation_id):
@@ -147,7 +150,7 @@ class ResourceService:
         binding = self.session.execute(select(bindings).where(and_(
             bindings.c.resource_uid == resource_uid, bindings.c.active.is_(True)))).mappings().one()
         connection = self._connection(binding["connection_uid"])
-        handler = self._handler(plugin_id, plugin_version, resource["driver_id"], action)
+        self._handler(plugin_id, plugin_version, resource["driver_id"], action)
         return OperationAdmissionRepository(self.session).create(
             server_scope=server_scope, request_id=request_id, correlation_id=correlation_id,
             source_type="direct", resource_uid=resource_uid, binding_uid=binding["uid"],
@@ -155,7 +158,7 @@ class ResourceService:
             connection_revision=connection["revision"], plugin_id=plugin_id,
             plugin_version=plugin_version, driver_id=resource["driver_id"],
             action=action, normalized_input=normalized_input,
-            is_mutating=action not in handler.read_only_actions)
+            is_mutating=self.registry.is_mutating(plugin_id, plugin_version, resource["driver_id"], action))
 
     def get_resource(self, uid):
         row = self.session.execute(select(resources).where(resources.c.uid == uid)).mappings().one_or_none()

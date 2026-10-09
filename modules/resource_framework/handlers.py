@@ -20,18 +20,29 @@ class OutcomeUnknown(Exception):
 class HandlerRegistry:
     def __init__(self):
         self._handlers = {}
+        self._read_only_actions = {}
 
     def register(self, plugin_id, plugin_version, driver_id, handler):
         key = (plugin_id, plugin_version, driver_id)
         if key in self._handlers:
             raise ValueError("重复的插件驱动版本")
+        read_only = getattr(handler, "read_only_actions", frozenset())
+        if (not isinstance(read_only, (set, frozenset, list, tuple))
+                or any(not isinstance(action, str) or not action for action in read_only)
+                or not set(read_only).issubset(handler.actions)):
+            raise ValueError("只读动作声明必须是已支持动作的子集")
         self._handlers[key] = handler
+        self._read_only_actions[key] = frozenset(read_only)
 
     def get(self, plugin_id, plugin_version, driver_id):
         try:
             return self._handlers[(plugin_id, plugin_version, driver_id)]
         except KeyError:
             raise ValueError("插件或驱动版本不可用") from None
+
+    def is_mutating(self, plugin_id, plugin_version, driver_id, action):
+        self.get(plugin_id, plugin_version, driver_id)
+        return action not in self._read_only_actions[(plugin_id, plugin_version, driver_id)]
 
 
 class FakeHandler:

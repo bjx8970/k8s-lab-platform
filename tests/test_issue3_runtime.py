@@ -1,17 +1,23 @@
 """P2 resource execution and crash-recovery acceptance on disposable PostgreSQL."""
 
 import os
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
-from sqlalchemy import create_engine, delete, event, select, update
+from sqlalchemy import and_, create_engine, delete, event, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from migrations.runner import run_migrations
-from modules.control_plane.repositories import LeaseLost, OperationExecutorRepository, RequestConflict
-from modules.control_plane.tables import bindings, connections, operations, resources
+from modules.control_plane.repositories import (
+    LeaseLost, OperationAdmissionRepository, OperationExecutorRepository, RequestConflict,
+    UnknownOperationBlocked, canonical_digest,
+)
+from modules.control_plane.tables import bindings, connections, operations, request_keys, resources
 from modules.resource_framework.handlers import ExecutionResult, FakeHandler, HandlerRegistry
 from modules.resource_framework.runtime import OperationWorker
 from modules.resource_framework.service import ResourceService
@@ -26,6 +32,30 @@ class FakeHandlerTests(unittest.TestCase):
         self.assertEqual("pending_external", fake.execute(target, "create", {}).phase)
         self.assertEqual("succeeded", fake.poll(target, "job-1", {}).phase)
         self.assertEqual([("execute", "r", "create"), ("poll", "r", "job-1")], fake.calls)
+
+    def test_missing_read_only_declaration_defaults_to_mutating(self):
+        handler = SimpleNamespace(actions={"start"}, execute=lambda *_: None, poll=lambda *_: None)
+        registry = HandlerRegistry()
+        registry.register("minimal", "1", "minimal.vm/v1", handler)
+        self.assertTrue(registry.is_mutating("minimal", "1", "minimal.vm/v1", "start"))
+
+    def test_invalid_read_only_declaration_is_rejected_at_registration(self):
+        for declaration in ("observe", None, ["undeclared"], [True]):
+            with self.subTest(declaration=declaration):
+                registry = HandlerRegistry()
+                handler = SimpleNamespace(actions={"observe"}, read_only_actions=declaration)
+                with self.assertRaises(ValueError):
+                    registry.register("invalid", "1", "invalid.vm/v1", handler)
+                with self.assertRaises(ValueError):
+                    registry.get("invalid", "1", "invalid.vm/v1")
+
+    def test_read_only_actions_are_frozen_at_registration(self):
+        handler = SimpleNamespace(actions={"start", "observe"}, read_only_actions={"observe"})
+        registry = HandlerRegistry()
+        registry.register("fixed", "1", "fixed.vm/v1", handler)
+        handler.read_only_actions.add("start")
+        self.assertTrue(registry.is_mutating("fixed", "1", "fixed.vm/v1", "start"))
+        self.assertFalse(registry.is_mutating("fixed", "1", "fixed.vm/v1", "observe"))
 
 
 @unittest.skipUnless(os.getenv("K8S_LAB_TEST_POSTGRES_URL"), "需要一次性 PostgreSQL")
@@ -71,6 +101,8 @@ class Issue3PostgresTests(unittest.TestCase):
         with Session(self.engine) as session, session.begin():
             resource_ids = session.execute(select(bindings.c.resource_uid).where(
                 bindings.c.connection_uid == self.connection_uid)).scalars().all()
+            operation_ids = select(operations.c.uid).where(operations.c.connection_uid == self.connection_uid)
+            session.execute(delete(request_keys).where(request_keys.c.result_uid.in_(operation_ids)))
             session.execute(delete(operations).where(operations.c.connection_uid == self.connection_uid))
             session.execute(delete(bindings).where(bindings.c.connection_uid == self.connection_uid))
             if resource_ids:
@@ -106,6 +138,8 @@ class Issue3PostgresTests(unittest.TestCase):
         with Session(self.engine) as session:
             self.assertEqual(0, len(session.execute(select(operations.c.uid).where(
                 operations.c.request_id == key)).all()))
+            self.assertIsNone(session.execute(select(request_keys).where(
+                request_keys.c.request_id == key)).first())
         op = self.create(request_id=key, external_key=external)
         replay = self.create(request_id=key, external_key=external)
         self.assertEqual(op["uid"], replay["uid"])
@@ -147,6 +181,49 @@ class Issue3PostgresTests(unittest.TestCase):
                 request_id=key, correlation_id="replayed")
         self.assertEqual(op["uid"], replay["uid"])
         self.assertEqual(op["correlation_id"], replay["correlation_id"])
+        self.assertEqual([], self.fake.calls)
+
+    def test_create_replay_uses_frozen_request_after_registration_metadata_changes(self):
+        key, external = uuid4().hex, uuid4().hex
+        op = self.create(request_id=key, external_key=external)
+        self.fake.execute_results = [ExecutionResult("succeeded", existence_state="present")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(resources).where(resources.c.uid == op["resource_uid"])
+                .values(attributes={"image": "new", "label": "updated"}, revision=2))
+            session.execute(update(bindings).where(bindings.c.uid == op["binding_uid"])
+                .values(external_identity={"source": "new evidence"}, revision=2, locator={"node": "n2"}))
+        replay = self.create(request_id=key, external_key=external)
+        self.assertEqual(op["uid"], replay["uid"])
+        self.assertEqual(op["correlation_id"], replay["correlation_id"])
+        with Session(self.engine) as session:
+            saved = session.execute(select(request_keys).where(
+                request_keys.c.result_uid == op["uid"])).mappings().one()
+        self.assertEqual(canonical_digest({"connectionId": str(self.connection_uid),
+            "resourceType": "compute.vm/v1", "pluginId": "fake", "pluginVersion": "1",
+            "driverId": "fake.vm/v1", "externalKey": external, "locator": {"node": "n1"},
+            "identityEvidence": {"source": "test"}, "attributes": {"image": "x"},
+            "input": {"image": "x"}}), saved["request_digest"])
+        self.assertEqual(1, len(self.fake.calls))
+
+    def test_create_request_digest_covers_all_admission_parameters(self):
+        key, external = uuid4().hex, uuid4().hex
+        op = self.create(request_id=key, external_key=external)
+        params = dict(connection_uid=self.connection_uid, resource_type="compute.vm/v1",
+            plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+            external_key=external, locator={"node": "n1"}, identity_evidence={"source": "test"},
+            attributes={"image": "x"}, normalized_input={"image": "x"},
+            server_scope="test/issue3", request_id=key, correlation_id="new-correlation")
+        changes = {"connection_uid": uuid4(), "resource_type": "compute.other/v1",
+            "plugin_id": "other", "plugin_version": "2", "driver_id": "other.vm/v1",
+            "external_key": "other", "locator": {"node": "n2"},
+            "identity_evidence": {"source": "changed"}, "attributes": {"image": "y"},
+            "normalized_input": {"image": "y"}}
+        for field, value in changes.items():
+            with self.subTest(field=field), Session(self.engine) as session, session.begin():
+                with self.assertRaises(RequestConflict):
+                    ResourceService(session, self.registry).create(**{**params, field: value})
+        self.assertEqual("pending", self.read(op["uid"])["phase"])
         self.assertEqual([], self.fake.calls)
 
     def test_registration_identity_scoped_by_domain(self):
@@ -220,6 +297,124 @@ class Issue3PostgresTests(unittest.TestCase):
                 bindings.c.uid == op["binding_uid"])).mappings().one()
         self.assertFalse(old_binding["active"])
         self.assertIsNotNone(old_binding["closed_at"])
+
+    def test_unknown_blocks_new_direct_and_plan_mutations_but_allows_replay_and_observe(self):
+        op = self.create()
+        self.fake.execute_results = [RuntimeError("uncertain submission")]
+        self.worker.run_once()
+        self.assertEqual("unknown", self.read(op["uid"])["phase"])
+        with Session(self.engine) as session, session.begin():
+            replay = OperationAdmissionRepository(session).create(
+                server_scope=op["server_scope"], request_id=op["request_id"],
+                action=op["action"], normalized_input=op["normalized_input"],
+                plugin_id=op["plugin_id"], plugin_version=op["plugin_version"],
+                driver_id=op["driver_id"], resource_uid=op["resource_uid"],
+                binding_uid=op["binding_uid"], binding_revision=op["binding_revision"],
+                connection_uid=op["connection_uid"], connection_revision=op["connection_revision"],
+                source_type="direct", correlation_id="replayed")
+            self.assertEqual(op["uid"], replay["uid"])
+        for action in ("start", "stop", "create", "delete"):
+            with self.subTest(action=action), Session(self.engine) as session, session.begin():
+                with self.assertRaises(UnknownOperationBlocked):
+                    OperationAdmissionRepository(session).create(server_scope="plan/test",
+                        request_id=uuid4().hex, action=action, normalized_input={},
+                        plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                        resource_uid=op["resource_uid"], binding_uid=op["binding_uid"],
+                        binding_revision=op["binding_revision"], connection_uid=op["connection_uid"],
+                        connection_revision=op["connection_revision"], source_type="plan",
+                        correlation_id="plan", operation_key=uuid4().hex, attempt=0)
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            with self.assertRaises(UnknownOperationBlocked):
+                service.execute(op["resource_uid"], action="stop", normalized_input={},
+                    plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                    request_id=uuid4().hex, correlation_id="blocked")
+            observation = service.execute(op["resource_uid"], action="observe", normalized_input={},
+                plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                request_id=uuid4().hex, correlation_id="observe")
+        self.assertFalse(observation["is_mutating"])
+        with Session(self.engine) as session:
+            count = session.scalar(select(func.count()).select_from(operations).where(and_(
+                operations.c.resource_uid == op["resource_uid"], operations.c.is_mutating.is_(True))))
+        self.assertEqual(1, count)
+        self.assertEqual(1, len(self.fake.calls))
+
+    def test_unknown_blocks_two_concurrent_admissions(self):
+        op = self.create()
+        self.fake.execute_results = [RuntimeError("uncertain submission")]
+        self.worker.run_once()
+        ready = threading.Barrier(2)
+
+        def admit(action):
+            ready.wait(timeout=5)
+            with Session(self.engine) as session, session.begin():
+                try:
+                    ResourceService(session, self.registry).execute(op["resource_uid"],
+                        action=action, normalized_input={}, plugin_id="fake", plugin_version="1",
+                        server_scope="test/issue3", request_id=uuid4().hex, correlation_id="racing")
+                except UnknownOperationBlocked:
+                    return "blocked"
+            return "admitted"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(admit, ("start", "stop")))
+        self.assertEqual(["blocked", "blocked"], outcomes)
+        with Session(self.engine) as session:
+            rows = session.execute(select(operations.c.uid).where(
+                operations.c.resource_uid == op["resource_uid"])).scalars().all()
+        self.assertEqual([op["uid"]], rows)
+
+    def test_unknown_transition_serializes_with_new_admission(self):
+        from sqlalchemy.exc import DBAPIError
+
+        op = self.create()
+        with Session(self.engine) as session, session.begin():
+            claim = OperationExecutorRepository(session).claim(op["uid"], worker_id="uncertain",
+                lease_until=datetime.now(timezone.utc) + timedelta(minutes=1))
+
+        def admit_while_locked():
+            try:
+                with Session(self.engine) as session, session.begin():
+                    session.execute(text("SET LOCAL lock_timeout = '250ms'"))
+                    OperationAdmissionRepository(session).create(server_scope="test/issue3",
+                        request_id=uuid4().hex, action="stop", normalized_input={},
+                        plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                        resource_uid=op["resource_uid"], binding_uid=op["binding_uid"],
+                        binding_revision=op["binding_revision"], connection_uid=op["connection_uid"],
+                        connection_revision=op["connection_revision"], source_type="direct",
+                        correlation_id="racing")
+            except DBAPIError as exc:
+                return exc.orig.args[0]["C"]
+            return "admitted"
+
+        with Session(self.engine) as session, session.begin():
+            OperationExecutorRepository(session).update_execution(op["uid"], worker_id="uncertain",
+                claim_revision=claim["claim_revision"], phase="unknown")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                outcome = pool.submit(admit_while_locked).result(timeout=5)
+            self.assertEqual("55P03", outcome)
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaises(UnknownOperationBlocked):
+                ResourceService(session, self.registry).execute(op["resource_uid"],
+                    action="stop", normalized_input={}, plugin_id="fake", plugin_version="1",
+                    server_scope="test/issue3", request_id=uuid4().hex, correlation_id="after-commit")
+
+    def test_handler_without_read_only_actions_admits_as_mutating(self):
+        handler = SimpleNamespace(actions={"start"}, execute=self.fake.execute, poll=self.fake.poll)
+        self.registry.register("minimal", "1", "fake.vm/v1", handler)
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            resource = service.register(connection_uid=self.connection_uid,
+                resource_type="compute.vm/v1", plugin_id="minimal", plugin_version="1",
+                driver_id="fake.vm/v1", external_key=uuid4().hex, locator={},
+                identity_evidence={"source": "test"})
+            operation = service.execute(resource["uid"], action="start", normalized_input={},
+                plugin_id="minimal", plugin_version="1", server_scope="test/issue3",
+                request_id=uuid4().hex, correlation_id="minimal")
+        self.assertTrue(operation["is_mutating"])
+        self.fake.execute_results = [ExecutionResult("succeeded")]
+        self.worker.run_once()
+        self.assertEqual("succeeded", self.read(operation["uid"])["phase"])
 
     def test_mutating_operation_is_serial_per_resource(self):
         op = self.create()

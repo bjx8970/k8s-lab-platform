@@ -24,6 +24,7 @@ UQ_MUTATION = "uq_rf_operation_mutation"
 class ResourceVersionConflict(RuntimeError): pass
 class RequestConflict(RuntimeError): pass
 class LeaseLost(RuntimeError): pass
+class UnknownOperationBlocked(RuntimeError): pass
 
 
 def canonical_digest(value):
@@ -210,6 +211,19 @@ class OperationAdmissionRepository:
 
         snapshot=self._resolve_target(resource_uid, binding_uid, binding_revision, connection_uid,
             connection_revision, driver_id, plugin_id, plugin_version, require_active=True)
+        existing=self.session.execute(select(operations).where(and_(operations.c.server_scope==server_scope,
+            operations.c.request_id==request_id))).mappings().one_or_none()
+        if existing: return _replay_check(existing, request_id)
+        if source_type=="plan":
+            plan_existing=self.session.execute(select(operations).where(and_(
+                operations.c.operation_key==operation_key, operations.c.attempt==attempt))).mappings().one_or_none()
+            if plan_existing: return _replay_check(plan_existing, f"operation_key={operation_key}/attempt={attempt}")
+        if is_mutating:
+            unresolved=self.session.execute(select(operations.c.uid).where(and_(
+                operations.c.resource_uid==resource_uid, operations.c.is_mutating.is_(True),
+                operations.c.phase=="unknown")).limit(1)).scalar_one_or_none()
+            if unresolved is not None:
+                raise UnknownOperationBlocked("Resource 存在尚未核对的 Unknown Operation")
         digest=canonical_digest({"action":action,"input":normalized_input,"target":snapshot})
 
         uid=uid or uuid4()
@@ -264,7 +278,13 @@ class OperationExecutorRepository:
         if row is None: return None
         result=dict(row); _event(self.session,"Operation",uid,result["resource_version"],"MODIFIED"); return result
 
+    def _lock_resource(self, operation_uid):
+        self.session.execute(select(resources.c.uid).where(resources.c.uid==select(
+            operations.c.resource_uid).where(operations.c.uid==operation_uid).scalar_subquery())
+            .with_for_update()).scalar_one_or_none()
+
     def recover_uncertain(self, uid):
+        self._lock_resource(uid)
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
             operations.c.phase=="running",
             or_(operations.c.lease_until.is_(None), operations.c.lease_until<utc_now())))
@@ -338,6 +358,7 @@ class OperationExecutorRepository:
     def update_execution(self,uid,*,worker_id,claim_revision,phase,external_task_ref=_UNSET,exec_data=_UNSET,
                          result=None,error=None,remote_job=None):
         if phase not in EXECUTOR_PHASES: raise ValueError(f"Executor 不允许写入 phase={phase}")
+        if phase=="unknown": self._lock_resource(uid)
         values=dict(phase=phase,resource_version=next_resource_version(),updated_at=utc_now())
         if external_task_ref is not _UNSET: values["external_task_ref"]=external_task_ref
         if exec_data is not _UNSET: values["exec_data"]=exec_data

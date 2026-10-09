@@ -45,6 +45,11 @@ connections = Table("rf_connections", metadata,
  Column("uid",UUID(as_uuid=True),primary_key=True), Column("domain_id",String(255)), Column("connection_type",String(128)),
  Column("secret_version_ref",Text), Column("configuration",JSONB), Column("revision",BIGINT), Column("active",BOOLEAN),
  Column("resource_version",BIGINT), Column("created_at",TIMESTAMP(timezone=True)), Column("updated_at",TIMESTAMP(timezone=True)))
+request_keys = Table("cp_request_keys", metadata,
+ Column("server_scope",String(255),primary_key=True), Column("entrypoint",String(255),primary_key=True),
+ Column("request_id",String(255),primary_key=True), Column("request_digest",String(64)),
+ Column("result_kind",String(64)), Column("result_uid",UUID(as_uuid=True)),
+ Column("created_at",TIMESTAMP(timezone=True)), Column("expires_at",TIMESTAMP(timezone=True)))
 
 
 def next_resource_version():
