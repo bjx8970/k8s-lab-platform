@@ -46,11 +46,15 @@ externalIdentity     ← 由 rf_bindings.external_key 构造
 locator              ← rf_bindings.locator
 ```
 
-digest 基于 `action + normalizedInput + canonical target snapshot` 计算。先按 UID/revision 校验历史关系，再进行 transport/plan 去重；只有确定要创建新 Operation 时才要求 Binding/Connection 仍 active。因此已 retired Binding 上的历史相同请求仍可幂等重放，但不能创建新 Operation。并发插入依赖显式命名的 `uq_rf_operation_transport` 与 `uq_rf_operation_plan_item` 唯一约束分类处理，不吞并 mutating Operation 冲突。
+digest 基于 `action + normalizedInput + canonical target snapshot` 计算。已存在的 transport/plan key 先使用原 Operation 冻结的 snapshot、拆分列和 digest 验证请求，完全一致返回原结果；重放不要求当前 Binding/Connection revision、active 状态或插件仍可用。只有新 Operation 才读取并验证当前 Resource/Binding/Connection，再生成快照；已退役 Binding 不得受理新命令。并发插入依赖显式命名的 `uq_rf_operation_transport` 与 `uq_rf_operation_plan_item` 唯一约束分类处理，不吞并 mutating Operation 冲突。
 
-Executor 用 `leaseOwner + leaseUntil + claimRevision` 领取；每次成功领取递增 claimRevision，全部后续更新比较 owner/revision，旧 claimant 更新为零行即 `LeaseLost`。已保存 externalTaskRef 只 poll；可能已提交但未保存外部标识进入 Unknown，不自动重发。
+create 的完整准入请求另以 `cp_request_keys(entrypoint='resource.create')` 保存不可变摘要，覆盖 connection、资源类型、plugin/driver 版本、externalKey、locator、identityEvidence、attributes 和 normalizedInput；它与 provisional Resource/Binding、Operation 在同一事务提交，且不随日志过期。历史重放只比较首次摘要并返回原 Operation，不读取可变登记字段，也不覆盖首次 correlationId。没有完整摘要的旧 create 不能从当前登记信息猜测原请求，重放返回 RequestConflict。
 
-create admission 同事务预分配 Resource 与 provisional Binding，初始 existenceState=pending。确认创建后转 present/provisional=false；确认未创建转 absent；无法确认转 unknown。unknown 不能释放 allocation。Resource 登记状态 active/closed 与 existenceState 分离。
+新变更 Operation 在 Resource 行锁内检查是否存在 mutating Unknown；未知结果未核对时抛出 UnknownOperationBlocked，拒绝新的 direct/plan 变更。Executor 写入 Unknown 和崩溃恢复使用同一 Resource 行锁；历史请求重放及只读 observe 不受该阻断影响。首版不提供自动解锁或凭新 requestId 绕过阻断的入口。
+
+Executor 用 `leaseOwner + leaseUntil + claimRevision` 领取；每次成功领取递增 claimRevision，全部后续更新比较 owner/revision，旧 claimant 更新为零行即 `LeaseLost`。未提交命令执行前验证当前版本；已保存 externalTaskRef 的 Operation 使用冻结目标继续 poll，不重新提交，旧版插件/凭据暂不可用时保留 ref 与 pending_external 供恢复。可能已提交但未保存外部标识进入 Unknown，不自动重发。
+
+create admission 同事务预分配 Resource 与 provisional Binding，初始 existenceState=pending。create/delete 仅在存在性事实分别确认为 present/absent 时记为 succeeded；不能确认则 Unknown 且保留身份。未提交即取消的 provisional create 确认 absent 后释放 Binding 身份；delete 确认 absent、或无在途/Unknown 操作的显式 unregister，才可退役 Binding。只读 observe 不占用变更 Operation 唯一键，未做采样序号 fencing 前不直接写 Resource 事实。unknown 不能释放 allocation。Resource 登记状态 active/closed 与 existenceState 分离。
 
 ## 删除与 finalizer
 

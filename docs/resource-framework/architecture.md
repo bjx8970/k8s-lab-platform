@@ -191,6 +191,8 @@ create 使用带预分配 UUID 和明确 connection/创建参数的 target；其
 
 ActionDescriptor 定义 name、input_schema、result_schema、是否异步、技术完成条件、支持的取消方式。支持能力只反映实现和后端协议，不结合教师/学生权限，也不动态排除“可能有影响”的操作。
 
+P2 handler 通过 `actions` 声明支持动作，可选 `read_only_actions` 必须是支持动作的字符串子集；未声明时保守视为全部变更动作。HandlerRegistry 注册时验证并冻结只读集合，准入从注册表取得 is_mutating，不接受普通请求自行指定。
+
 ExecutionContext 只提供 operation_id、连接/transport、凭据解析、日志及执行数据保存。没有 authorize、plan、child_operations、dependency_graph、allocation、rollback 等服务。注册表的软件版本依赖仅解决插件加载兼容性，不是资源业务依赖。
 
 ExecutionResult 包含 state、output、error、external_task_ref、exec_data、observed_state（可选）。错误至少包含 code、中文 message、provider_code、details；保留平台拒绝原因，不包装成自行推断的业务结论。
