@@ -84,17 +84,16 @@ class P0PostgresIntegrationTests(unittest.TestCase):
                 f"('{uid}','compute.vm/v1','pve.qemu/v1')")
 
     def _seed_binding(self, uid, resource_uid, connection_uid, domain_id, driver_id, external_key,
-                      active=True, locator=None):
-        active_str = "TRUE" if active else "FALSE"
+                      active=True, locator=None, provisional=False):
         locator_json = json.dumps(locator if locator is not None else {"node": "pve1"})
         with self.engine.begin() as c:
             c.execute(text(
                 "INSERT INTO rf_bindings(uid,resource_uid,connection_uid,domain_id,driver_id,external_key,"
-                "external_identity,locator,external_identity_digest,active) VALUES "
-                "(:uid,:res,:conn,:domain,:driver,:key,'{}'::jsonb,CAST(:locator AS jsonb),:digest,:active)"),
+                "external_identity,locator,external_identity_digest,active,provisional) VALUES "
+                "(:uid,:res,:conn,:domain,:driver,:key,'{}'::jsonb,CAST(:locator AS jsonb),:digest,:active,:provisional)"),
                 {"uid": uid, "res": resource_uid, "conn": connection_uid, "domain": domain_id,
                  "driver": driver_id, "key": external_key, "locator": locator_json,
-                 "digest": "0" * 64, "active": active})
+                 "digest": "0" * 64, "active": active, "provisional": provisional})
 
     def _seed_env(self, uid, name="e"):
         with self.engine.begin() as c:
@@ -395,7 +394,8 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         conn_id, res_id, bind_id = uuid4(), uuid4(), uuid4()
         self._seed_connection(conn_id, domain_id)
         self._seed_resource(res_id)
-        self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-plan")
+        self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-plan",
+                           provisional=True)
         key = "env/uid/intent/1/plan/puid/item/create-vm"
 
         def _plan_op(session, request_id, correlation_id):
@@ -476,7 +476,8 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         conn_id, res_id, bind_id = uuid4(), uuid4(), uuid4()
         self._seed_connection(conn_id, domain_id)
         self._seed_resource(res_id)
-        self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-pext")
+        self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-pext",
+                           provisional=True)
         op_id = uuid4()
         with Session(self.engine) as session, session.begin():
             self._create_direct_op(session, resource_uid=res_id, binding_uid=bind_id,
@@ -520,7 +521,8 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         conn_id, res_id, bind_id = uuid4(), uuid4(), uuid4()
         self._seed_connection(conn_id, domain_id)
         self._seed_resource(res_id)
-        self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-extref")
+        self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-extref",
+                           provisional=True)
         op_id = uuid4()
         with Session(self.engine) as session, session.begin():
             self._create_direct_op(session, resource_uid=res_id, binding_uid=bind_id,

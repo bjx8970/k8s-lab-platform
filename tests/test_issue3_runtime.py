@@ -124,6 +124,88 @@ class Issue3PostgresTests(unittest.TestCase):
         with Session(self.engine) as session:
             return ResourceService(session, self.registry).get_operation(uid)
 
+    def test_execute_rejects_create_on_registered_and_provisional_resources(self):
+        provisional = self.create()
+        with Session(self.engine) as session, session.begin():
+            registered = ResourceService(session, self.registry).register(
+                connection_uid=self.connection_uid, resource_type="compute.vm/v1",
+                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                external_key=uuid4().hex, locator={}, identity_evidence={"source": "test"})
+        for resource_uid, request_id in ((registered["uid"], uuid4().hex),
+                (provisional["resource_uid"], uuid4().hex),
+                (provisional["resource_uid"], provisional["request_id"])):
+            with self.subTest(resource_uid=resource_uid, request_id=request_id):
+                with Session(self.engine) as session, session.begin():
+                    with self.assertRaisesRegex(ValueError, "专用资源创建入口"):
+                        ResourceService(session, self.registry).execute(resource_uid,
+                            action="create", normalized_input={"image": "x"},
+                            plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                            request_id=request_id, correlation_id="rejected")
+        with Session(self.engine) as session:
+            operation_ids = session.execute(select(operations.c.uid).where(
+                operations.c.connection_uid == self.connection_uid)).scalars().all()
+            request_ids = session.execute(select(request_keys.c.result_uid).where(
+                request_keys.c.result_uid.in_(operation_ids))).scalars().all()
+        self.assertEqual([provisional["uid"]], operation_ids)
+        self.assertEqual([provisional["uid"]], request_ids)
+        self.assertEqual([], self.fake.calls)
+
+    def test_repository_rejects_create_without_pending_provisional_identity(self):
+        states = [("pending", "pending", False, True), ("present", "pending", True, True),
+            ("absent", "pending", True, True), ("unknown", "pending", True, True),
+            ("pending", "present", True, True), ("pending", "absent", True, True),
+            ("pending", "unknown", True, True), ("pending", "pending", True, False)]
+        for source_type in ("direct", "plan"):
+            for resource_state, binding_state, provisional, mutating in states:
+                with self.subTest(source=source_type, states=(resource_state, binding_state, provisional, mutating)):
+                    with Session(self.engine) as session, session.begin():
+                        service = ResourceService(session, self.registry)
+                        connection = service._connection(self.connection_uid)
+                        resource, binding = service._bind(connection=connection,
+                            resource_type="compute.vm/v1", driver_id="fake.vm/v1", external_key=uuid4().hex,
+                            locator={}, identity_evidence={"source": "test"}, attributes={}, provisional=provisional)
+                        session.execute(update(resources).where(resources.c.uid == resource["uid"])
+                            .values(existence_state=resource_state))
+                        session.execute(update(bindings).where(bindings.c.uid == binding["uid"])
+                            .values(existence_state=binding_state))
+                        with self.assertRaisesRegex(ValueError, "provisional Binding"):
+                            OperationAdmissionRepository(session).create(server_scope="test/issue3",
+                                request_id=uuid4().hex, action="create", normalized_input={},
+                                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                                resource_uid=resource["uid"], binding_uid=binding["uid"], binding_revision=1,
+                                connection_uid=self.connection_uid, connection_revision=1,
+                                source_type=source_type, correlation_id="rejected", is_mutating=mutating,
+                                operation_key=uuid4().hex if source_type == "plan" else None,
+                                attempt=0 if source_type == "plan" else None)
+                        self.assertEqual(0, session.scalar(select(func.count()).select_from(operations)
+                            .where(operations.c.resource_uid == resource["uid"])))
+        self.assertEqual([], self.fake.calls)
+
+    def test_preallocated_plan_create_succeeds_and_replays_after_completion(self):
+        request_id, operation_key = uuid4().hex, uuid4().hex
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            resource, binding = service._bind(connection=service._connection(self.connection_uid),
+                resource_type="compute.vm/v1", driver_id="fake.vm/v1", external_key=uuid4().hex,
+                locator={}, identity_evidence={"source": "plan"}, attributes={}, provisional=True)
+            params = dict(server_scope="test/plan", action="create", normalized_input={},
+                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                resource_uid=resource["uid"], binding_uid=binding["uid"], binding_revision=1,
+                connection_uid=self.connection_uid, connection_revision=1, source_type="plan",
+                correlation_id="plan-first", operation_key=operation_key, attempt=0)
+            operation = OperationAdmissionRepository(session).create(request_id=request_id, **params)
+        self.fake.execute_results = [ExecutionResult("succeeded", existence_state="present")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            current_binding = session.execute(select(bindings).where(bindings.c.uid == binding["uid"])).mappings().one()
+            self.assertFalse(current_binding["provisional"])
+            first_replay = OperationAdmissionRepository(session).create(request_id=request_id, **params)
+            second_replay = OperationAdmissionRepository(session).create(request_id=uuid4().hex, **params)
+            self.assertEqual(operation["uid"], first_replay["uid"])
+            self.assertEqual(operation["uid"], second_replay["uid"])
+            self.assertEqual("succeeded", second_replay["phase"])
+        self.assertEqual(1, len(self.fake.calls))
+
     def test_create_is_atomic_and_replay_does_not_duplicate_resource(self):
         key, external = uuid4().hex, uuid4().hex
         with self.assertRaisesRegex(RuntimeError, "rollback"):
@@ -415,6 +497,81 @@ class Issue3PostgresTests(unittest.TestCase):
         self.fake.execute_results = [ExecutionResult("succeeded")]
         self.worker.run_once()
         self.assertEqual("succeeded", self.read(operation["uid"])["phase"])
+
+    def _assert_direct_plan_lock_order(self, plan_is_mutating):
+        with Session(self.engine) as session, session.begin():
+            resource = ResourceService(session, self.registry).register(
+                connection_uid=self.connection_uid, resource_type="compute.vm/v1",
+                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                external_key=uuid4().hex, locator={}, identity_evidence={"source": "test"})
+            binding = session.execute(select(bindings).where(
+                bindings.c.resource_uid == resource["uid"])).mappings().one()
+        resource_locked, direct_ready, plan_finished = (threading.Event() for _ in range(3))
+
+        class SynchronizedService(ResourceService):
+            def _handler(service, *args):
+                handler = super()._handler(*args)
+                direct_ready.set()
+                if not plan_finished.wait(timeout=5):
+                    raise RuntimeError("plan admission 未能完成")
+                return handler
+
+        def plan_admission():
+            try:
+                with Session(self.engine) as session, session.begin():
+                    session.execute(text("SET LOCAL lock_timeout = '1s'"))
+                    session.execute(select(resources.c.uid).where(
+                        resources.c.uid == resource["uid"]).with_for_update())
+                    resource_locked.set()
+                    if not direct_ready.wait(timeout=5):
+                        raise RuntimeError("direct admission 未开始")
+                    operation = OperationAdmissionRepository(session).create(
+                        server_scope="test/plan", request_id=uuid4().hex,
+                        action="start" if plan_is_mutating else "observe", normalized_input={},
+                        plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                        resource_uid=resource["uid"], binding_uid=binding["uid"], binding_revision=1,
+                        connection_uid=self.connection_uid, connection_revision=1,
+                        source_type="plan", correlation_id="plan", operation_key=uuid4().hex,
+                        attempt=0, is_mutating=plan_is_mutating)
+                return operation["uid"]
+            finally:
+                plan_finished.set()
+
+        def direct_admission():
+            if not resource_locked.wait(timeout=5):
+                raise RuntimeError("plan Resource 行锁未获取")
+            try:
+                with Session(self.engine) as session, session.begin():
+                    session.execute(text("SET LOCAL lock_timeout = '1s'"))
+                    operation = SynchronizedService(session, self.registry).execute(resource["uid"],
+                        action="stop", normalized_input={}, plugin_id="fake", plugin_version="1",
+                        server_scope="test/issue3", request_id=uuid4().hex, correlation_id="direct")
+                return operation["uid"]
+            except IntegrityError as exc:
+                if exc.orig.args[0]["n"] != "uq_rf_operation_mutation":
+                    raise
+                return "mutation-conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            plan_future = pool.submit(plan_admission)
+            direct_future = pool.submit(direct_admission)
+            plan_uid = plan_future.result(timeout=10)
+            direct_result = direct_future.result(timeout=10)
+        if plan_is_mutating:
+            self.assertEqual("mutation-conflict", direct_result)
+        else:
+            self.assertNotEqual(plan_uid, direct_result)
+        with Session(self.engine) as session:
+            mutating_count = session.scalar(select(func.count()).select_from(operations).where(and_(
+                operations.c.resource_uid == resource["uid"], operations.c.is_mutating.is_(True))))
+        self.assertEqual(1, mutating_count)
+        self.assertEqual([], self.fake.calls)
+
+    def test_direct_and_read_only_plan_admission_follow_the_same_lock_order(self):
+        self._assert_direct_plan_lock_order(plan_is_mutating=False)
+
+    def test_direct_and_mutating_plan_admission_preserve_mutex_without_deadlock(self):
+        self._assert_direct_plan_lock_order(plan_is_mutating=True)
 
     def test_mutating_operation_is_serial_per_resource(self):
         op = self.create()

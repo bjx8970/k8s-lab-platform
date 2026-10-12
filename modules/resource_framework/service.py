@@ -130,6 +130,8 @@ class ResourceService:
 
     def execute(self, resource_uid, *, action, normalized_input, plugin_id,
                 plugin_version, server_scope, request_id, correlation_id):
+        if action == "create":
+            raise ValueError("create 必须使用专用资源创建入口")
         self._input(normalized_input)
         existing = self.session.execute(select(operations).where(and_(
             operations.c.server_scope == server_scope,
@@ -149,7 +151,8 @@ class ResourceService:
             raise ValueError("Resource 已关闭登记")
         binding = self.session.execute(select(bindings).where(and_(
             bindings.c.resource_uid == resource_uid, bindings.c.active.is_(True)))).mappings().one()
-        connection = self._connection(binding["connection_uid"])
+        connection = self.session.execute(select(connections).where(
+            connections.c.uid == binding["connection_uid"])).mappings().one()
         self._handler(plugin_id, plugin_version, resource["driver_id"], action)
         return OperationAdmissionRepository(self.session).create(
             server_scope=server_scope, request_id=request_id, correlation_id=correlation_id,

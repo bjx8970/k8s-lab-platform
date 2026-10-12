@@ -9,6 +9,9 @@ pip install -r requirements.txt
 #   venv\Scripts\activate; pip install simple-websocket
 python app.py            # Flask dev at :5000 (with flask-socketio threading mode)
 # Production: set FLASK_SECRET_KEY=...; python run.py  (generates .secret_key on first run)
+# Tests (GitHub Actions runs this; needs disposable PostgreSQL):
+#   K8S_LAB_TEST_POSTGRES_URL=... python scripts/run_ci_tests.py   # fails on any skip / 0 tests / missing PG
+#   python -m unittest discover -s tests -t .                      # local runs may skip PostgreSQL suites
 ```
 
 ## Architecture
