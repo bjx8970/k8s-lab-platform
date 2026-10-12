@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -291,6 +292,21 @@ class OperationExecutorRepository:
             operations.c.resource_uid).where(operations.c.uid==operation_uid).scalar_subquery())
             .with_for_update()).scalar_one_or_none()
 
+    def _lock_target(self, operation, *, lock_operation):
+        """Lock Resource -> Binding (-> Operation) in admission order and return the locked rows."""
+        resource = self.session.execute(select(resources).where(
+            resources.c.uid == operation["resource_uid"]).with_for_update()).mappings().one_or_none()
+        if resource is None:
+            raise ValueError("Operation 目标 Resource 不存在")
+        binding = self.session.execute(select(bindings).where(
+            bindings.c.uid == operation["binding_uid"]).with_for_update()).mappings().one_or_none()
+        if binding is None:
+            raise ValueError("Operation 目标 Binding 不存在")
+        if lock_operation:
+            self.session.execute(select(operations.c.uid).where(
+                operations.c.uid == operation["uid"]).with_for_update()).scalar_one_or_none()
+        return resource, binding
+
     def recover_uncertain(self, uid):
         self._lock_resource(uid)
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
@@ -315,25 +331,32 @@ class OperationExecutorRepository:
         _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
         return dict(row)
 
-    def _release_cancelled_create(self, operation):
-        if operation["action"]!="create": return
-        is_provisional=self.session.execute(select(bindings.c.provisional).where(
-            bindings.c.uid==operation["binding_uid"])).scalar_one()
-        if not is_provisional: return
-        resource=self.session.execute(update(resources).where(and_(
-            resources.c.uid==operation["resource_uid"],resources.c.existence_state=="pending"))
-            .values(existence_state="absent",resource_version=next_resource_version(),
+    def _release_provisional_identity(self, operation, resource, binding):
+        if operation["action"] != "create" or not binding["provisional"]:
+            return
+        if not binding["active"]:
+            # Binding already retired (e.g. rebind); the external identity is no
+            # longer reserved by this row, so there is nothing to release here.
+            return
+        resource = self.session.execute(update(resources).where(and_(
+            resources.c.uid == operation["resource_uid"],
+            resources.c.existence_state == "pending"))
+            .values(existence_state="absent", resource_version=next_resource_version(),
                 updated_at=utc_now()).returning(resources)).mappings().one_or_none()
-        binding=self.session.execute(update(bindings).where(and_(
-            bindings.c.uid==operation["binding_uid"],
-            bindings.c.revision==operation["binding_revision"],
+        binding = self.session.execute(update(bindings).where(and_(
+            bindings.c.uid == operation["binding_uid"],
             bindings.c.active.is_(True), bindings.c.provisional.is_(True)))
-            .values(active=False,existence_state="absent",closed_at=utc_now(),
+            .values(active=False, existence_state="absent", closed_at=utc_now(),
                 resource_version=next_resource_version()).returning(bindings)).mappings().one_or_none()
-        if binding is None or resource is None:
+        if resource is None or binding is None:
             raise ValueError("provisional create 未确认未提交，不能释放外部身份")
-        _event(self.session,"Binding",binding["uid"],binding["resource_version"],"MODIFIED")
-        _event(self.session,"Resource",resource["uid"],resource["resource_version"],"MODIFIED")
+        _event(self.session, "Resource", resource["uid"], resource["resource_version"], "MODIFIED")
+        _event(self.session, "Binding", binding["uid"], binding["resource_version"], "MODIFIED")
+
+    def _cancelled_pending_row(self, uid):
+        return self.session.execute(select(operations).where(and_(
+            operations.c.uid == uid, operations.c.phase == "cancelled",
+            operations.c.lease_owner.is_(None))).with_for_update()).mappings().one_or_none()
 
     def request_cancel(self, uid):
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
@@ -343,11 +366,17 @@ class OperationExecutorRepository:
                 finished_at=case((operations.c.phase=="pending",utc_now()),else_=operations.c.finished_at),
                 resource_version=next_resource_version(), updated_at=utc_now())
             .returning(operations)).mappings().one_or_none()
-        if row is not None:
-            if row["phase"]=="cancelled": self._release_cancelled_create(row)
-            _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
-            return dict(row)
-        return None
+        if row is None:
+            return None
+        _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+        if row["phase"]=="cancelled":
+            current = self._cancelled_pending_row(uid)
+            if current is None:
+                raise ValueError("provisional create 未确认未提交，不能释放外部身份")
+            resource, binding = self._lock_target(current, lock_operation=True)
+            self._release_provisional_identity(current, resource, binding)
+            return dict(current)
+        return dict(row)
 
     def cancel_before_submit(self, uid, *, worker_id, claim_revision):
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
@@ -357,21 +386,45 @@ class OperationExecutorRepository:
             .values(phase="cancelled", lease_owner=None, lease_until=None,
                 finished_at=utc_now(), resource_version=next_resource_version(), updated_at=utc_now())
             .returning(operations)).mappings().one_or_none()
-        if row is not None:
-            self._release_cancelled_create(row)
-            _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
-            return dict(row)
-        return None
+        if row is None:
+            return None
+        _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+        resource, binding = self._lock_target(row, lock_operation=False)
+        self._release_provisional_identity(row, resource, binding)
+        return dict(row)
+
+    def fail_before_submit(self, operation, *, worker_id, claim_revision, code):
+        """Terminalize an Operation whose external call was rejected before dispatch
+        and release its provisional create identity, holding rows in admission order."""
+        uid = operation["uid"]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", code):
+            raise ValueError("无效错误代码")
+        resource, binding = self._lock_target(operation, lock_operation=True)
+        row = self.session.execute(update(operations).where(and_(
+            operations.c.uid == uid, operations.c.phase == "running",
+            operations.c.external_task_ref.is_(None), operations.c.lease_owner == worker_id,
+            operations.c.claim_revision == claim_revision, operations.c.lease_until > utc_now()))
+            .values(phase="failed", error={"code": code}, finished_at=utc_now(),
+                lease_owner=None, lease_until=None,
+                resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is None:
+            raise LeaseLost(str(uid))
+        _event(self.session, "Operation", uid, row["resource_version"], "MODIFIED")
+        self._release_provisional_identity(operation, resource, binding)
+        return dict(row)
 
     def update_execution(self,uid,*,worker_id,claim_revision,phase,external_task_ref=_UNSET,exec_data=_UNSET,
-                         result=None,error=None,remote_job=None):
+                         result=None,error=_UNSET,clear_error=False,remote_job=None):
         if phase not in EXECUTOR_PHASES: raise ValueError(f"Executor 不允许写入 phase={phase}")
+        if error is not _UNSET and clear_error: raise ValueError("不能同时写入并清空 error")
         if phase=="unknown": self._lock_resource(uid)
         values=dict(phase=phase,resource_version=next_resource_version(),updated_at=utc_now())
         if external_task_ref is not _UNSET: values["external_task_ref"]=external_task_ref
         if exec_data is not _UNSET: values["exec_data"]=exec_data
         if result is not None: values["result"]=result
-        if error is not None: values["error"]=error
+        if error is not _UNSET: values["error"]=error
+        elif clear_error: values["error"]=None
         if remote_job:
             allowed={"remote_job_id","remote_status_path","remote_exit_path","remote_log_path"}
             if set(remote_job)-allowed: raise ValueError("未知远端作业字段")

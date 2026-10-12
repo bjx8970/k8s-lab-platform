@@ -672,30 +672,114 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertIsNone(self.worker.run_once())
 
     def test_changed_connection_fails_before_external_call(self):
-        op = self.create()
+        external = uuid4().hex
+        op = self.create(external_key=external)
         with Session(self.engine) as session, session.begin():
             session.execute(update(connections).where(connections.c.uid == self.connection_uid)
                 .values(revision=2, secret_version_ref="secret/v2"))
         self.worker.run_once()
-        self.assertEqual("failed", self.read(op["uid"])["phase"])
+        failed = self.read(op["uid"])
+        self.assertEqual("failed", failed["phase"])
+        self.assertEqual("TargetRevisionConflict", failed["error"]["code"])
         self.assertEqual([], self.fake.calls)
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            replacement = service.register(connection_uid=self.connection_uid,
+                resource_type="compute.vm/v1", plugin_id="fake", plugin_version="1",
+                driver_id="fake.vm/v1", external_key=external, locator={},
+                identity_evidence={"source": "test"})
+            service.unregister(op["resource_uid"])
+            self.assertNotEqual(op["resource_uid"], replacement["uid"])
+        with Session(self.engine) as session:
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertFalse(binding["active"])
+        self.assertIsNotNone(binding["closed_at"])
 
     def test_changed_binding_fails_before_external_call(self):
-        op = self.create()
+        external = uuid4().hex
+        op = self.create(external_key=external)
         with Session(self.engine) as session, session.begin():
             session.execute(update(bindings).where(bindings.c.uid == op["binding_uid"])
                 .values(revision=2, locator={"node": "n2"}))
         self.worker.run_once()
         self.assertEqual("failed", self.read(op["uid"])["phase"])
+        self.assertEqual("TargetRevisionConflict", self.read(op["uid"])["error"]["code"])
+        with Session(self.engine) as session, session.begin():
+            ResourceService(session, self.registry).unregister(op["resource_uid"])
+            replacement = ResourceService(session, self.registry).register(
+                connection_uid=self.connection_uid, resource_type="compute.vm/v1",
+                plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                external_key=external, locator={}, identity_evidence={"source": "test"})
+        self.assertNotEqual(op["resource_uid"], replacement["uid"])
         self.assertEqual([], self.fake.calls)
 
     def test_missing_plugin_does_not_dispatch_to_another_version(self):
-        op = self.create()
+        external = uuid4().hex
+        op = self.create(external_key=external)
         worker = OperationWorker(self.engine, HandlerRegistry(),
             worker_id="unloaded-" + uuid4().hex, lease_seconds=6)
         worker.run_once()
-        self.assertEqual("failed", self.read(op["uid"])["phase"])
+        failed = self.read(op["uid"])
+        self.assertEqual("failed", failed["phase"])
+        self.assertEqual("PluginUnavailable", failed["error"]["code"])
         self.assertEqual([], self.fake.calls)
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            service.unregister(op["resource_uid"])
+            replacement = service.register(connection_uid=self.connection_uid,
+                resource_type="compute.vm/v1", plugin_id="fake", plugin_version="1",
+                driver_id="fake.vm/v1", external_key=external, locator={},
+                identity_evidence={"source": "test"})
+        self.assertNotEqual(op["resource_uid"], replacement["uid"])
+
+    def test_unknown_create_keeps_provisional_identity(self):
+        op = self.create()
+        self.fake.execute_results = [RuntimeError("uncertain")]
+        self.worker.run_once()
+        unknown = self.read(op["uid"])
+        self.assertEqual("unknown", unknown["phase"])
+        with Session(self.engine) as session:
+            resource = session.execute(select(resources).where(
+                resources.c.uid == op["resource_uid"])).mappings().one()
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertEqual("pending", resource["existence_state"])
+        self.assertTrue(binding["active"])
+        self.assertTrue(binding["provisional"])
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaises(ValueError):
+                ResourceService(session, self.registry).unregister(op["resource_uid"])
+        self.assertEqual(1, len(self.fake.calls))
+
+    def test_poll_recovery_clears_transient_error(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="remote-1")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        missing = OperationWorker(self.engine, HandlerRegistry(), worker_id="missing", lease_seconds=6)
+        missing.run_once()
+        degraded = self.read(op["uid"])
+        self.assertEqual("pending_external", degraded["phase"])
+        self.assertEqual("PluginUnavailable", degraded["error"]["code"])
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        self.fake.poll_results = [ExecutionResult("succeeded", existence_state="present")]
+        self.worker.run_once()
+        final = self.read(op["uid"])
+        self.assertEqual("succeeded", final["phase"])
+        self.assertIsNone(final["error"])
+        self.assertEqual(1, len([call for call in self.fake.calls if call[0] == "execute"]))
+
+    def test_cancel_release_clears_transient_error(self):
+        op = self.create()
+        with Session(self.engine) as session, session.begin():
+            OperationExecutorRepository(session).request_cancel(op["uid"])
+        self.assertIsNone(self.worker.run_once())
+        self.assertEqual("cancelled", self.read(op["uid"])["phase"])
 
     def test_delete_success_releases_binding_and_allows_registration(self):
         external = uuid4().hex
@@ -787,6 +871,66 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertNotEqual(op["resource_uid"], replacement["uid"])
         self.assertEqual("cancelled", self.read(op["uid"])["phase"])
         self.assertEqual([], self.fake.calls)
+
+    def test_cancel_race_with_admission_has_deterministic_outcome_without_deadlock(self):
+        from sqlalchemy.exc import DBAPIError
+
+        op = self.create()
+
+        def cancel():
+            try:
+                with Session(self.engine) as session, session.begin():
+                    session.execute(text("SET LOCAL lock_timeout = '10s'"))
+                    return OperationExecutorRepository(session).request_cancel(op["uid"])
+            except DBAPIError as exc:
+                return exc.orig.args[0].get("C")
+
+        def admit():
+            try:
+                with Session(self.engine) as session, session.begin():
+                    session.execute(text("SET LOCAL lock_timeout = '10s'"))
+                    ResourceService(session, self.registry).execute(op["resource_uid"],
+                        action="start", normalized_input={}, plugin_id="fake", plugin_version="1",
+                        server_scope="test/issue3", request_id=uuid4().hex, correlation_id="race")
+                return "admitted"
+            except (ValueError, IntegrityError):
+                return "rejected"
+            except DBAPIError as exc:
+                return exc.orig.args[0].get("C")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            cancel_future = pool.submit(cancel)
+            admit_future = pool.submit(admit)
+            cancel_result = cancel_future.result(timeout=30)
+            admit_result = admit_future.result(timeout=30)
+        self.assertNotIn(cancel_result, ("40P01", "55P03", None))
+        self.assertIn(admit_result, ("admitted", "rejected"))
+        current = self.read(op["uid"])
+        self.assertEqual("cancelled", current["phase"])
+        with Session(self.engine) as session:
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+            resource = session.execute(select(resources).where(
+                resources.c.uid == op["resource_uid"])).mappings().one()
+            mutating = session.scalar(select(func.count()).select_from(operations).where(and_(
+                operations.c.resource_uid == op["resource_uid"], operations.c.is_mutating.is_(True))))
+        self.assertFalse(binding["active"])
+        self.assertIsNotNone(binding["closed_at"])
+        self.assertEqual("absent", resource["existence_state"])
+        self.assertEqual(2 if admit_result == "admitted" else 1, mutating)
+        self.assertEqual([], self.fake.calls)
+
+    def test_failed_create_request_key_replays_terminal_operation(self):
+        key, external = uuid4().hex, uuid4().hex
+        op = self.create(request_id=key, external_key=external)
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(bindings).where(bindings.c.uid == op["binding_uid"])
+                .values(revision=2))
+        self.worker.run_once()
+        self.assertEqual("failed", self.read(op["uid"])["phase"])
+        replay = self.create(request_id=key, external_key=external)
+        self.assertEqual(op["uid"], replay["uid"])
+        self.assertEqual("failed", replay["phase"])
 
     def test_cancel_during_submission_tracks_actual_success(self):
         op = self.create()

@@ -9,7 +9,7 @@ from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session
 
 from modules.audit import sanitize
-from modules.control_plane.repositories import LeaseLost, OperationExecutorRepository, _event
+from modules.control_plane.repositories import LeaseLost, OperationExecutorRepository, _UNSET, _event
 from modules.control_plane.tables import bindings, connections, next_resource_version, operations, resources, utc_now
 from .handlers import ExecutionResult, OutcomeUnknown
 
@@ -110,9 +110,10 @@ class OperationWorker:
             code = response.error_code
             if code and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", code):
                 code = "ProviderError"
+            clear_transient = response.phase in ("succeeded", "cancelled") and not code
             return repo.update_execution(uid, worker_id=self.worker_id, claim_revision=claim_revision,
                 phase=response.phase, result=result or None,
-                error={"code": code} if code else None, **options)
+                error={"code": code} if code else _UNSET, clear_error=clear_transient, **options)
 
     def run_once(self):
         with Session(self.engine) as session:
@@ -135,18 +136,22 @@ class OperationWorker:
                         valid = self._target_valid(session, op)
                     if not valid:
                         with Session(self.engine) as session, session.begin():
-                            OperationExecutorRepository(session).update_execution(uid,
-                                worker_id=self.worker_id, claim_revision=claim_revision, phase="failed",
-                                error={"code":"TargetRevisionConflict"})
+                            OperationExecutorRepository(session).fail_before_submit(op,
+                                worker_id=self.worker_id, claim_revision=claim_revision,
+                                code="TargetRevisionConflict")
                         return uid
                 try:
                     handler = self.registry.get(op["plugin_id"], op["plugin_version"], op["driver_id"])
                 except ValueError:
                     with Session(self.engine) as session, session.begin():
-                        OperationExecutorRepository(session).update_execution(uid,
-                            worker_id=self.worker_id, claim_revision=claim_revision,
-                            phase="pending_external" if op["external_task_ref"] else "failed",
-                            error={"code":"PluginUnavailable"})
+                        repo = OperationExecutorRepository(session)
+                        if op["external_task_ref"]:
+                            repo.update_execution(uid, worker_id=self.worker_id,
+                                claim_revision=claim_revision, phase="pending_external",
+                                error={"code":"PluginUnavailable"})
+                        else:
+                            repo.fail_before_submit(op, worker_id=self.worker_id,
+                                claim_revision=claim_revision, code="PluginUnavailable")
                     return uid
                 stop, lost = threading.Event(), threading.Event()
                 heartbeat = threading.Thread(target=self._heartbeat,

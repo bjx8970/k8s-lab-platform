@@ -150,9 +150,13 @@ class ResourceService:
         if resource["registration_state"] != "active":
             raise ValueError("Resource 已关闭登记")
         binding = self.session.execute(select(bindings).where(and_(
-            bindings.c.resource_uid == resource_uid, bindings.c.active.is_(True)))).mappings().one()
+            bindings.c.resource_uid == resource_uid, bindings.c.active.is_(True)))).mappings().one_or_none()
+        if binding is None:
+            raise ValueError("Resource 没有可用绑定")
         connection = self.session.execute(select(connections).where(
-            connections.c.uid == binding["connection_uid"])).mappings().one()
+            connections.c.uid == binding["connection_uid"])).mappings().one_or_none()
+        if connection is None:
+            raise ValueError("Resource 没有可用绑定")
         self._handler(plugin_id, plugin_version, resource["driver_id"], action)
         return OperationAdmissionRepository(self.session).create(
             server_scope=server_scope, request_id=request_id, correlation_id=correlation_id,
