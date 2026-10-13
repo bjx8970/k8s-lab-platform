@@ -752,6 +752,67 @@ class Issue3PostgresTests(unittest.TestCase):
                 ResourceService(session, self.registry).unregister(op["resource_uid"])
         self.assertEqual(1, len(self.fake.calls))
 
+    def test_failed_poll_without_error_code_replaces_stale_plugin_error(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="remote-1")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        missing = OperationWorker(self.engine, HandlerRegistry(), worker_id="missing", lease_seconds=6)
+        missing.run_once()
+        self.assertEqual("PluginUnavailable", self.read(op["uid"])["error"]["code"])
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        self.fake.poll_results = [ExecutionResult("failed")]
+        self.worker.run_once()
+        result = self.read(op["uid"])
+        self.assertEqual("failed", result["phase"])
+        self.assertEqual({"code": "ProviderFailed"}, result["error"])
+        self.assertEqual("remote-1", result["external_task_ref"])
+        self.assertIsNotNone(result["finished_at"])
+        with Session(self.engine) as session:
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertTrue(binding["active"])
+        self.assertEqual(1, len([call for call in self.fake.calls if call[0] == "execute"]))
+
+    def test_failed_poll_with_error_code_replaces_stale_poll_error(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="remote-1")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        self.fake.poll_results = [RuntimeError("poll temporarily unavailable")]
+        self.worker.run_once()
+        self.assertEqual("PollUnavailable", self.read(op["uid"])["error"]["code"])
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        self.fake.poll_results = [ExecutionResult("failed", error_code="InstallFailed")]
+        self.worker.run_once()
+        result = self.read(op["uid"])
+        self.assertEqual("failed", result["phase"])
+        self.assertEqual({"code": "InstallFailed"}, result["error"])
+        self.assertEqual("remote-1", result["external_task_ref"])
+        self.assertEqual(1, len([call for call in self.fake.calls if call[0] == "execute"]))
+
+    def test_execute_failure_without_error_code_persists_provider_failed(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("failed")]
+        self.worker.run_once()
+        result = self.read(op["uid"])
+        self.assertEqual("failed", result["phase"])
+        self.assertEqual({"code": "ProviderFailed"}, result["error"])
+        with Session(self.engine) as session:
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertTrue(binding["active"])
+        self.assertIsNone(binding["closed_at"])
+        self.assertEqual(1, len(self.fake.calls))
+
     def test_poll_recovery_clears_transient_error(self):
         op = self.create()
         self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="remote-1")]
@@ -872,53 +933,181 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertEqual("cancelled", self.read(op["uid"])["phase"])
         self.assertEqual([], self.fake.calls)
 
-    def test_cancel_race_with_admission_has_deterministic_outcome_without_deadlock(self):
+    def test_pending_cancel_rechecks_phase_after_waiting_for_target_lock(self):
+        op = self.create()
+        target_read = threading.Event()
+
+        class CoordinatedExecutor(OperationExecutorRepository):
+            def _lock_target(repo, operation, *, lock_operation):
+                target_read.set()
+                return super()._lock_target(operation, lock_operation=lock_operation)
+
+        def cancel():
+            with Session(self.engine) as session, session.begin():
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                return CoordinatedExecutor(session).request_cancel(op["uid"])
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with Session(self.engine) as session, session.begin():
+                session.execute(select(resources.c.uid).where(
+                    resources.c.uid == op["resource_uid"]).with_for_update())
+                future = pool.submit(cancel)
+                self.assertTrue(target_read.wait(timeout=5))
+                repo = OperationExecutorRepository(session)
+                claim = repo.claim(op["uid"], worker_id="submitted",
+                    lease_until=datetime.now(timezone.utc) + timedelta(minutes=1))
+                repo.update_execution(op["uid"], worker_id="submitted",
+                    claim_revision=claim["claim_revision"], phase="pending_external",
+                    external_task_ref="remote-1")
+            result = future.result(timeout=10)
+        self.assertEqual("pending_external", result["phase"])
+        self.assertTrue(result["cancellation_requested"])
+        self.assertEqual("remote-1", result["external_task_ref"])
+        with Session(self.engine) as session:
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+            resource = session.execute(select(resources).where(
+                resources.c.uid == op["resource_uid"])).mappings().one()
+        self.assertTrue(binding["active"])
+        self.assertIsNone(binding["closed_at"])
+        self.assertEqual("pending", resource["existence_state"])
+        self.assertEqual([], self.fake.calls)
+
+    def test_cancel_before_submit_rechecks_claim_after_waiting_for_target_lock(self):
+        op = self.create()
+        target_read = threading.Event()
+        with Session(self.engine) as session, session.begin():
+            repo = OperationExecutorRepository(session)
+            old_claim = repo.claim(op["uid"], worker_id="old",
+                lease_until=datetime.now(timezone.utc) + timedelta(minutes=1))
+            repo.request_cancel(op["uid"])
+
+        class CoordinatedExecutor(OperationExecutorRepository):
+            def _lock_target(repo, operation, *, lock_operation):
+                target_read.set()
+                return super()._lock_target(operation, lock_operation=lock_operation)
+
+        def cancel():
+            with Session(self.engine) as session, session.begin():
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                return CoordinatedExecutor(session).cancel_before_submit(op["uid"], worker_id="old",
+                    claim_revision=old_claim["claim_revision"])
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with Session(self.engine) as session, session.begin():
+                session.execute(select(resources.c.uid).where(
+                    resources.c.uid == op["resource_uid"]).with_for_update())
+                future = pool.submit(cancel)
+                self.assertTrue(target_read.wait(timeout=5))
+                session.execute(update(operations).where(operations.c.uid == op["uid"])
+                    .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+                new_claim = OperationExecutorRepository(session).claim(op["uid"], worker_id="new",
+                    lease_until=datetime.now(timezone.utc) + timedelta(minutes=1))
+            result = future.result(timeout=10)
+        self.assertIsNone(result)
+        current = self.read(op["uid"])
+        self.assertEqual("running", current["phase"])
+        self.assertEqual("new", current["lease_owner"])
+        self.assertGreater(new_claim["claim_revision"], old_claim["claim_revision"])
+        with Session(self.engine) as session:
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+            resource = session.execute(select(resources).where(
+                resources.c.uid == op["resource_uid"])).mappings().one()
+        self.assertTrue(binding["active"])
+        self.assertIsNone(binding["closed_at"])
+        self.assertEqual("pending", resource["existence_state"])
+        self.assertEqual([], self.fake.calls)
+
+    def _assert_cancel_admission_lock_order(self, *, before_submit):
         from sqlalchemy.exc import DBAPIError
 
         op = self.create()
+        claim = None
+        if before_submit:
+            with Session(self.engine) as session, session.begin():
+                repo = OperationExecutorRepository(session)
+                claim = repo.claim(op["uid"], worker_id="waiting",
+                    lease_until=datetime.now(timezone.utc) + timedelta(minutes=1))
+                repo.request_cancel(op["uid"])
+        cancel_at_target, admission_locked_target, cancel_lock_requested = (
+            threading.Event() for _ in range(3))
+
+        class CoordinatedExecutor(OperationExecutorRepository):
+            def _lock_target(repo, operation, *, lock_operation):
+                cancel_at_target.set()
+                if not admission_locked_target.wait(timeout=5):
+                    raise RuntimeError("admission 未能取得目标行锁")
+                cancel_lock_requested.set()
+                return super()._lock_target(operation, lock_operation=lock_operation)
+
+        class CoordinatedAdmission(OperationAdmissionRepository):
+            def _resolve_target(repo, *args, **kwargs):
+                snapshot = super()._resolve_target(*args, **kwargs)
+                admission_locked_target.set()
+                if not cancel_lock_requested.wait(timeout=5):
+                    raise RuntimeError("cancel 未请求目标行锁")
+                return snapshot
 
         def cancel():
             try:
                 with Session(self.engine) as session, session.begin():
-                    session.execute(text("SET LOCAL lock_timeout = '10s'"))
-                    return OperationExecutorRepository(session).request_cancel(op["uid"])
+                    session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                    session.execute(text("SET LOCAL statement_timeout = '8s'"))
+                    repo = CoordinatedExecutor(session)
+                    row = repo.cancel_before_submit(op["uid"], worker_id="waiting",
+                        claim_revision=claim["claim_revision"]) if before_submit else repo.request_cancel(op["uid"])
+                    return row["phase"] if row is not None else "not-cancelled"
             except DBAPIError as exc:
                 return exc.orig.args[0].get("C")
 
         def admit():
+            if not cancel_at_target.wait(timeout=5):
+                raise RuntimeError("cancel 未开始目标锁定")
             try:
                 with Session(self.engine) as session, session.begin():
-                    session.execute(text("SET LOCAL lock_timeout = '10s'"))
-                    ResourceService(session, self.registry).execute(op["resource_uid"],
-                        action="start", normalized_input={}, plugin_id="fake", plugin_version="1",
-                        server_scope="test/issue3", request_id=uuid4().hex, correlation_id="race")
+                    session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                    session.execute(text("SET LOCAL statement_timeout = '8s'"))
+                    CoordinatedAdmission(session).create(server_scope="test/issue3",
+                        request_id=uuid4().hex, action="start", normalized_input={},
+                        plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
+                        resource_uid=op["resource_uid"], binding_uid=op["binding_uid"],
+                        binding_revision=op["binding_revision"], connection_uid=op["connection_uid"],
+                        connection_revision=op["connection_revision"], source_type="direct",
+                        correlation_id="race")
                 return "admitted"
-            except (ValueError, IntegrityError):
-                return "rejected"
+            except IntegrityError as exc:
+                self.assertEqual("uq_rf_operation_mutation", exc.orig.args[0].get("n"))
+                return "mutation-conflict"
             except DBAPIError as exc:
                 return exc.orig.args[0].get("C")
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             cancel_future = pool.submit(cancel)
             admit_future = pool.submit(admit)
-            cancel_result = cancel_future.result(timeout=30)
-            admit_result = admit_future.result(timeout=30)
-        self.assertNotIn(cancel_result, ("40P01", "55P03", None))
-        self.assertIn(admit_result, ("admitted", "rejected"))
-        current = self.read(op["uid"])
-        self.assertEqual("cancelled", current["phase"])
+            cancel_result = cancel_future.result(timeout=15)
+            admit_result = admit_future.result(timeout=15)
+        self.assertEqual("cancelled", cancel_result)
+        self.assertEqual("mutation-conflict", admit_result)
+        self.assertEqual("cancelled", self.read(op["uid"])["phase"])
         with Session(self.engine) as session:
             binding = session.execute(select(bindings).where(
                 bindings.c.uid == op["binding_uid"])).mappings().one()
             resource = session.execute(select(resources).where(
                 resources.c.uid == op["resource_uid"])).mappings().one()
-            mutating = session.scalar(select(func.count()).select_from(operations).where(and_(
-                operations.c.resource_uid == op["resource_uid"], operations.c.is_mutating.is_(True))))
+            operation_ids = session.execute(select(operations.c.uid).where(
+                operations.c.resource_uid == op["resource_uid"])).scalars().all()
         self.assertFalse(binding["active"])
         self.assertIsNotNone(binding["closed_at"])
         self.assertEqual("absent", resource["existence_state"])
-        self.assertEqual(2 if admit_result == "admitted" else 1, mutating)
+        self.assertEqual([op["uid"]], operation_ids)
         self.assertEqual([], self.fake.calls)
+
+    def test_pending_cancel_and_admission_use_resource_first_lock_order(self):
+        self._assert_cancel_admission_lock_order(before_submit=False)
+
+    def test_claimed_cancel_and_admission_use_resource_first_lock_order(self):
+        self._assert_cancel_admission_lock_order(before_submit=True)
 
     def test_failed_create_request_key_replays_terminal_operation(self):
         key, external = uuid4().hex, uuid4().hex

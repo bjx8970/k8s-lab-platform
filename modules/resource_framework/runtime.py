@@ -108,7 +108,9 @@ class OperationWorker:
             if response.exec_data:
                 options["exec_data"] = sanitize(response.exec_data)
             code = response.error_code
-            if code and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", code):
+            if response.phase == "failed" and not code:
+                code = "ProviderFailed"
+            elif code and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", code):
                 code = "ProviderError"
             clear_transient = response.phase in ("succeeded", "cancelled") and not code
             return repo.update_execution(uid, worker_id=self.worker_id, claim_revision=claim_revision,

@@ -353,12 +353,11 @@ class OperationExecutorRepository:
         _event(self.session, "Resource", resource["uid"], resource["resource_version"], "MODIFIED")
         _event(self.session, "Binding", binding["uid"], binding["resource_version"], "MODIFIED")
 
-    def _cancelled_pending_row(self, uid):
-        return self.session.execute(select(operations).where(and_(
-            operations.c.uid == uid, operations.c.phase == "cancelled",
-            operations.c.lease_owner.is_(None))).with_for_update()).mappings().one_or_none()
-
     def request_cancel(self, uid):
+        operation=self.session.execute(select(operations).where(operations.c.uid==uid)).mappings().one_or_none()
+        if operation is None:
+            return None
+        resource, binding = self._lock_target(operation, lock_operation=True)
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
             operations.c.phase.in_(("pending","running","pending_external"))))
             .values(cancellation_requested=True,
@@ -370,15 +369,14 @@ class OperationExecutorRepository:
             return None
         _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
         if row["phase"]=="cancelled":
-            current = self._cancelled_pending_row(uid)
-            if current is None:
-                raise ValueError("provisional create 未确认未提交，不能释放外部身份")
-            resource, binding = self._lock_target(current, lock_operation=True)
-            self._release_provisional_identity(current, resource, binding)
-            return dict(current)
+            self._release_provisional_identity(row, resource, binding)
         return dict(row)
 
     def cancel_before_submit(self, uid, *, worker_id, claim_revision):
+        operation=self.session.execute(select(operations).where(operations.c.uid==uid)).mappings().one_or_none()
+        if operation is None:
+            return None
+        resource, binding = self._lock_target(operation, lock_operation=True)
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
             operations.c.phase=="running", operations.c.external_task_ref.is_(None),
             operations.c.cancellation_requested.is_(True), operations.c.lease_owner==worker_id,
@@ -389,7 +387,6 @@ class OperationExecutorRepository:
         if row is None:
             return None
         _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
-        resource, binding = self._lock_target(row, lock_operation=False)
         self._release_provisional_identity(row, resource, binding)
         return dict(row)
 
