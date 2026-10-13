@@ -225,14 +225,24 @@ class OperationAdmissionRepository:
                 operations.c.phase=="unknown")).limit(1)).scalar_one_or_none()
             if unresolved is not None:
                 raise UnknownOperationBlocked("Resource 存在尚未核对的 Unknown Operation")
-        if action=="create":
+        if is_mutating or action=="create":
+            # _resolve_target holds Resource/Binding locks; replay has already returned.
             target_state=self.session.execute(select(resources.c.existence_state,
                 bindings.c.provisional, bindings.c.existence_state.label("binding_existence_state"))
                 .select_from(resources.join(bindings, bindings.c.resource_uid==resources.c.uid))
                 .where(and_(resources.c.uid==resource_uid,bindings.c.uid==binding_uid))).mappings().one()
-            if (not is_mutating or target_state["existence_state"]!="pending"
-                    or not target_state["provisional"] or target_state["binding_existence_state"]!="pending"):
-                raise ValueError("create 必须绑定待创建的 Resource 和 provisional Binding，且必须是变更动作")
+            if action=="create":
+                if (not is_mutating or target_state["existence_state"]!="pending"
+                        or not target_state["provisional"] or target_state["binding_existence_state"]!="pending"):
+                    raise ValueError("create 必须绑定待创建的 Resource 和 provisional Binding，且必须是变更动作")
+                prior_create=self.session.execute(select(operations.c.uid).where(and_(
+                    operations.c.resource_uid==resource_uid, operations.c.action=="create"))
+                    .limit(1)).scalar_one_or_none()
+                if prior_create is not None:
+                    raise UnknownOperationBlocked("Resource 已受理 create，不能在存在性未核对时再次创建")
+            elif (target_state["existence_state"] in ("pending","unknown")
+                    or target_state["binding_existence_state"] in ("pending","unknown")):
+                raise UnknownOperationBlocked("Resource 或 Binding 的外部存在性尚未核对，不能受理新的变更")
         digest=canonical_digest({"action":action,"input":normalized_input,"target":snapshot})
 
         uid=uid or uuid4()

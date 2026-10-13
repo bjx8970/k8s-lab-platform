@@ -461,6 +461,10 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-cancel")
         op_id = uuid4()
         with Session(self.engine) as session, session.begin():
+            session.execute(text("UPDATE rf_resources SET existence_state='present' WHERE uid=:uid"),
+                {"uid": res_id})
+            session.execute(text("UPDATE rf_bindings SET existence_state='present' WHERE uid=:uid"),
+                {"uid": bind_id})
             self._create_direct_op(session, resource_uid=res_id, binding_uid=bind_id,
                 binding_revision=1, connection_uid=conn_id, connection_revision=1,
                 uid=op_id, action="delete", is_mutating=True)

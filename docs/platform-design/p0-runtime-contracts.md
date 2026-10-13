@@ -52,6 +52,8 @@ create 的完整准入请求另以 `cp_request_keys(entrypoint='resource.create'
 
 新变更 Operation 在 Resource 行锁内检查是否存在 mutating Unknown；未知结果未核对时抛出 UnknownOperationBlocked，拒绝新的 direct/plan 变更。Executor 写入 Unknown 和崩溃恢复使用同一 Resource 行锁；历史请求重放及只读 observe 不受该阻断影响。首版不提供自动解锁或凭新 requestId 绕过阻断的入口。
 
+新变更准入还在已持有的 Resource/Binding 行锁内检查外部存在性：任一为 pending/unknown 时拒绝新的 start/stop/delete 等变更，不因 create 已进入 failed 而解除阻断。唯一例外是 active/pending Resource 与 active/provisional/pending Binding 上首次受理的 create；同一 Resource 已有 create Operation 时，新 requestId 或新的 plan attempt 不能再次调用 create。冻结请求重放与只读 observe 仍可用；observe 不直接核对或写入这些事实。明确核对 Resource/Binding 的存在性后，后续准入仍须通过 Unknown Operation、版本、活跃状态和互斥检查。确定未提交的失败或取消仍按既有规则退役 provisional 身份，允许重新创建独立 Resource。
+
 create 只允许走专用准入：通用 direct 命令入口拒绝 `action='create'`；repository 对真正新受理的 create（不作用于已冻结请求的重放）在 Resource→Binding→Connection 行锁内验证目标 Resource 为 active/pending、Binding 为 active/provisional 且 existence pending、且 is_mutating=true，direct 与 plan 都不例外。所有目标行的加锁与版本复核集中在 admission repository；宿主预读只用于解析目标与 handler 元数据，不再提前锁 Connection，避免与 plan 路径形成 Connection↔Resource 等待环。
 
 Executor 用 `leaseOwner + leaseUntil + claimRevision` 领取；每次成功领取递增 claimRevision，全部后续更新比较 owner/revision，旧 claimant 更新为零行即 `LeaseLost`。未提交命令执行前验证当前版本；已保存 externalTaskRef 的 Operation 使用冻结目标继续 poll，不重新提交，旧版插件/凭据暂不可用时保留 ref 与 pending_external 供恢复。可能已提交但未保存外部标识进入 Unknown，不自动重发。

@@ -574,12 +574,20 @@ class Issue3PostgresTests(unittest.TestCase):
         self._assert_direct_plan_lock_order(plan_is_mutating=True)
 
     def test_mutating_operation_is_serial_per_resource(self):
-        op = self.create()
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            resource = service.register(connection_uid=self.connection_uid,
+                resource_type="compute.vm/v1", plugin_id="fake", plugin_version="1",
+                driver_id="fake.vm/v1", external_key=uuid4().hex, locator={},
+                identity_evidence={"source": "test"})
+            service.execute(resource["uid"], action="start", normalized_input={},
+                plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                request_id=uuid4().hex, correlation_id="first")
         with self.assertRaises(IntegrityError):
             with Session(self.engine) as session, session.begin():
-                ResourceService(session, self.registry).execute(op["resource_uid"],
-                    action="start", normalized_input={}, plugin_id="fake", plugin_version="1",
-                    server_scope="test/issue3", request_id=uuid4().hex, correlation_id="corr")
+                ResourceService(session, self.registry).execute(resource["uid"],
+                    action="stop", normalized_input={}, plugin_id="fake", plugin_version="1",
+                    server_scope="test/issue3", request_id=uuid4().hex, correlation_id="second")
 
     def test_async_restart_polls_original_ref_and_tracks_resource_fact(self):
         op = self.create()
@@ -813,6 +821,137 @@ class Issue3PostgresTests(unittest.TestCase):
         self.assertIsNone(binding["closed_at"])
         self.assertEqual(1, len(self.fake.calls))
 
+    def test_failed_create_without_existence_blocks_new_direct_and_plan_mutations(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("failed")]
+        self.worker.run_once()
+        self.assertEqual("failed", self.read(op["uid"])["phase"])
+        with Session(self.engine) as session:
+            resource = session.execute(select(resources).where(
+                resources.c.uid == op["resource_uid"])).mappings().one()
+            binding = session.execute(select(bindings).where(
+                bindings.c.uid == op["binding_uid"])).mappings().one()
+        self.assertEqual("pending", resource["existence_state"])
+        self.assertEqual("pending", binding["existence_state"])
+        self.assertTrue(binding["active"])
+        self.assertTrue(binding["provisional"])
+        for action in ("start", "stop", "delete"):
+            with self.subTest(source="direct", action=action):
+                with Session(self.engine) as session, session.begin():
+                    with self.assertRaises(UnknownOperationBlocked):
+                        ResourceService(session, self.registry).execute(op["resource_uid"],
+                            action=action, normalized_input={}, plugin_id="fake", plugin_version="1",
+                            server_scope="test/issue3", request_id=uuid4().hex, correlation_id="blocked")
+        for action in ("start", "stop", "delete", "create"):
+            with self.subTest(source="plan", action=action):
+                with Session(self.engine) as session, session.begin():
+                    with self.assertRaises(UnknownOperationBlocked):
+                        OperationAdmissionRepository(session).create(
+                            server_scope="test/plan", request_id=uuid4().hex, action=action,
+                            normalized_input={}, plugin_id="fake", plugin_version="1",
+                            driver_id="fake.vm/v1", resource_uid=op["resource_uid"],
+                            binding_uid=op["binding_uid"], binding_revision=1,
+                            connection_uid=self.connection_uid, connection_revision=1,
+                            source_type="plan", correlation_id="blocked", operation_key=uuid4().hex,
+                            attempt=0)
+        with Session(self.engine) as session:
+            operation_ids = session.execute(select(operations.c.uid).where(
+                operations.c.resource_uid == op["resource_uid"])).scalars().all()
+        self.assertEqual([op["uid"]], operation_ids)
+        self.assertEqual([("execute", str(op["resource_uid"]), "create")], self.fake.calls)
+
+    def test_failed_create_replay_and_observe_do_not_unlock_mutations(self):
+        key, external = uuid4().hex, uuid4().hex
+        op = self.create(request_id=key, external_key=external)
+        self.fake.execute_results = [ExecutionResult("failed")]
+        self.worker.run_once()
+        replay = self.create(request_id=key, external_key=external)
+        self.assertEqual(op["uid"], replay["uid"])
+        self.assertEqual("failed", replay["phase"])
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            observation = service.execute(op["resource_uid"], action="observe", normalized_input={},
+                plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                request_id=uuid4().hex, correlation_id="observe")
+        self.assertFalse(observation["is_mutating"])
+        self.fake.execute_results = [ExecutionResult("succeeded", existence_state="present")]
+        self.assertEqual(observation["uid"], self.worker.run_once())
+        with Session(self.engine) as session, session.begin():
+            service = ResourceService(session, self.registry)
+            self.assertEqual("pending", service.get_resource(op["resource_uid"])["existence_state"])
+            with self.assertRaises(UnknownOperationBlocked):
+                service.execute(op["resource_uid"], action="start", normalized_input={},
+                    plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                    request_id=uuid4().hex, correlation_id="still-blocked")
+        self.assertEqual("failed", self.read(op["uid"])["phase"])
+        self.assertEqual(2, len(self.fake.calls))
+
+    def test_failed_create_admission_resumes_after_resource_and_binding_are_confirmed(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("failed")]
+        self.worker.run_once()
+        # Simulate an approved fact reconciliation; observe itself must not write these facts.
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(resources).where(resources.c.uid == op["resource_uid"])
+                .values(existence_state="present"))
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaises(UnknownOperationBlocked):
+                ResourceService(session, self.registry).execute(op["resource_uid"],
+                    action="start", normalized_input={}, plugin_id="fake", plugin_version="1",
+                    server_scope="test/issue3", request_id=uuid4().hex, correlation_id="binding-unconfirmed")
+        with Session(self.engine) as session, session.begin():
+            session.execute(select(resources.c.uid).where(
+                resources.c.uid == op["resource_uid"]).with_for_update())
+            session.execute(update(bindings).where(bindings.c.uid == op["binding_uid"])
+                .values(existence_state="present", provisional=False))
+            start = ResourceService(session, self.registry).execute(op["resource_uid"],
+                action="start", normalized_input={}, plugin_id="fake", plugin_version="1",
+                server_scope="test/issue3", request_id=uuid4().hex, correlation_id="confirmed")
+        self.fake.execute_results = [ExecutionResult("succeeded")]
+        self.assertEqual(start["uid"], self.worker.run_once())
+        self.assertEqual("succeeded", self.read(start["uid"])["phase"])
+        self.assertEqual("failed", self.read(op["uid"])["phase"])
+        self.assertEqual(2, len(self.fake.calls))
+
+    def test_failed_poll_without_existence_blocks_followup_mutation(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="failed-job")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            session.execute(update(operations).where(operations.c.uid == op["uid"])
+                .values(lease_until=datetime.now(timezone.utc) - timedelta(seconds=1)))
+        self.fake.poll_results = [ExecutionResult("failed")]
+        self.worker.run_once()
+        failed = self.read(op["uid"])
+        self.assertEqual("failed", failed["phase"])
+        self.assertEqual("failed-job", failed["external_task_ref"])
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaises(UnknownOperationBlocked):
+                ResourceService(session, self.registry).execute(op["resource_uid"],
+                    action="stop", normalized_input={}, plugin_id="fake", plugin_version="1",
+                    server_scope="test/issue3", request_id=uuid4().hex, correlation_id="blocked")
+        self.assertEqual(2, len(self.fake.calls))
+
+    def test_unknown_resource_or_binding_existence_blocks_new_mutation(self):
+        for resource_state, binding_state in (("unknown", "present"), ("present", "unknown"),
+                ("pending", "present"), ("present", "pending")):
+            with self.subTest(resource=resource_state, binding=binding_state):
+                with Session(self.engine) as session, session.begin():
+                    service = ResourceService(session, self.registry)
+                    resource = service.register(connection_uid=self.connection_uid,
+                        resource_type="compute.vm/v1", plugin_id="fake", plugin_version="1",
+                        driver_id="fake.vm/v1", external_key=uuid4().hex, locator={},
+                        identity_evidence={"source": "test"})
+                    session.execute(update(resources).where(resources.c.uid == resource["uid"])
+                        .values(existence_state=resource_state))
+                    session.execute(update(bindings).where(bindings.c.resource_uid == resource["uid"])
+                        .values(existence_state=binding_state))
+                    with self.assertRaises(UnknownOperationBlocked):
+                        service.execute(resource["uid"], action="start", normalized_input={},
+                            plugin_id="fake", plugin_version="1", server_scope="test/issue3",
+                            request_id=uuid4().hex, correlation_id="blocked")
+        self.assertEqual([], self.fake.calls)
+
     def test_poll_recovery_clears_transient_error(self):
         op = self.create()
         self.fake.execute_results = [ExecutionResult("pending_external", external_task_ref="remote-1")]
@@ -1032,6 +1171,15 @@ class Issue3PostgresTests(unittest.TestCase):
                 repo.request_cancel(op["uid"])
         cancel_at_target, admission_locked_target, cancel_lock_requested = (
             threading.Event() for _ in range(3))
+        cancel_sql = []
+
+        def record_cancel_sql(connection, cursor, statement, parameters, context, executemany):
+            if "FOR UPDATE" in statement:
+                for table in ("rf_resources", "rf_bindings", "rf_operations"):
+                    if "FROM " + table in statement:
+                        cancel_sql.append("lock:" + table)
+            elif statement.startswith("UPDATE rf_operations "):
+                cancel_sql.append("update:rf_operations")
 
         class CoordinatedExecutor(OperationExecutorRepository):
             def _lock_target(repo, operation, *, lock_operation):
@@ -1054,6 +1202,7 @@ class Issue3PostgresTests(unittest.TestCase):
                 with Session(self.engine) as session, session.begin():
                     session.execute(text("SET LOCAL lock_timeout = '5s'"))
                     session.execute(text("SET LOCAL statement_timeout = '8s'"))
+                    event.listen(session.connection(), "before_cursor_execute", record_cancel_sql)
                     repo = CoordinatedExecutor(session)
                     row = repo.cancel_before_submit(op["uid"], worker_id="waiting",
                         claim_revision=claim["claim_revision"]) if before_submit else repo.request_cancel(op["uid"])
@@ -1076,6 +1225,8 @@ class Issue3PostgresTests(unittest.TestCase):
                         connection_revision=op["connection_revision"], source_type="direct",
                         correlation_id="race")
                 return "admitted"
+            except UnknownOperationBlocked:
+                return "existence-blocked"
             except IntegrityError as exc:
                 self.assertEqual("uq_rf_operation_mutation", exc.orig.args[0].get("n"))
                 return "mutation-conflict"
@@ -1088,7 +1239,10 @@ class Issue3PostgresTests(unittest.TestCase):
             cancel_result = cancel_future.result(timeout=15)
             admit_result = admit_future.result(timeout=15)
         self.assertEqual("cancelled", cancel_result)
-        self.assertEqual("mutation-conflict", admit_result)
+        self.assertEqual("existence-blocked", admit_result)
+        # Admission now rejects before INSERT; explicitly retain the cancellation lock-order regression.
+        self.assertEqual(["lock:rf_resources", "lock:rf_bindings", "lock:rf_operations",
+            "update:rf_operations"], cancel_sql[:4])
         self.assertEqual("cancelled", self.read(op["uid"])["phase"])
         with Session(self.engine) as session:
             binding = session.execute(select(bindings).where(
