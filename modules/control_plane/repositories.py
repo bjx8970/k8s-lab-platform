@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -24,6 +25,7 @@ UQ_MUTATION = "uq_rf_operation_mutation"
 class ResourceVersionConflict(RuntimeError): pass
 class RequestConflict(RuntimeError): pass
 class LeaseLost(RuntimeError): pass
+class UnknownOperationBlocked(RuntimeError): pass
 
 
 def canonical_digest(value):
@@ -106,7 +108,9 @@ class OperationAdmissionRepository:
     owned_columns=frozenset({"resource_uid","action","phase","is_mutating","normalized_input","server_scope","request_id",
         "request_digest","target_snapshot","binding_uid","binding_revision","connection_uid","connection_revision",
         "secret_version_ref","plugin_id","plugin_version","driver_id","claim_revision","resource_version"})
-    def __init__(self,session): self.session=session
+    def __init__(self,session,registry=None):
+        self.session=session
+        self.registry=registry
 
     def _resolve_target(self, resource_uid, binding_uid, binding_revision, connection_uid, connection_revision,
                         driver_id, plugin_id, plugin_version, *, require_active):
@@ -120,6 +124,8 @@ class OperationAdmissionRepository:
         resource=self.session.execute(select(resources).where(
             resources.c.uid==resource_uid).with_for_update()).mappings().one_or_none()
         if resource is None: raise ValueError("Resource 不存在")
+        if require_active and resource["registration_state"]!="active":
+            raise ValueError("Resource 已关闭登记")
         if resource["driver_id"] != driver_id:
             raise ValueError("driver_id 与 Resource 不一致")
 
@@ -166,7 +172,7 @@ class OperationAdmissionRepository:
     def create(self, *, server_scope, request_id, action, normalized_input, plugin_id, plugin_version,
                driver_id, resource_uid, binding_uid, binding_revision, connection_uid,
                connection_revision, source_type, correlation_id,
-               is_mutating=True, operation_key=None, attempt=None, uid=None):
+               is_mutating=None, operation_key=None, attempt=None, uid=None):
         # --- source_type validation ---
         if source_type not in ("plan", "direct"):
             raise ValueError("source_type 必须为 plan 或 direct")
@@ -181,14 +187,20 @@ class OperationAdmissionRepository:
         if not correlation_id:
             raise ValueError("correlation_id 不能为空")
 
-        # Historical relationship is validated first so an already-created Operation can be replayed
-        # even after its Binding was retired; active checks happen only for a real new admission.
-        snapshot=self._resolve_target(resource_uid, binding_uid, binding_revision, connection_uid,
-            connection_revision, driver_id, plugin_id, plugin_version, require_active=False)
-        digest=canonical_digest({"action":action,"input":normalized_input,"target":snapshot})
+        if is_mutating is not None and type(is_mutating) is not bool:
+            raise ValueError("is_mutating 必须为布尔值或省略")
 
         def _replay_check(existing, where):
-            if existing["request_digest"]!=digest or existing["source_type"]!=source_type:
+            digest=canonical_digest({"action":action,"input":normalized_input,
+                "target":existing["target_snapshot"]})
+            if (existing["request_digest"]!=digest or existing["source_type"]!=source_type
+                    or existing["resource_uid"]!=resource_uid or existing["binding_uid"]!=binding_uid
+                    or existing["binding_revision"]!=binding_revision
+                    or existing["connection_uid"]!=connection_uid
+                    or existing["connection_revision"]!=connection_revision
+                    or existing["plugin_id"]!=plugin_id or existing["plugin_version"]!=plugin_version
+                    or existing["driver_id"]!=driver_id
+                    or (is_mutating is not None and existing["is_mutating"]!=is_mutating)):
                 raise RequestConflict(where)
             if source_type=="plan" and (existing["operation_key"]!=operation_key or existing["attempt"]!=attempt):
                 raise RequestConflict(where)
@@ -204,9 +216,47 @@ class OperationAdmissionRepository:
                 operations.c.operation_key==operation_key, operations.c.attempt==attempt))).mappings().one_or_none()
             if plan_existing: return _replay_check(plan_existing, f"operation_key={operation_key}/attempt={attempt}")
 
-        # --- new admission: require a currently usable target ---
         snapshot=self._resolve_target(resource_uid, binding_uid, binding_revision, connection_uid,
             connection_revision, driver_id, plugin_id, plugin_version, require_active=True)
+        existing=self.session.execute(select(operations).where(and_(operations.c.server_scope==server_scope,
+            operations.c.request_id==request_id))).mappings().one_or_none()
+        if existing: return _replay_check(existing, request_id)
+        if source_type=="plan":
+            plan_existing=self.session.execute(select(operations).where(and_(
+                operations.c.operation_key==operation_key, operations.c.attempt==attempt))).mappings().one_or_none()
+            if plan_existing: return _replay_check(plan_existing, f"operation_key={operation_key}/attempt={attempt}")
+        # Every new admission uses the host registry; caller flags are assertions only.
+        # Replay returns above without loading current plugin metadata.
+        if self.registry is None:
+            raise ValueError("新 Operation 准入需要可信 HandlerRegistry")
+        classified_mutating=self.registry.is_mutating(plugin_id,plugin_version,driver_id,action)
+        if is_mutating is not None and is_mutating!=classified_mutating:
+            raise ValueError("is_mutating 与 Handler 动作定义不一致")
+        is_mutating=classified_mutating
+        if is_mutating:
+            unresolved=self.session.execute(select(operations.c.uid).where(and_(
+                operations.c.resource_uid==resource_uid, operations.c.is_mutating.is_(True),
+                operations.c.phase=="unknown")).limit(1)).scalar_one_or_none()
+            if unresolved is not None:
+                raise UnknownOperationBlocked("Resource 存在尚未核对的 Unknown Operation")
+        if is_mutating or action=="create":
+            # _resolve_target holds Resource/Binding locks; replay has already returned.
+            target_state=self.session.execute(select(resources.c.existence_state,
+                bindings.c.provisional, bindings.c.existence_state.label("binding_existence_state"))
+                .select_from(resources.join(bindings, bindings.c.resource_uid==resources.c.uid))
+                .where(and_(resources.c.uid==resource_uid,bindings.c.uid==binding_uid))).mappings().one()
+            if action=="create":
+                if (not is_mutating or target_state["existence_state"]!="pending"
+                        or not target_state["provisional"] or target_state["binding_existence_state"]!="pending"):
+                    raise ValueError("create 必须绑定待创建的 Resource 和 provisional Binding，且必须是变更动作")
+                prior_create=self.session.execute(select(operations.c.uid).where(and_(
+                    operations.c.resource_uid==resource_uid, operations.c.action=="create"))
+                    .limit(1)).scalar_one_or_none()
+                if prior_create is not None:
+                    raise UnknownOperationBlocked("Resource 已受理 create，不能在存在性未核对时再次创建")
+            elif (target_state["existence_state"] in ("pending","unknown")
+                    or target_state["binding_existence_state"] in ("pending","unknown")):
+                raise UnknownOperationBlocked("Resource 或 Binding 的外部存在性尚未核对，不能受理新的变更")
         digest=canonical_digest({"action":action,"input":normalized_input,"target":snapshot})
 
         uid=uid or uuid4()
@@ -243,6 +293,12 @@ class OperationExecutorRepository:
     owned_resource_columns=frozenset({"existence_state","status","resource_version","updated_at"})
     def __init__(self,session): self.session=session
 
+    def candidates(self, limit=32):
+        return self.session.execute(select(operations.c.uid).where(and_(
+            operations.c.phase.in_(("pending", "running", "pending_external")),
+            or_(operations.c.lease_until.is_(None), operations.c.lease_until < utc_now())))
+            .order_by(operations.c.created_at, operations.c.uid).limit(limit)).scalars().all()
+
     def claim(self,uid,*,worker_id,lease_until):
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
             operations.c.phase.in_(("pending","running","pending_external")),
@@ -255,21 +311,149 @@ class OperationExecutorRepository:
         if row is None: return None
         result=dict(row); _event(self.session,"Operation",uid,result["resource_version"],"MODIFIED"); return result
 
+    def _lock_resource(self, operation_uid):
+        self.session.execute(select(resources.c.uid).where(resources.c.uid==select(
+            operations.c.resource_uid).where(operations.c.uid==operation_uid).scalar_subquery())
+            .with_for_update()).scalar_one_or_none()
+
+    def _lock_target(self, operation, *, lock_operation):
+        """Lock Resource -> Binding (-> Operation) in admission order and return the locked rows."""
+        resource = self.session.execute(select(resources).where(
+            resources.c.uid == operation["resource_uid"]).with_for_update()).mappings().one_or_none()
+        if resource is None:
+            raise ValueError("Operation 目标 Resource 不存在")
+        binding = self.session.execute(select(bindings).where(
+            bindings.c.uid == operation["binding_uid"]).with_for_update()).mappings().one_or_none()
+        if binding is None:
+            raise ValueError("Operation 目标 Binding 不存在")
+        if lock_operation:
+            self.session.execute(select(operations.c.uid).where(
+                operations.c.uid == operation["uid"]).with_for_update()).scalar_one_or_none()
+        return resource, binding
+
+    def recover_uncertain(self, uid):
+        self._lock_resource(uid)
+        row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
+            operations.c.phase=="running",
+            or_(operations.c.lease_until.is_(None), operations.c.lease_until<utc_now())))
+            .values(phase="unknown", lease_owner=None, lease_until=None,
+                error={"code":"ExecutionOutcomeUnknown"}, finished_at=utc_now(),
+                resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is not None:
+            _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+            return dict(row)
+        return None
+
+    def renew(self, uid, *, worker_id, claim_revision, lease_until):
+        row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
+            operations.c.lease_owner==worker_id, operations.c.claim_revision==claim_revision,
+            operations.c.lease_until>utc_now(), operations.c.phase.in_(("running","pending_external"))))
+            .values(lease_until=lease_until, resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is None: raise LeaseLost(str(uid))
+        _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+        return dict(row)
+
+    def _release_provisional_identity(self, operation, resource, binding):
+        if operation["action"] != "create" or not binding["provisional"]:
+            return
+        if not binding["active"]:
+            # Binding already retired (e.g. rebind); the external identity is no
+            # longer reserved by this row, so there is nothing to release here.
+            return
+        resource = self.session.execute(update(resources).where(and_(
+            resources.c.uid == operation["resource_uid"],
+            resources.c.existence_state == "pending"))
+            .values(existence_state="absent", resource_version=next_resource_version(),
+                updated_at=utc_now()).returning(resources)).mappings().one_or_none()
+        binding = self.session.execute(update(bindings).where(and_(
+            bindings.c.uid == operation["binding_uid"],
+            bindings.c.active.is_(True), bindings.c.provisional.is_(True)))
+            .values(active=False, existence_state="absent", closed_at=utc_now(),
+                resource_version=next_resource_version()).returning(bindings)).mappings().one_or_none()
+        if resource is None or binding is None:
+            raise ValueError("provisional create 未确认未提交，不能释放外部身份")
+        _event(self.session, "Resource", resource["uid"], resource["resource_version"], "MODIFIED")
+        _event(self.session, "Binding", binding["uid"], binding["resource_version"], "MODIFIED")
+
+    def request_cancel(self, uid):
+        operation=self.session.execute(select(operations).where(operations.c.uid==uid)).mappings().one_or_none()
+        if operation is None:
+            return None
+        resource, binding = self._lock_target(operation, lock_operation=True)
+        row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
+            operations.c.phase.in_(("pending","running","pending_external"))))
+            .values(cancellation_requested=True,
+                phase=case((operations.c.phase=="pending","cancelled"),else_=operations.c.phase),
+                finished_at=case((operations.c.phase=="pending",utc_now()),else_=operations.c.finished_at),
+                resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is None:
+            return None
+        _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+        if row["phase"]=="cancelled":
+            self._release_provisional_identity(row, resource, binding)
+        return dict(row)
+
+    def cancel_before_submit(self, uid, *, worker_id, claim_revision):
+        operation=self.session.execute(select(operations).where(operations.c.uid==uid)).mappings().one_or_none()
+        if operation is None:
+            return None
+        resource, binding = self._lock_target(operation, lock_operation=True)
+        row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,
+            operations.c.phase=="running", operations.c.external_task_ref.is_(None),
+            operations.c.cancellation_requested.is_(True), operations.c.lease_owner==worker_id,
+            operations.c.claim_revision==claim_revision, operations.c.lease_until>utc_now()))
+            .values(phase="cancelled", lease_owner=None, lease_until=None,
+                finished_at=utc_now(), resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is None:
+            return None
+        _event(self.session,"Operation",uid,row["resource_version"],"MODIFIED")
+        self._release_provisional_identity(row, resource, binding)
+        return dict(row)
+
+    def fail_before_submit(self, operation, *, worker_id, claim_revision, code):
+        """Terminalize an Operation whose external call was rejected before dispatch
+        and release its provisional create identity, holding rows in admission order."""
+        uid = operation["uid"]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", code):
+            raise ValueError("无效错误代码")
+        resource, binding = self._lock_target(operation, lock_operation=True)
+        row = self.session.execute(update(operations).where(and_(
+            operations.c.uid == uid, operations.c.phase == "running",
+            operations.c.external_task_ref.is_(None), operations.c.lease_owner == worker_id,
+            operations.c.claim_revision == claim_revision, operations.c.lease_until > utc_now()))
+            .values(phase="failed", error={"code": code}, finished_at=utc_now(),
+                lease_owner=None, lease_until=None,
+                resource_version=next_resource_version(), updated_at=utc_now())
+            .returning(operations)).mappings().one_or_none()
+        if row is None:
+            raise LeaseLost(str(uid))
+        _event(self.session, "Operation", uid, row["resource_version"], "MODIFIED")
+        self._release_provisional_identity(operation, resource, binding)
+        return dict(row)
+
     def update_execution(self,uid,*,worker_id,claim_revision,phase,external_task_ref=_UNSET,exec_data=_UNSET,
-                         result=None,error=None,remote_job=None):
+                         result=None,error=_UNSET,clear_error=False,remote_job=None):
         if phase not in EXECUTOR_PHASES: raise ValueError(f"Executor 不允许写入 phase={phase}")
+        if error is not _UNSET and clear_error: raise ValueError("不能同时写入并清空 error")
+        if phase=="unknown": self._lock_resource(uid)
         values=dict(phase=phase,resource_version=next_resource_version(),updated_at=utc_now())
         if external_task_ref is not _UNSET: values["external_task_ref"]=external_task_ref
         if exec_data is not _UNSET: values["exec_data"]=exec_data
         if result is not None: values["result"]=result
-        if error is not None: values["error"]=error
+        if error is not _UNSET: values["error"]=error
+        elif clear_error: values["error"]=None
         if remote_job:
             allowed={"remote_job_id","remote_status_path","remote_exit_path","remote_log_path"}
             if set(remote_job)-allowed: raise ValueError("未知远端作业字段")
             values.update(remote_job)
         if phase in TERMINAL_PHASES: values.update(finished_at=utc_now(),lease_owner=None,lease_until=None)
         row=self.session.execute(update(operations).where(and_(operations.c.uid==uid,operations.c.lease_owner==worker_id,
-            operations.c.claim_revision==claim_revision,operations.c.lease_until>utc_now()))
+            operations.c.claim_revision==claim_revision,operations.c.lease_until>utc_now(),
+            operations.c.phase.in_(("running","pending_external"))))
             .values(**values).returning(operations)).mappings().one_or_none()
         if row is None: raise LeaseLost(str(uid))
         out=dict(row); _event(self.session,"Operation",uid,out["resource_version"],"MODIFIED"); return out

@@ -46,11 +46,21 @@ externalIdentity     ← 由 rf_bindings.external_key 构造
 locator              ← rf_bindings.locator
 ```
 
-digest 基于 `action + normalizedInput + canonical target snapshot` 计算。先按 UID/revision 校验历史关系，再进行 transport/plan 去重；只有确定要创建新 Operation 时才要求 Binding/Connection 仍 active。因此已 retired Binding 上的历史相同请求仍可幂等重放，但不能创建新 Operation。并发插入依赖显式命名的 `uq_rf_operation_transport` 与 `uq_rf_operation_plan_item` 唯一约束分类处理，不吞并 mutating Operation 冲突。
+digest 基于 `action + normalizedInput + canonical target snapshot` 计算。已存在的 transport/plan key 先使用原 Operation 冻结的 snapshot、拆分列和 digest 验证请求，完全一致返回原结果；重放不要求当前 Binding/Connection revision、active 状态或插件仍可用。只有新 Operation 才读取并验证当前 Resource/Binding/Connection，再生成快照；已退役 Binding 不得受理新命令。并发插入依赖显式命名的 `uq_rf_operation_transport` 与 `uq_rf_operation_plan_item` 唯一约束分类处理，不吞并 mutating Operation 冲突。
 
-Executor 用 `leaseOwner + leaseUntil + claimRevision` 领取；每次成功领取递增 claimRevision，全部后续更新比较 owner/revision，旧 claimant 更新为零行即 `LeaseLost`。已保存 externalTaskRef 只 poll；可能已提交但未保存外部标识进入 Unknown，不自动重发。
+create 的完整准入请求另以 `cp_request_keys(entrypoint='resource.create')` 保存不可变摘要，覆盖 connection、资源类型、plugin/driver 版本、externalKey、locator、identityEvidence、attributes 和 normalizedInput；它与 provisional Resource/Binding、Operation 在同一事务提交，且不随日志过期。历史重放只比较首次摘要并返回原 Operation，不读取可变登记字段，也不覆盖首次 correlationId。没有完整摘要的旧 create 不能从当前登记信息猜测原请求，重放返回 RequestConflict。
 
-create admission 同事务预分配 Resource 与 provisional Binding，初始 existenceState=pending。确认创建后转 present/provisional=false；确认未创建转 absent；无法确认转 unknown。unknown 不能释放 allocation。Resource 登记状态 active/closed 与 existenceState 分离。
+新变更 Operation 在 Resource 行锁内检查是否存在 mutating Unknown；未知结果未核对时抛出 UnknownOperationBlocked，拒绝新的 direct/plan 变更。Executor 写入 Unknown 和崩溃恢复使用同一 Resource 行锁；历史请求重放及只读 observe 不受该阻断影响。首版不提供自动解锁或凭新 requestId 绕过阻断的入口。
+
+所有新 Operation（direct/plan 均包含）由宿主向 OperationAdmissionRepository 注入可信 HandlerRegistry，并从注册时冻结的支持动作与只读集合计算 is_mutating。调用方可省略该值；显式提供时只能作为布尔断言，必须与注册定义一致，否则拒绝准入。没有注册表、指定插件/驱动版本不可用或动作未声明时均拒绝新请求，不回退到调用方分类。历史 transport/plan 重放先校验冻结请求并返回原 Operation，不读取当前插件元数据；省略分类时沿用历史值，显式不一致的分类仍为 RequestConflict。
+
+新变更准入还在已持有的 Resource/Binding 行锁内检查外部存在性：任一为 pending/unknown 时拒绝新的 start/stop/delete 等变更，不因 create 已进入 failed 而解除阻断。唯一例外是 active/pending Resource 与 active/provisional/pending Binding 上首次受理的 create；同一 Resource 已有 create Operation 时，新 requestId 或新的 plan attempt 不能再次调用 create。冻结请求重放与只读 observe 仍可用；observe 不直接核对或写入这些事实。明确核对 Resource/Binding 的存在性后，后续准入仍须通过 Unknown Operation、版本、活跃状态和互斥检查。确定未提交的失败或取消仍按既有规则退役 provisional 身份，允许重新创建独立 Resource。
+
+create 只允许走专用准入：通用 direct 命令入口拒绝 `action='create'`；repository 对真正新受理的 create（不作用于已冻结请求的重放）在 Resource→Binding→Connection 行锁内验证目标 Resource 为 active/pending、Binding 为 active/provisional 且 existence pending、且 is_mutating=true，direct 与 plan 都不例外。所有目标行的加锁与版本复核集中在 admission repository；宿主预读只用于解析目标与 handler 元数据，不再提前锁 Connection，避免与 plan 路径形成 Connection↔Resource 等待环。
+
+Executor 用 `leaseOwner + leaseUntil + claimRevision` 领取；每次成功领取递增 claimRevision，全部后续更新比较 owner/revision，旧 claimant 更新为零行即 `LeaseLost`。未提交命令执行前验证当前版本；已保存 externalTaskRef 的 Operation 使用冻结目标继续 poll，不重新提交，旧版插件/凭据暂不可用时保留 ref 与 pending_external 供恢复。可能已提交但未保存外部标识进入 Unknown，不自动重发。
+
+create admission 同事务预分配 Resource 与 provisional Binding，初始 existenceState=pending。create/delete 仅在存在性事实分别确认为 present/absent 时记为 succeeded；不能确认则 Unknown 且保留身份。身份释放只允许发生在外部调用确定未发起的取消/提交前失败路径：pending 取消、claim 后提交前取消、TargetRevisionConflict、提交前 PluginUnavailable。取消入口先无锁读取目标标识，按 Resource→Binding→Operation 顺序取得行锁后才条件 UPDATE，重新检查最新 phase、externalTaskRef、lease 和 claimRevision；不能先更新 Operation 再锁目标。释放在同一事务内把 Resource/Binding 置 absent 并退役 provisional 身份；Unknown 或提交结果不确定时绝不释放。Operation 转入 succeeded/cancelled 等确定终态时显式清空此前的瞬时 error；failed 必须写入当前失败错误码，handler 未提供时使用 ProviderFailed 覆盖旧暂态错误，不能继续显示 PluginUnavailable/PollUnavailable。delete 确认 absent、或无在途/Unknown 操作的显式 unregister，才可退役 Binding。只读 observe 不占用变更 Operation 唯一键，未做采样序号 fencing 前不直接写 Resource 事实。unknown 不能释放 allocation。Resource 登记状态 active/closed 与 existenceState 分离。
 
 ## 删除与 finalizer
 
