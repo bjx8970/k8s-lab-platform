@@ -23,6 +23,7 @@ from modules.control_plane.repositories import (
     ResourceVersionConflict,
 )
 from modules.control_plane.tables import bindings, operations, outbox
+from modules.resource_framework.handlers import FakeHandler, HandlerRegistry
 
 
 POSTGRES_URL = os.getenv("K8S_LAB_TEST_POSTGRES_URL")
@@ -48,6 +49,12 @@ def _pg_error(exc):
 class P0PostgresIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        class ProbeHandler(FakeHandler):
+            actions = FakeHandler.actions | {"probe"}
+            read_only_actions = FakeHandler.read_only_actions | {"probe"}
+
+        cls.registry = HandlerRegistry()
+        cls.registry.register("test", "1", "pve.qemu/v1", ProbeHandler())
         cls.schema = "p0_" + uuid4().hex
         cls.admin = create_engine(POSTGRES_URL, hide_parameters=True)
         with cls.admin.begin() as connection:
@@ -106,7 +113,7 @@ class P0PostgresIntegrationTests(unittest.TestCase):
                           correlation_id=None, plugin_id="test", plugin_version="1",
                           driver_id="pve.qemu/v1", normalized_input=None):
         """Helper to create a direct Operation; the repository builds the canonical snapshot."""
-        return OperationAdmissionRepository(session).create(
+        return OperationAdmissionRepository(session, self.registry).create(
             uid=uid or uuid4(), server_scope=server_scope,
             request_id=request_id or uuid4().hex,
             action=action, normalized_input=normalized_input if normalized_input is not None else {},
@@ -252,7 +259,7 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-src")
         with Session(self.engine) as session, session.begin():
             with self.assertRaises(ValueError):
-                OperationAdmissionRepository(session).create(
+                OperationAdmissionRepository(session, self.registry).create(
                     server_scope="test/scope", request_id=uuid4().hex,
                     action="create", normalized_input={},
                     plugin_id="test", plugin_version="1", driver_id="pve.qemu/v1",
@@ -269,7 +276,7 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         self._seed_binding(bind_id, res_id, conn_id, domain_id, "pve.qemu/v1", "vmid-src")
         with Session(self.engine) as session, session.begin():
             with self.assertRaises(ValueError):
-                OperationAdmissionRepository(session).create(
+                OperationAdmissionRepository(session, self.registry).create(
                     server_scope="test/scope", request_id=uuid4().hex,
                     action="create", normalized_input={},
                     plugin_id="test", plugin_version="1", driver_id="pve.qemu/v1",
@@ -382,12 +389,12 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         with Session(self.engine) as session, session.begin():
             self._create_direct_op(session, resource_uid=res_id, binding_uid=bind_id,
                 binding_revision=1, connection_uid=conn_id, connection_revision=1,
-                request_id=req_id, action="start")
+                request_id=req_id, action="probe")
         with Session(self.engine) as session, session.begin():
             with self.assertRaises(RequestConflict):
                 self._create_direct_op(session, resource_uid=res_id, binding_uid=bind_id,
                     binding_revision=1, connection_uid=conn_id, connection_revision=1,
-                    request_id=req_id, action="stop")
+                    request_id=req_id, action="observe")
 
     def test_plan_item_dedup(self):
         domain_id = "domain-plan-" + uuid4().hex[:8]
@@ -399,7 +406,7 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         key = "env/uid/intent/1/plan/puid/item/create-vm"
 
         def _plan_op(session, request_id, correlation_id):
-            return OperationAdmissionRepository(session).create(
+            return OperationAdmissionRepository(session, self.registry).create(
                 server_scope="test/scope", request_id=request_id,
                 action="create", normalized_input={},
                 plugin_id="test", plugin_version="1", driver_id="pve.qemu/v1",
@@ -416,7 +423,7 @@ class P0PostgresIntegrationTests(unittest.TestCase):
         # Same plan key + attempt with a different input must conflict, not silently reuse.
         with Session(self.engine) as session, session.begin():
             with self.assertRaises(RequestConflict):
-                OperationAdmissionRepository(session).create(
+                OperationAdmissionRepository(session, self.registry).create(
                     server_scope="test/scope", request_id=uuid4().hex,
                     action="delete", normalized_input={},
                     plugin_id="test", plugin_version="1", driver_id="pve.qemu/v1",

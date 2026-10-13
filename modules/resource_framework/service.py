@@ -42,8 +42,7 @@ class ResourceService:
 
     def _handler(self, plugin_id, plugin_version, driver_id, action):
         handler = self.registry.get(plugin_id, plugin_version, driver_id)
-        if action not in handler.actions:
-            raise ValueError("不支持的资源动作")
+        self.registry.is_mutating(plugin_id, plugin_version, driver_id, action)
         return handler
 
     def _input(self, normalized_input):
@@ -116,7 +115,7 @@ class ResourceService:
         resource, binding = self._bind(connection=connection, resource_type=resource_type,
             driver_id=driver_id, external_key=external_key, locator=locator,
             identity_evidence=identity_evidence, attributes=attributes, provisional=True)
-        operation = OperationAdmissionRepository(self.session).create(
+        operation = OperationAdmissionRepository(self.session, self.registry).create(
             server_scope=server_scope, request_id=request_id, correlation_id=correlation_id,
             source_type="direct", resource_uid=resource["uid"], binding_uid=binding["uid"],
             binding_revision=binding["revision"], connection_uid=connection_uid,
@@ -137,7 +136,7 @@ class ResourceService:
             operations.c.server_scope == server_scope,
             operations.c.request_id == request_id))).mappings().one_or_none()
         if existing is not None:
-            return OperationAdmissionRepository(self.session).create(
+            return OperationAdmissionRepository(self.session, self.registry).create(
                 server_scope=server_scope, request_id=request_id, correlation_id=correlation_id,
                 source_type="direct", resource_uid=resource_uid,
                 binding_uid=existing["binding_uid"], binding_revision=existing["binding_revision"],
@@ -158,14 +157,13 @@ class ResourceService:
         if connection is None:
             raise ValueError("Resource 没有可用绑定")
         self._handler(plugin_id, plugin_version, resource["driver_id"], action)
-        return OperationAdmissionRepository(self.session).create(
+        return OperationAdmissionRepository(self.session, self.registry).create(
             server_scope=server_scope, request_id=request_id, correlation_id=correlation_id,
             source_type="direct", resource_uid=resource_uid, binding_uid=binding["uid"],
             binding_revision=binding["revision"], connection_uid=connection["uid"],
             connection_revision=connection["revision"], plugin_id=plugin_id,
             plugin_version=plugin_version, driver_id=resource["driver_id"],
-            action=action, normalized_input=normalized_input,
-            is_mutating=self.registry.is_mutating(plugin_id, plugin_version, resource["driver_id"], action))
+            action=action, normalized_input=normalized_input)
 
     def get_resource(self, uid):
         row = self.session.execute(select(resources).where(resources.c.uid == uid)).mappings().one_or_none()

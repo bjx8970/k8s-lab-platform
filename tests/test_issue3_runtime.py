@@ -57,6 +57,26 @@ class FakeHandlerTests(unittest.TestCase):
         self.assertTrue(registry.is_mutating("fixed", "1", "fixed.vm/v1", "start"))
         self.assertFalse(registry.is_mutating("fixed", "1", "fixed.vm/v1", "observe"))
 
+    def test_supported_actions_are_frozen_and_unknown_actions_are_rejected(self):
+        handler = SimpleNamespace(actions={"observe"}, read_only_actions={"observe"})
+        registry = HandlerRegistry()
+        registry.register("fixed", "1", "fixed.vm/v1", handler)
+        handler.actions.add("start")
+        handler.actions.remove("observe")
+        self.assertFalse(registry.is_mutating("fixed", "1", "fixed.vm/v1", "observe"))
+        with self.assertRaisesRegex(ValueError, "不支持"):
+            registry.is_mutating("fixed", "1", "fixed.vm/v1", "start")
+
+    def test_invalid_supported_action_declarations_are_rejected(self):
+        for actions in (None, "start", set(), {""}, [True]):
+            with self.subTest(actions=actions):
+                registry = HandlerRegistry()
+                with self.assertRaises(ValueError):
+                    registry.register("invalid", "1", "invalid.vm/v1",
+                        SimpleNamespace(actions=actions))
+                with self.assertRaises(ValueError):
+                    registry.get("invalid", "1", "invalid.vm/v1")
+
 
 @unittest.skipUnless(os.getenv("K8S_LAB_TEST_POSTGRES_URL"), "需要一次性 PostgreSQL")
 class Issue3PostgresTests(unittest.TestCase):
@@ -124,6 +144,124 @@ class Issue3PostgresTests(unittest.TestCase):
         with Session(self.engine) as session:
             return ResourceService(session, self.registry).get_operation(uid)
 
+    def plan_request(self, target, action, **overrides):
+        params = dict(server_scope="test/plan", request_id=uuid4().hex,
+            action=action, normalized_input={}, plugin_id=target["plugin_id"],
+            plugin_version=target["plugin_version"], driver_id=target["driver_id"],
+            resource_uid=target["resource_uid"], binding_uid=target["binding_uid"],
+            binding_revision=target["binding_revision"], connection_uid=target["connection_uid"],
+            connection_revision=target["connection_revision"], source_type="plan",
+            correlation_id="plan", operation_key=uuid4().hex, attempt=0)
+        params.update(overrides)
+        return params
+
+    def test_plan_cannot_classify_failed_create_followup_as_read_only(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("failed")]
+        self.worker.run_once()
+        for action in ("start", "stop", "delete", "create"):
+            with self.subTest(action=action), Session(self.engine) as session, session.begin():
+                with self.assertRaisesRegex(ValueError, "is_mutating"):
+                    OperationAdmissionRepository(session, self.registry).create(
+                        **self.plan_request(op, action, is_mutating=False))
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaises(UnknownOperationBlocked):
+                OperationAdmissionRepository(session, self.registry).create(
+                    **self.plan_request(op, "start"))
+            count = session.scalar(select(func.count()).select_from(operations).where(
+                operations.c.resource_uid == op["resource_uid"]))
+            self.assertEqual(1, count)
+            observation = OperationAdmissionRepository(session, self.registry).create(
+                **self.plan_request(op, "observe"))
+        self.assertFalse(observation["is_mutating"])
+        self.assertEqual([("execute", str(op["resource_uid"]), "create")], self.fake.calls)
+
+    def test_plan_classification_cannot_bypass_unknown_blocking(self):
+        op = self.create()
+        self.fake.execute_results = [RuntimeError("uncertain submission")]
+        self.worker.run_once()
+        self.assertEqual("unknown", self.read(op["uid"])["phase"])
+        with Session(self.engine) as session, session.begin():
+            repo = OperationAdmissionRepository(session, self.registry)
+            with self.assertRaisesRegex(ValueError, "is_mutating"):
+                repo.create(**self.plan_request(op, "start", is_mutating=False))
+            with self.assertRaises(UnknownOperationBlocked):
+                repo.create(**self.plan_request(op, "start"))
+            observation = repo.create(**self.plan_request(op, "observe"))
+        self.assertFalse(observation["is_mutating"])
+        self.assertEqual(1, len(self.fake.calls))
+
+    def test_plan_classification_cannot_bypass_mutation_mutex(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("succeeded", existence_state="present")]
+        self.worker.run_once()
+        with Session(self.engine) as session, session.begin():
+            running = ResourceService(session, self.registry).execute(op["resource_uid"],
+                action="start", normalized_input={}, plugin_id="fake", plugin_version="1",
+                server_scope="test/issue3", request_id=uuid4().hex, correlation_id="start")
+        self.assertTrue(running["is_mutating"])
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaisesRegex(ValueError, "is_mutating"):
+                OperationAdmissionRepository(session, self.registry).create(
+                    **self.plan_request(op, "stop", is_mutating=False))
+        with self.assertRaises(IntegrityError):
+            with Session(self.engine) as session, session.begin():
+                OperationAdmissionRepository(session, self.registry).create(
+                    **self.plan_request(op, "stop"))
+        with Session(self.engine) as session, session.begin():
+            observation = OperationAdmissionRepository(session, self.registry).create(
+                **self.plan_request(op, "observe", is_mutating=False))
+        self.assertFalse(observation["is_mutating"])
+        self.assertEqual(1, len(self.fake.calls))
+
+    def test_new_admission_requires_registered_action_metadata(self):
+        op = self.create()
+        for registry in (None, HandlerRegistry()):
+            for action in ("start", "observe"):
+                with self.subTest(registry=registry, action=action):
+                    with Session(self.engine) as session, session.begin():
+                        with self.assertRaises(ValueError):
+                            OperationAdmissionRepository(session, registry).create(
+                                **self.plan_request(op, action, is_mutating=False))
+        with Session(self.engine) as session, session.begin():
+            with self.assertRaisesRegex(ValueError, "不支持"):
+                OperationAdmissionRepository(session, self.registry).create(
+                    **self.plan_request(op, "undeclared", is_mutating=False))
+            count = session.scalar(select(func.count()).select_from(operations).where(
+                operations.c.resource_uid == op["resource_uid"]))
+        self.assertEqual(1, count)
+        self.assertEqual([], self.fake.calls)
+
+    def test_plan_replay_keeps_frozen_classification_without_current_metadata(self):
+        op = self.create()
+        self.fake.execute_results = [ExecutionResult("succeeded", existence_state="present")]
+        self.worker.run_once()
+        params = self.plan_request(op, "start")
+        with Session(self.engine) as session, session.begin():
+            first = OperationAdmissionRepository(session, self.registry).create(**params)
+        changed_registry = HandlerRegistry()
+        changed_registry.register("fake", "1", "fake.vm/v1",
+            SimpleNamespace(actions=FakeHandler.actions, read_only_actions={"observe", "start"}))
+        for registry in (None, HandlerRegistry(), changed_registry):
+            with self.subTest(registry=registry), Session(self.engine) as session, session.begin():
+                repo = OperationAdmissionRepository(session, registry)
+                for request_id in (params["request_id"], uuid4().hex):
+                    replay = repo.create(**dict(params, request_id=request_id))
+                    self.assertEqual(first["uid"], replay["uid"])
+                    self.assertTrue(replay["is_mutating"])
+                with self.assertRaises(RequestConflict):
+                    repo.create(**dict(params, is_mutating=False))
+        self.assertEqual(1, len(self.fake.calls))
+
+    def test_admission_rejects_non_boolean_mutating_flags(self):
+        op = self.create()
+        for value in (0, 1, "false", [], {}):
+            with self.subTest(value=value), Session(self.engine) as session, session.begin():
+                with self.assertRaisesRegex(ValueError, "布尔"):
+                    OperationAdmissionRepository(session, self.registry).create(
+                        **self.plan_request(op, "start", is_mutating=value))
+        self.assertEqual([], self.fake.calls)
+
     def test_execute_rejects_create_on_registered_and_provisional_resources(self):
         provisional = self.create()
         with Session(self.engine) as session, session.begin():
@@ -168,8 +306,8 @@ class Issue3PostgresTests(unittest.TestCase):
                             .values(existence_state=resource_state))
                         session.execute(update(bindings).where(bindings.c.uid == binding["uid"])
                             .values(existence_state=binding_state))
-                        with self.assertRaisesRegex(ValueError, "provisional Binding"):
-                            OperationAdmissionRepository(session).create(server_scope="test/issue3",
+                        with self.assertRaisesRegex(ValueError, "provisional Binding" if mutating else "is_mutating"):
+                            OperationAdmissionRepository(session, self.registry).create(server_scope="test/issue3",
                                 request_id=uuid4().hex, action="create", normalized_input={},
                                 plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
                                 resource_uid=resource["uid"], binding_uid=binding["uid"], binding_revision=1,
@@ -193,14 +331,14 @@ class Issue3PostgresTests(unittest.TestCase):
                 resource_uid=resource["uid"], binding_uid=binding["uid"], binding_revision=1,
                 connection_uid=self.connection_uid, connection_revision=1, source_type="plan",
                 correlation_id="plan-first", operation_key=operation_key, attempt=0)
-            operation = OperationAdmissionRepository(session).create(request_id=request_id, **params)
+            operation = OperationAdmissionRepository(session, self.registry).create(request_id=request_id, **params)
         self.fake.execute_results = [ExecutionResult("succeeded", existence_state="present")]
         self.worker.run_once()
         with Session(self.engine) as session, session.begin():
             current_binding = session.execute(select(bindings).where(bindings.c.uid == binding["uid"])).mappings().one()
             self.assertFalse(current_binding["provisional"])
-            first_replay = OperationAdmissionRepository(session).create(request_id=request_id, **params)
-            second_replay = OperationAdmissionRepository(session).create(request_id=uuid4().hex, **params)
+            first_replay = OperationAdmissionRepository(session, self.registry).create(request_id=request_id, **params)
+            second_replay = OperationAdmissionRepository(session, self.registry).create(request_id=uuid4().hex, **params)
             self.assertEqual(operation["uid"], first_replay["uid"])
             self.assertEqual(operation["uid"], second_replay["uid"])
             self.assertEqual("succeeded", second_replay["phase"])
@@ -386,7 +524,7 @@ class Issue3PostgresTests(unittest.TestCase):
         self.worker.run_once()
         self.assertEqual("unknown", self.read(op["uid"])["phase"])
         with Session(self.engine) as session, session.begin():
-            replay = OperationAdmissionRepository(session).create(
+            replay = OperationAdmissionRepository(session, self.registry).create(
                 server_scope=op["server_scope"], request_id=op["request_id"],
                 action=op["action"], normalized_input=op["normalized_input"],
                 plugin_id=op["plugin_id"], plugin_version=op["plugin_version"],
@@ -398,7 +536,7 @@ class Issue3PostgresTests(unittest.TestCase):
         for action in ("start", "stop", "create", "delete"):
             with self.subTest(action=action), Session(self.engine) as session, session.begin():
                 with self.assertRaises(UnknownOperationBlocked):
-                    OperationAdmissionRepository(session).create(server_scope="plan/test",
+                    OperationAdmissionRepository(session, self.registry).create(server_scope="plan/test",
                         request_id=uuid4().hex, action=action, normalized_input={},
                         plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
                         resource_uid=op["resource_uid"], binding_uid=op["binding_uid"],
@@ -458,7 +596,7 @@ class Issue3PostgresTests(unittest.TestCase):
             try:
                 with Session(self.engine) as session, session.begin():
                     session.execute(text("SET LOCAL lock_timeout = '250ms'"))
-                    OperationAdmissionRepository(session).create(server_scope="test/issue3",
+                    OperationAdmissionRepository(session, self.registry).create(server_scope="test/issue3",
                         request_id=uuid4().hex, action="stop", normalized_input={},
                         plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
                         resource_uid=op["resource_uid"], binding_uid=op["binding_uid"],
@@ -525,7 +663,7 @@ class Issue3PostgresTests(unittest.TestCase):
                     resource_locked.set()
                     if not direct_ready.wait(timeout=5):
                         raise RuntimeError("direct admission 未开始")
-                    operation = OperationAdmissionRepository(session).create(
+                    operation = OperationAdmissionRepository(session, self.registry).create(
                         server_scope="test/plan", request_id=uuid4().hex,
                         action="start" if plan_is_mutating else "observe", normalized_input={},
                         plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
@@ -846,7 +984,7 @@ class Issue3PostgresTests(unittest.TestCase):
             with self.subTest(source="plan", action=action):
                 with Session(self.engine) as session, session.begin():
                     with self.assertRaises(UnknownOperationBlocked):
-                        OperationAdmissionRepository(session).create(
+                        OperationAdmissionRepository(session, self.registry).create(
                             server_scope="test/plan", request_id=uuid4().hex, action=action,
                             normalized_input={}, plugin_id="fake", plugin_version="1",
                             driver_id="fake.vm/v1", resource_uid=op["resource_uid"],
@@ -1217,7 +1355,7 @@ class Issue3PostgresTests(unittest.TestCase):
                 with Session(self.engine) as session, session.begin():
                     session.execute(text("SET LOCAL lock_timeout = '5s'"))
                     session.execute(text("SET LOCAL statement_timeout = '8s'"))
-                    CoordinatedAdmission(session).create(server_scope="test/issue3",
+                    CoordinatedAdmission(session, self.registry).create(server_scope="test/issue3",
                         request_id=uuid4().hex, action="start", normalized_input={},
                         plugin_id="fake", plugin_version="1", driver_id="fake.vm/v1",
                         resource_uid=op["resource_uid"], binding_uid=op["binding_uid"],

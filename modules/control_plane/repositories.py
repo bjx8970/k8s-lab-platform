@@ -108,7 +108,9 @@ class OperationAdmissionRepository:
     owned_columns=frozenset({"resource_uid","action","phase","is_mutating","normalized_input","server_scope","request_id",
         "request_digest","target_snapshot","binding_uid","binding_revision","connection_uid","connection_revision",
         "secret_version_ref","plugin_id","plugin_version","driver_id","claim_revision","resource_version"})
-    def __init__(self,session): self.session=session
+    def __init__(self,session,registry=None):
+        self.session=session
+        self.registry=registry
 
     def _resolve_target(self, resource_uid, binding_uid, binding_revision, connection_uid, connection_revision,
                         driver_id, plugin_id, plugin_version, *, require_active):
@@ -170,7 +172,7 @@ class OperationAdmissionRepository:
     def create(self, *, server_scope, request_id, action, normalized_input, plugin_id, plugin_version,
                driver_id, resource_uid, binding_uid, binding_revision, connection_uid,
                connection_revision, source_type, correlation_id,
-               is_mutating=True, operation_key=None, attempt=None, uid=None):
+               is_mutating=None, operation_key=None, attempt=None, uid=None):
         # --- source_type validation ---
         if source_type not in ("plan", "direct"):
             raise ValueError("source_type 必须为 plan 或 direct")
@@ -185,6 +187,9 @@ class OperationAdmissionRepository:
         if not correlation_id:
             raise ValueError("correlation_id 不能为空")
 
+        if is_mutating is not None and type(is_mutating) is not bool:
+            raise ValueError("is_mutating 必须为布尔值或省略")
+
         def _replay_check(existing, where):
             digest=canonical_digest({"action":action,"input":normalized_input,
                 "target":existing["target_snapshot"]})
@@ -194,7 +199,8 @@ class OperationAdmissionRepository:
                     or existing["connection_uid"]!=connection_uid
                     or existing["connection_revision"]!=connection_revision
                     or existing["plugin_id"]!=plugin_id or existing["plugin_version"]!=plugin_version
-                    or existing["driver_id"]!=driver_id or existing["is_mutating"]!=is_mutating):
+                    or existing["driver_id"]!=driver_id
+                    or (is_mutating is not None and existing["is_mutating"]!=is_mutating)):
                 raise RequestConflict(where)
             if source_type=="plan" and (existing["operation_key"]!=operation_key or existing["attempt"]!=attempt):
                 raise RequestConflict(where)
@@ -219,6 +225,14 @@ class OperationAdmissionRepository:
             plan_existing=self.session.execute(select(operations).where(and_(
                 operations.c.operation_key==operation_key, operations.c.attempt==attempt))).mappings().one_or_none()
             if plan_existing: return _replay_check(plan_existing, f"operation_key={operation_key}/attempt={attempt}")
+        # Every new admission uses the host registry; caller flags are assertions only.
+        # Replay returns above without loading current plugin metadata.
+        if self.registry is None:
+            raise ValueError("新 Operation 准入需要可信 HandlerRegistry")
+        classified_mutating=self.registry.is_mutating(plugin_id,plugin_version,driver_id,action)
+        if is_mutating is not None and is_mutating!=classified_mutating:
+            raise ValueError("is_mutating 与 Handler 动作定义不一致")
+        is_mutating=classified_mutating
         if is_mutating:
             unresolved=self.session.execute(select(operations.c.uid).where(and_(
                 operations.c.resource_uid==resource_uid, operations.c.is_mutating.is_(True),

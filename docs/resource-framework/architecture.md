@@ -191,7 +191,7 @@ create 使用带预分配 UUID 和明确 connection/创建参数的 target；其
 
 ActionDescriptor 定义 name、input_schema、result_schema、是否异步、技术完成条件、支持的取消方式。支持能力只反映实现和后端协议，不结合教师/学生权限，也不动态排除“可能有影响”的操作。
 
-P2 handler 通过 `actions` 声明支持动作，可选 `read_only_actions` 必须是支持动作的字符串子集；未声明时保守视为全部变更动作。HandlerRegistry 注册时验证并冻结只读集合，准入从注册表取得 is_mutating，不接受普通请求自行指定。
+P2 handler 通过 `actions` 声明非空的支持动作字符串集合，可选 `read_only_actions` 必须是支持动作的字符串子集；未声明时保守视为全部变更动作。HandlerRegistry 注册时验证并冻结支持动作和只读集合。统一 admission repository 对新 direct/plan Operation 均要求可信注册表，验证动作受支持并计算 is_mutating；调用方显式分类只能作为必须一致的断言，缺少或不可用的注册定义不能被 is_mutating=False 替代。冻结历史请求的重放不重新加载插件或重新分类。
 
 ExecutionContext 只提供 operation_id、连接/transport、凭据解析、日志及执行数据保存。没有 authorize、plan、child_operations、dependency_graph、allocation、rollback 等服务。注册表的软件版本依赖仅解决插件加载兼容性，不是资源业务依赖。
 
