@@ -1,0 +1,129 @@
+{
+  "evidence_version": "1.0",
+  "retrieved_on": "2026-10-16",
+  "target_environment_reported_by_user": "PVE 7.4-20",
+  "target_environment_observed": false,
+  "source": {
+    "url": "https://pve.proxmox.com/pve-docs-7/api-viewer/apidoc.js",
+    "documentation_index": "https://pve.proxmox.com/pve-docs-7/",
+    "documentation_index_version": "7.4",
+    "documentation_index_updated": "2023-03-22",
+    "retrieved_text_sha256": "125f0af24951e901800e49559593678edd95af66da27c88311faecda708ebaf1",
+    "kind": "manually curated extract of the official archived schema, not a full schema copy",
+    "limitation": "The archive is not proof of the exact installed 7.4-20 package set. Verify installed schema and package versions before live acceptance."
+  },
+  "endpoints": [
+    {
+      "path": "/version",
+      "method": "GET",
+      "returns": {
+        "type": "object",
+        "fields": {
+          "version": "Full pve-manager package version of this node",
+          "release": "Point release in x.y format",
+          "repoid": "Short build git revision"
+        }
+      },
+      "assertion": "Record actual values; do not derive qemu-server or kernel versions from this response."
+    },
+    {
+      "path": "/cluster/nextid",
+      "method": "GET",
+      "returns": {"type": "integer"},
+      "assertion": "A free-ID query is not a reservation; a race may still cause clone conflict."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}/clone",
+      "method": "POST",
+      "returns": {"type": "string"},
+      "parameters": {
+        "vmid": {"type": "integer", "minimum": 1, "format": "pve-vmid"},
+        "newid": {"type": "integer", "minimum": 1, "format": "pve-vmid"},
+        "full": {"type": "boolean", "optional": true, "documented_behavior": "Normal VM clones copy all disks; template clones attempt linked clones by default."},
+        "storage": {"optional": true, "documented_behavior": "Target storage for full clone."},
+        "target": {"optional": true, "documented_behavior": "Target node; only allowed if the original VM is on shared storage."}
+      },
+      "assertion": "Persist returned task reference; do not configure before clone completion."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}/config",
+      "method": "GET",
+      "parameters": {"current": {"type": "boolean", "default": 0}},
+      "assertion": "Default response includes pending changes. Use current=1 and pending separately when reporting active configuration."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}/config",
+      "method": "PUT",
+      "returns": {"type": "null"},
+      "assertion": "Successful synchronous null response is valid; a response lost after submission is still uncertain."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}/config",
+      "method": "POST",
+      "returns": {"type": "string", "optional": true},
+      "parameters": {"background_delay": {"type": "integer", "minimum": 1, "maximum": 30, "optional": true}},
+      "assertion": "With background_delay, completion within the wait can return null; otherwise persist UPID. No synthetic UPID is allowed."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}/config",
+      "methods": ["PUT", "POST"],
+      "parameters": {
+        "cores": {"type": "integer", "minimum": 1},
+        "memory": {"type": "integer", "minimum": 16, "unit": "MiB"},
+        "digest": {"type": "string", "maxLength": 40, "optional": true, "documented_behavior": "Reject if current configuration SHA1 digest differs."},
+        "sshkeys": {"type": "string", "format": "urlencoded", "documented_behavior": "OpenSSH public keys, one key per line."},
+        "net[n].tag": {"type": "integer", "minimum": 1, "maximum": 4094}
+      },
+      "assertion": "Validate declared driver fields and encode SSH keys at the API value layer as required by the installed schema."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}/pending",
+      "method": "GET",
+      "returns": {"type": "array", "item_fields": ["key", "value?", "pending?", "delete?"]},
+      "assertion": "Pending configuration is not proof of an active runtime change."
+    },
+    {
+      "paths": ["/nodes/{node}/qemu/{vmid}/status/start", "/nodes/{node}/qemu/{vmid}/status/stop"],
+      "method": "POST",
+      "returns": {"type": "string"},
+      "assertion": "Task submission is not task completion; stop is forceful, not graceful shutdown."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}/status/shutdown",
+      "method": "POST",
+      "returns": {"type": "string"},
+      "parameters": {"forceStop": {"type": "boolean", "default": 0}, "timeout": {"type": "integer", "minimum": 0, "optional": true}},
+      "assertion": "Graceful stop must not enable forceStop or fall back to stop after timeout."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}/status/reboot",
+      "method": "POST",
+      "returns": {"type": "string"},
+      "parameters": {"timeout": {"type": "integer", "minimum": 0, "optional": true}},
+      "assertion": "No forceStop parameter is declared here. Do not translate reboot to reset, stop/start, or start of a stopped VM."
+    },
+    {
+      "path": "/nodes/{node}/qemu/{vmid}",
+      "method": "DELETE",
+      "returns": {"type": "string"},
+      "parameters": {
+        "purge": {"type": "boolean", "optional": true, "documented_behavior": "Remove VMID references from configurations such as backup, replication and HA."},
+        "destroy-unreferenced-disks": {"type": "boolean", "default": 0, "documented_behavior": "Also delete unreferenced disks with a matching VMID from enabled storages."}
+      },
+      "assertion": "Do not add shutdown, unlock, purge or extra disk deletion implicitly. Deletion already removes used/owned volumes and VM-specific permissions/firewall rules."
+    },
+    {
+      "path": "/nodes/{node}/tasks/{upid}/status",
+      "method": "GET",
+      "returns": {"type": "object", "status_enum": ["running", "stopped"], "exitstatus": {"type": "string", "optional": true}},
+      "permission_description": "Non-owners need Sys.Audit on /nodes/<node>.",
+      "assertion": "Stopped alone is not success. Task lookup failure does not prove VM absence. Live evidence must confirm successful tasks have exitstatus OK."
+    },
+    {
+      "path": "/nodes/{node}/tasks/{upid}/log",
+      "method": "GET",
+      "returns": {"type": "array", "item_fields": ["n", "t"]},
+      "assertion": "Capture bounded sanitized log evidence; retain task node separately from the VM's mutable locator."
+    }
+  ]
+}
