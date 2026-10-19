@@ -1,1 +1,0 @@
-"""Versioned PostgreSQL schema migrations."""
