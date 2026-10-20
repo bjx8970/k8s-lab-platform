@@ -6,16 +6,12 @@ from datetime import datetime
 
 from flask_login import UserMixin
 from sqlalchemy import (
-    Boolean, CheckConstraint, Column, DateTime, ForeignKey, ForeignKeyConstraint,
-    Integer, String, Text, text, UniqueConstraint,
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Text, text, UniqueConstraint,
     create_engine, func,
 )
-from sqlalchemy.engine import URL
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, selectinload
 
 from modules.credential_store import decrypt_secret, encrypt_secret
-from modules.sqlite_vm_identity import upgrade_sqlite_vm_identity
-from modules.vm_identity import positive_id, validate_node, vm_identity, vm_identity_key
 
 
 REDACTED = "[REDACTED]"
@@ -25,16 +21,13 @@ DB_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__
 
 
 def _load_db_config():
-    if not os.path.exists(DB_CONFIG_PATH):
-        return None
-    try:
-        with open(DB_CONFIG_PATH, encoding="utf-8") as f:
-            config = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError("数据库配置文件无效，服务拒绝启动") from exc
-    if not isinstance(config, dict):
-        raise RuntimeError("数据库配置必须是 JSON 对象")
-    return config
+    if os.path.exists(DB_CONFIG_PATH):
+        try:
+            with open(DB_CONFIG_PATH, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
 
 
 def _save_db_config(cfg):
@@ -44,21 +37,22 @@ def _save_db_config(cfg):
 
 def _create_engine():
     cfg = _load_db_config()
-    if not cfg:
+    if not cfg or cfg.get("type") != "postgresql":
         return None
-    if cfg.get("type") != "postgresql":
-        raise RuntimeError("生产控制面仅支持 PostgreSQL")
     missing = [k for k in ("host", "user", "password", "database") if not cfg.get(k)]
     if missing:
-        raise RuntimeError(f"数据库配置缺少字段: {', '.join(missing)}")
-    url = URL.create(
-        "postgresql+pg8000", username=cfg["user"], password=cfg["password"],
-        host=cfg["host"], port=int(cfg.get("port", 5432)), database=cfg["database"],
-    )
-    return create_engine(
-        url, echo=False, pool_size=10, max_overflow=20,
-        pool_pre_ping=True, pool_recycle=3600, hide_parameters=True,
-    )
+        return None
+    url = (f"postgresql+pg8000://{cfg['user']}:{cfg['password']}@"
+           f"{cfg['host']}:{cfg.get('port', 5432)}/{cfg['database']}")
+    try:
+        return create_engine(
+            url, echo=False,
+            pool_size=10, max_overflow=20,
+            pool_pre_ping=True, pool_recycle=3600,
+            hide_parameters=True,
+        )
+    except Exception:
+        return None
 
 
 _engine_lock = threading.Lock()
@@ -83,7 +77,7 @@ class Cluster(Base):
     ssh_public_key = Column(Text)
     pve_node = Column(String(32))
     template_vmid = Column(Integer)
-    pve_server_id = Column(Integer)
+    pve_server_id = Column(Integer, default=0)
     ssh_port = Column(Integer)
     client_mac = Column(String(24))
     k8s_status = Column(String(16), default="pending")
@@ -96,14 +90,7 @@ class Cluster(Base):
     class_id = Column(Integer, ForeignKey("classes.id"), nullable=True, index=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
 
-    __table_args__ = (
-        UniqueConstraint("id", "pve_server_id", name="uq_clusters_id_pve_server_id"),
-    )
-
-    vms = relationship(
-        "Vm", back_populates="cluster", cascade="all, delete-orphan",
-        foreign_keys="Vm.cluster_id",
-    )
+    vms = relationship("Vm", back_populates="cluster", cascade="all, delete-orphan")
     group_ref = relationship("Group", back_populates="clusters")
 
 
@@ -111,27 +98,14 @@ class Vm(Base):
     __tablename__ = "vms"
     id = Column(Integer, primary_key=True)
     cluster_id = Column(Integer, ForeignKey("clusters.id"), nullable=False, index=True)
-    pve_server_id = Column(Integer, ForeignKey("pve_servers.id"), nullable=False, index=True)
     vm_name = Column(String(64), nullable=False)
-    vmid = Column(Integer, nullable=False)
+    vmid = Column(Integer, unique=True, nullable=False)
     node = Column(String(32), nullable=False, index=True)
     role = Column(String(16))
     mac = Column(String(24))
     ip = Column(String(16))
 
-    __table_args__ = (
-        CheckConstraint("pve_server_id > 0", name="ck_vms_pve_server_id_positive"),
-        CheckConstraint("vmid > 0", name="ck_vms_vmid_positive"),
-        UniqueConstraint("pve_server_id", "vmid", name="uq_vms_pve_server_vmid"),
-        ForeignKeyConstraint(
-            ["cluster_id", "pve_server_id"],
-            ["clusters.id", "clusters.pve_server_id"],
-            name="fk_vms_cluster_pve_server",
-        ),
-    )
-
-    cluster = relationship("Cluster", back_populates="vms", foreign_keys=[cluster_id])
-    pve_server = relationship("PVEServer")
+    cluster = relationship("Cluster", back_populates="vms")
 
 
 class Config(Base):
@@ -439,14 +413,16 @@ def init_db():
     with _engine_lock:
         if engine is None:
             raise RuntimeError("数据库未配置")
-    if engine.dialect.name == "sqlite":
-        Base.metadata.create_all(engine)
-        upgrade_sqlite_vm_identity(engine)
-        return
-    from migrations.runner import run_migrations
-
-    # Checksum drift and any DDL/backfill failure propagate and stop startup.
-    run_migrations(engine)
+    Base.metadata.create_all(engine)
+    _ensure_db_indexes()
+    _migrate_user_name()
+    _migrate_pve_template_vmid()
+    _migrate_pve_ow_fields()
+    migrate_pve_config()
+    _migrate_openwrt_to_pve_servers()
+    _migrate_group_max_students()
+    _migrate_cluster_students()
+    _migrate_group_member_student_number()
 
 
 @contextmanager
@@ -472,8 +448,6 @@ def get_session():
 
 def _cluster_to_dict(cluster):
     return {
-        "id": cluster.id,
-        "name": cluster.name,
         "status": cluster.status,
         "k8s_status": cluster.k8s_status,
         "vlan_id": cluster.vlan_id,
@@ -494,12 +468,71 @@ def _cluster_to_dict(cluster):
         "group_id": cluster.group_id,
         "class_id": cluster.class_id,
         "created_by": cluster.created_by,
-        "vms": {vm.vm_name: {
-            "key": vm_identity_key(vm.pve_server_id, vm.vmid),
-            "pve_server_id": vm.pve_server_id,
-            "node": vm.node, "vmid": vm.vmid, "role": vm.role, "mac": vm.mac, "ip": vm.ip,
-        } for vm in cluster.vms},
+        "vms": {vm.vm_name: {"node": vm.node, "vmid": vm.vmid, "role": vm.role, "mac": vm.mac, "ip": vm.ip}
+                for vm in cluster.vms},
     }
+
+
+def _ensure_db_indexes():
+    if engine is None:
+        return
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS ix_clusters_group_id ON clusters (group_id)",
+        "CREATE INDEX IF NOT EXISTS ix_clusters_created_by ON clusters (created_by)",
+        "CREATE INDEX IF NOT EXISTS ix_clusters_pve_server_id ON clusters (pve_server_id)",
+        "CREATE INDEX IF NOT EXISTS ix_vms_cluster_id ON vms (cluster_id)",
+        "CREATE INDEX IF NOT EXISTS ix_vms_node ON vms (node)",
+        "CREATE INDEX IF NOT EXISTS ix_group_members_user_id ON group_members (user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_group_members_group_id ON group_members (group_id)",
+        "CREATE INDEX IF NOT EXISTS ix_group_members_class_id ON group_members (class_id)",
+    ]
+    with engine.connect() as conn:
+        for stmt in indexes:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass
+        conn.commit()
+
+
+def _migrate_user_name():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN name VARCHAR(128) DEFAULT ''"))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _migrate_pve_template_vmid():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE pve_servers ADD COLUMN template_vmid INTEGER DEFAULT 9000"))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _migrate_pve_ow_fields():
+    if engine is None:
+        return
+    cols = [
+        ("ow_host", "VARCHAR(128) DEFAULT ''"),
+        ("ow_port", "INTEGER DEFAULT 22"),
+        ("ow_username", "VARCHAR(64) DEFAULT ''"),
+        ("ow_password", "VARCHAR(256) DEFAULT ''"),
+    ]
+    for col_name, col_type in cols:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text(f"ALTER TABLE pve_servers ADD COLUMN {col_name} {col_type}"))
+                conn.commit()
+        except Exception:
+            pass
 
 
 def _migrate_openwrt_to_pve_servers():
@@ -520,6 +553,39 @@ def _migrate_openwrt_to_pve_servers():
             s.ow_port = int(ow_cfg.get("port", 22))
             s.ow_username = ow_cfg.get("username", "")
             s.ow_password = password
+
+
+def _migrate_group_member_student_number():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE group_members ADD COLUMN student_number INTEGER"))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _migrate_group_max_students():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE groups ADD COLUMN max_students INTEGER DEFAULT 0"))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _migrate_cluster_students():
+    if engine is None:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE clusters ADD COLUMN students TEXT DEFAULT '{}'"))
+            conn.commit()
+    except Exception:
+        pass
 
 
 def load_clusters():
@@ -553,61 +619,49 @@ def load_cluster(name):
 
 
 def save_cluster(name, cluster_data):
-    if not isinstance(cluster_data, dict):
-        raise ValueError("集群数据必须是对象")
     with session_scope(commit=True) as session:
         cluster = session.query(Cluster).filter_by(name=name).first()
-        server_id = positive_id(cluster_data.get("pve_server_id", cluster.pve_server_id if cluster else None),
-                                "PVE 服务器编号")
-        if session.get(PVEServer, server_id) is None:
-            raise ValueError("PVE 服务器不存在")
-        supplied_vms = cluster_data.get("vms", {})
-        if not isinstance(supplied_vms, dict):
-            raise ValueError("VM 列表必须是对象")
-        old_vms = {vm.vm_name: vm for vm in cluster.vms} if cluster else {}
-        if cluster and cluster.pve_server_id not in (None, server_id) and old_vms:
-            raise ValueError("已有虚拟机的集群不可更换 PVE 服务器")
-        normalized = {}
-        for vm_name, info in supplied_vms.items():
-            if not isinstance(vm_name, str) or not vm_name or not isinstance(info, dict):
-                raise ValueError("VM 信息无效")
-            current = old_vms.get(vm_name)
-            vm_server, vmid = vm_identity(info.get("pve_server_id", server_id),
-                                          info.get("vmid", current.vmid if current else None))
-            if vm_server != server_id:
-                raise ValueError("VM 平台身份与集群不匹配")
-            if current and current.pve_server_id not in (None, vm_server):
-                raise ValueError("VM 平台身份不可更改")
-            normalized[vm_name] = (vm_server, vmid,
-                                   validate_node(info.get("node", current.node if current else None)), info)
-        identities = [(sid, vmid) for sid, vmid, _, _ in normalized.values()]
-        if len(set(identities)) != len(identities):
-            raise ValueError("集群中存在重复 VM 身份")
         if cluster is None:
             cluster = Cluster(name=name)
             session.add(cluster)
-            session.flush()
         cluster.status = cluster_data.get("status", cluster.status or "running")
-        for field in ("vlan_id", "vlan_device", "interface", "gateway", "netmask", "dnsmasq",
-                      "ssh_public_key", "pve_node", "template_vmid", "ssh_port", "client_mac",
-                      "group_id", "class_id", "created_by"):
-            setattr(cluster, field, cluster_data.get(field))
+        cluster.vlan_id = cluster_data.get("vlan_id")
+        cluster.vlan_device = cluster_data.get("vlan_device")
+        cluster.interface = cluster_data.get("interface")
+        cluster.gateway = cluster_data.get("gateway")
+        cluster.netmask = cluster_data.get("netmask")
+        cluster.dnsmasq = cluster_data.get("dnsmasq")
         if "ssh_private_key" in cluster_data:
             cluster.ssh_private_key = _stored_secret(cluster_data.get("ssh_private_key"))
-        cluster.pve_server_id = server_id
+        cluster.ssh_public_key = cluster_data.get("ssh_public_key")
+        cluster.pve_node = cluster_data.get("pve_node")
+        cluster.template_vmid = cluster_data.get("template_vmid")
+        cluster.pve_server_id = cluster_data.get("pve_server_id", cluster.pve_server_id or 0)
+        cluster.ssh_port = cluster_data.get("ssh_port")
         cluster.password = cluster_data.get("password", cluster.password or "k8s.1234")
+        cluster.client_mac = cluster_data.get("client_mac")
         cluster.k8s_status = cluster_data.get("k8s_status", cluster.k8s_status or "pending")
+        cluster.group_id = cluster_data.get("group_id")
+        cluster.class_id = cluster_data.get("class_id")
+        cluster.created_by = cluster_data.get("created_by")
         cluster.students = json.dumps(cluster_data.get("students", {}), ensure_ascii=False)
         cluster.updated_at = func.now()
-        for vm_name, (vm_server, vmid, node, info) in normalized.items():
-            vm = old_vms.get(vm_name)
-            if vm is None:
-                vm = Vm(vm_name=vm_name)
+
+        vms = cluster_data.get("vms", {})
+        existing = {v.vm_name: v for v in cluster.vms}
+        for vm_name, vm_info in vms.items():
+            if vm_name in existing:
+                vm = existing[vm_name]
+            else:
+                vm = Vm(cluster_id=cluster.id, vm_name=vm_name)
+                session.add(vm)
                 cluster.vms.append(vm)
-            vm.pve_server_id, vm.vmid, vm.node = vm_server, vmid, node
-            vm.role = info.get("role", "")
-            vm.mac = info.get("mac", "")
-            vm.ip = info.get("ip", "")
+            vm.vmid = vm_info.get("vmid", vm.vmid)
+            vm.node = vm_info.get("node", vm.node)
+            vm.role = vm_info.get("role", "")
+            vm.mac = vm_info.get("mac", "")
+            vm.ip = vm_info.get("ip", "")
+
         return cluster.id
 
 
@@ -659,24 +713,13 @@ def delete_cluster_db(name):
             session.delete(cluster)
 
 
-def find_cluster_by_vm(pve_server_id, vmid, node=None):
-    """Resolve a VM by stable provider-qualified identity.
-
-    ``node`` is an optional current locator check.  It is never part of the
-    identity query and a changed node remains the same VM.
-    """
-    server_id, normalized_vmid = vm_identity(pve_server_id, vmid)
+def find_cluster_by_vm(node, vmid):
     with session_scope() as session:
-        query = session.query(Vm).filter_by(
-            pve_server_id=server_id, vmid=normalized_vmid,
-        )
-        vm = query.one_or_none()
+        vm = session.query(Vm).filter_by(node=node, vmid=vmid).first()
         if not vm:
             return None
-        if node is not None:
-            validate_node(node)
         cluster = session.query(Cluster).filter_by(id=vm.cluster_id).first()
-        if not cluster or cluster.pve_server_id != server_id:
+        if not cluster:
             return None
         return _cluster_to_dict(cluster)
 
