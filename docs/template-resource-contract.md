@@ -38,9 +38,9 @@ resources 中每项可声明 key、for_each、name、type_label、data、display
 
 参数声明 key、类型、必填、默认值、约束及展示信息。使用有限 JSON 类型，明确字符串长度、数值范围、数组长度和唯一性。未知用户字段默认拒绝；前端表单不替代后端校验。
 
-需要插件候选项时，参数可提供 selector：plugin_instance、action、value_field、label_field。选择器动作必须声明 read_only，由后台按模板调用，不能成为用户任意插件动作入口。
+需要插件候选项时，参数可提供 selector：plugin_instance、action、value_field、label_field。选择器动作必须声明 read_only，由后台按模板调用，不能成为用户任意插件动作入口。v1 选择器返回候选项数组，value_field/label_field 从每个数组项读取，键必填且值唯一；未配置 input 时传空对象，不能调用需要未提供必填输入的动作。
 
-候选项由插件解释，平台只验证稳定键和模板许可。提交时重新校验所选项合法，并将实际清单/配置版本固定到调用。管理员也可直接在模板中固定选择项，不允许教师修改。
+候选项由插件解释，平台只验证稳定键和模板许可。提交时在即将固定的 Job 配置/Storage 视图中重新校验所选项合法，并将实际清单/配置版本固定到 Job；界面早先展示的候选快照不自动视为提交依据。管理员也可直接在模板中固定选择项，不允许教师修改。
 
 ### 3.2 引用
 
@@ -57,6 +57,10 @@ resources 中每项可声明 key、for_each、name、type_label、data、display
 | item | 当前有界展开项 |
 
 当前流程可用的环境创建结果保存为不可变 create_results，只有完成输出 Schema 校验的成功输出进入此处。已知部分引用/checkpoint 通过 evidence 提供，不能伪装为成功 steps 输出。
+
+Environment 的模板、创建结果和资源目标快照不等于所有以后动作都固定创建时的最新凭据；每个独立 Job 接受时另行固定 plugin_instance 配置 revision、Storage 命名空间 snapshot_id、插件代码摘要和允许秘密版本映射。多 Step 共用该 Job 视图，Step B 不能读取 A 之后更新的 latest 主机映射。资源 data 中已固定的外部目标不会被新的 Job 配置重新解释成另一对象。
+
+后继步骤若要使用前序写入的新 Storage 或新生成秘密，必须显式引用精确派生版本；原 Job 的读视图不自动刷新。秘密普通轮换保留历史但不保证远端仍接受；紧急吊销或版本失效时阻断调用，不自动换新凭据。详见插件“跨步骤快照范围”和执行“Job 级快照与跨 Step 引用”。
 
 ### 3.3 cleanup / 恢复证据引用
 
@@ -135,64 +139,82 @@ UI 只显示模板向角色开放且插件可执行的动作。插件不可用�
 
 ## 7. 完整结构示例
 
-以下仅使用一个 SSH 普通动作，演示工具主机与实验产出的区别。命令不创建学生账号，也不自动产生学生终端入口。示例插件、selector 和字段必须由实际 Manifest 定义。
+本示例与插件规范第 2 节 Manifest 联合使用：由管理员预先建立实例 ssh_lab，其 plugin_key 为 ssh；该实例身份映射属于部署/配置前置条件，不是模板可伪造的字段。Manifest 同时声明只读 list_host_options 和 execute_command。这里的命令不创建学生账号，也不自动产生学生终端入口。
 
-```yaml
-schema_version: 1
-metadata:
-  name: SSH 检查实验
-  description: 对教师选择的执行主机完成一次检查，并生成可再次检查的实验记录
-parameters:
-  target_host:
-    type: string
-    required: true
-    selector:
-      plugin_instance: ssh_lab
-      action: list_host_options
-      value_field: id
-      label_field: name
-quota:
-  environments: 1
-  vms: 0
-  vcpu: 0
-  memory_mb: 0
-create:
-  steps:
-    - id: inspect
-      plugin_instance: ssh_lab
-      action: execute_command
-      input:
-        host_id: {$ref: params.target_host}
-        command: "uname -s"
-      timeout_seconds: 30
-resources:
-  - key: report
-    name: 系统检查记录
-    type_label: 检查结果
-    data:
-      host_id: {$ref: params.target_host}
-      system: {$ref: steps.inspect.output.stdout}
-    actions:
-      inspect_again:
-        label: 再次检查
-        roles: [teacher, student]
-        parameters: {}
-        steps:
-          - id: inspect
-            plugin_instance: ssh_lab
-            action: execute_command
-            input:
-              host_id: {$ref: resource.data.host_id}
-              command: "uname -s"
-            timeout_seconds: 30
-actions: {}
-cleanup:
-  steps: []
-  completion:
-    no_external_cleanup_required: true
-readiness:
-  require_steps: [inspect]
-access: {}
+以下 JSON 也是合法 YAML，方便用标准库直接解析；其他 YAML 表达方式仍支持。selector 返回数组项的 id/name，必需的 stdout 已在配套 Manifest output_schema 中声明，可为空但不能省略。
+
+```json
+{
+  "schema_version": 1,
+  "metadata": {
+    "name": "SSH 检查实验",
+    "description": "对教师选择的执行主机完成一次检查，并生成可再次检查的实验记录"
+  },
+  "parameters": {
+    "target_host": {
+      "type": "string",
+      "required": true,
+      "selector": {
+        "plugin_instance": "ssh_lab",
+        "action": "list_host_options",
+        "value_field": "id",
+        "label_field": "name"
+      }
+    }
+  },
+  "quota": {"environments": 1, "vms": 0, "vcpu": 0, "memory_mb": 0},
+  "create": {
+    "steps": [
+      {
+        "id": "inspect",
+        "plugin_instance": "ssh_lab",
+        "action": "execute_command",
+        "input": {
+          "host_id": {"$ref": "params.target_host"},
+          "command": "uname -s"
+        },
+        "timeout_seconds": 30
+      }
+    ]
+  },
+  "resources": [
+    {
+      "key": "report",
+      "name": "系统检查记录",
+      "type_label": "检查结果",
+      "data": {
+        "host_id": {"$ref": "params.target_host"},
+        "system": {"$ref": "steps.inspect.output.stdout"}
+      },
+      "actions": {
+        "inspect_again": {
+          "label": "再次检查",
+          "roles": ["teacher", "student"],
+          "parameters": {},
+          "steps": [
+            {
+              "id": "inspect",
+              "plugin_instance": "ssh_lab",
+              "action": "execute_command",
+              "input": {
+                "host_id": {"$ref": "resource.data.host_id"},
+                "command": "uname -s"
+              },
+              "timeout_seconds": 30
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "actions": {},
+  "cleanup": {
+    "steps": [],
+    "completion": {"no_external_cleanup_required": true}
+  },
+  "readiness": {"require_steps": ["inspect"]},
+  "access": {}
+}
 ```
 
 此模板登记的是平台检查产出，不是自动登记 SSH 管理主机资产。一个不需要产出的模板可以将 resources 设为空。空 cleanup 只适用于管理员明确声明无外部清理需求的流程，不能据此消除 unknown 调用。
