@@ -1,243 +1,97 @@
 # K8s Lab Platform
 
-基于 Flask 的 Web 管理平台，自动化完成 PVE 虚拟机克隆 → OpenWrt 网络配置 → K8s 集群部署的全流程。支持多用户 RBAC 权限管理（管理员/教师/学生）。
+面向课程教学的模板驱动实验环境平台。管理员发布模板，教师通过模板创建实验环境并分配给课程内的小组或学生，平台按模板调用插件，执行创建、启停、重启、删除及其他插件支持的操作。
 
-## 架构
+## 项目状态
 
-```
-用户浏览器 → Flask Web + SocketIO (app.py)
-                ├── PVE API (proxmoxer)           → Proxmox VE 虚拟化 (支持多服务器)
-                ├── OpenWrt SSH (paramiko)        → OpenWrt 路由器 (UCI 配置)
-                ├── SQLite / PostgreSQL           → 集群数据持久化 (SQLAlchemy)
-                ├── WebSSH (xterm.js + SocketIO)  → 浏览器终端 SSH 到 client VM
-                ├── VM 状态缓存 (status_cache)     → 后台定时轮询 PVE VM 状态
-                └── 异步任务队列 (task_queue)      → 创建/删除/部署异步执行
-```
+**本仓库已确定 v1 目标设计，运行代码尚未按该设计重构。本文及 `docs/` 中的新规范不表示相关功能已经实现。**
 
-## 功能
+当前代码仍是 Flask/Jinja 单体，直接调用 PVE、OpenWrt，使用进程内任务队列和旧 `clusters`、`vms` 等模型。目标是彻底重建运行结构，不要求旧 API、旧表或旧页面兼容；本文不提供旧系统到新系统的迁移承诺，也不授权清空真实数据库或外部资源。
 
-- **用户与权限管理** — 管理员/教师/学生三级 RBAC，支持 CSV 批量导入用户
-- **课程与组管理** — 教师创建课程与组，学生分配到组，可按组批量创建集群
-- **PVE 连接管理** — 支持多 PVE 服务器，配置 API Token，查看节点/虚拟机/模板
-- **OpenWrt 管理** — 通过 SSH + UCI 管理 VLAN、接口、DHCP、dnsmasq、防火墙
-- **K8s 集群创建** — 一键完成：
-  - 自动编号集群名称 (`k8s_1`, `k8s_2` ...)
-  - VLAN 规划 (ID 101+，子网 `10.100.N.0/24`)
-  - OpenWrt 网络配置 (VLAN 设备、接口、DHCP、dnsmasq、防火墙)
-  - PVE linked clone (cloud-init + 随机 MAC + SSH 密钥注入)
-  - 生成并上传 Ed25519 SSH 密钥对到 client VM
-  - OpenWrt 端口转发 (WAN:N+50000 → client:22)
-  - OpenWrt 静态 DHCP 绑定
-- **K8s 部署** — 基于 kubeasz 在 client VM 内自动部署 Kubernetes 集群
-- **异步任务** — 创建/删除/部署均异步执行，前端实时显示进度条 + 详细日志页面，支持取消运行中的任务
-- **集群删除** — 释放所有虚拟机并清理 OpenWrt 配置，支持强制删除异常集群
-- **浏览器 WebSSH** — 基于 xterm.js + SocketIO + paramiko 的浏览器终端，教师/管理员可接管或查看学生会话
-- **用户在线追踪** — 通过 SocketIO 实时追踪用户在线状态
-- **VM 关机投票** — 学生组成员可投票决定是否关闭共享集群的 VM
-- **数据库切换** — 支持 SQLite ↔ PostgreSQL 在线切换和数据迁移
+## 目标与角色
 
-## 前置条件
+| 角色 | 职责 |
+| --- | --- |
+| 管理员 | 管理用户、插件配置、模板、全部实验环境与资源、教师配额；插件 Web 管理为后续能力 |
+| 教师 | 创建课程、小组和平台学生账号；选择已发布模板创建环境；在同一课程内分配给多个组和/或学生；管理自己的环境，旁观和接管学生 WebSSH |
+| 学生 | 管理本人允许修改的信息；仅访问直接分配或通过组分配获得的环境，执行模板向学生开放的动作，查看授权环境凭据和使用 WebSSH |
 
-1. **Proxmox VE** 7.x+
-   - 已配置 API Token（无需 root 密码）
-   - API Token 用户需要以下最小权限（可在 Datacenter → Permissions 中为用户或 API Token 分配自定义角色）：
+教师不编写模板、不配置底层基础设施、不直接调用插件。学生没有创建或删除环境、分配环境、管理模板和插件的权限。
 
-     | Privilege | 用途 |
-     |---|---|
-     | `VM.Audit` | 查看虚拟机、模板列表与状态 |
-     | `VM.Clone` | 克隆模板创建新虚拟机 |
-     | `VM.Config.Network` | 配置虚拟机网络 (net0) |
-     | `VM.Config.Cloudinit` | 注入 cloud-init 配置 |
-     | `VM.Config.Options` | 修改虚拟机其他配置选项 |
-     | `VM.PowerMgmt` | 启动 / 停止 / 重启虚拟机 |
-     | `VM.Allocate` | 创建和删除虚拟机 |
-     | `VM.Monitor` | 通过 QEMU Guest Agent 执行命令 |
-     | `Sys.Audit` | 查看节点列表、集群信息 |
-     | `Datastore.AllocateSpace` | 分配磁盘空间（克隆时需要） |
+学生账号可以跨教师加入课程。教师创建的学生初始由创建教师唯一管理；成功加入其他教师课程后，账号永久降为共享账号，创建教师失去编辑、重置密码、禁用和删除权限。学生在同一课程最多属于一个组，也可以只加入课程而不分组。
 
-     也可以直接使用内置角色 `PVEAdmin`（包含全部权限）或 `PVEVMAdmin`（需额外补 `Datastore.AllocateSpace`）。
-   - VM 模板需预装 `cloud-init` + `qemu-guest-agent`
-   - 模板需有 `k8s` 用户（cloud-init 配置 `ciuser: k8s`）
-   - 模板需预装必要系统包：`python3-venv`、`curl` 等
-2. **OpenWrt** 路由器
-   - 已启用 SSH
-   - `eth1` 作为 VLAN 上行口（可在代码中修改）
+## 核心设计
 
-## 安装
-
-```bash
-# 克隆项目
-git clone <repo-url> k8s-lab-platform
-cd k8s-lab-platform
-
-# 创建虚拟环境
-python -m venv venv
-# Linux/Mac
-source venv/bin/activate
-# Windows
-venv\Scripts\activate
-
-# 安装依赖
-pip install -r requirements.txt
+```text
+管理员发布不可变模板版本
+          ↓
+教师选择模板与参数 → 校验授权和配额 → Environment + Job
+                                                ↓
+                                   Step + Operation（原子建立）
+                                                ↓
+                                  插件运行时 → 外部基础设施
+                                                ↓
+                             结果、检查点和已知外部引用持久化
+                                                ↓
+                          平台按模板生成实验资源及其动作绑定
+                                                ↓
+                       教师分配 → 学生通过环境/资源动作入口使用
 ```
 
-## 配置
+- **按需模板工作流**：以明确请求驱动创建、动作和 cleanup；周期扫描恢复执行事实，不持续 Reconcile 或自动修复外部漂移。历史 control-plane v0.2 不再是实施基线，见[架构 ADR-001](docs/architecture.md#11-adr-001采用按需模板工作流不以持续协调为-v1-基线)。
+- **单体控制平面**：API、执行器、恢复扫描和会话服务在同一进程内模块化运行；不拆分 Web/Worker/Monitor 部署。不合作插件可能耗尽真实线程容量，此时降级、停止受影响派发并等待管理员人工重启，不自动补线程或自动重启。
+- **PostgreSQL 持久化**：保存对象、Job/Step/Operation、配额、凭据、会话元数据及审计；进程内线程池只承担执行，不是事实来源。
+- **启动加载插件**：从可信插件目录扫描，按部署配置的 required/optional 处理加载失败。v1 不做热更新、在线安装或多版本共存。
+- **插件自治**：Manifest 是技术能力的权威来源，核心不维护供应商动作白名单或危险命令过滤器；管理员可以发布 SSH 命令模板。
+- **模板是业务入口**：教师、学生不能绕过模板构造插件调用；动作、参数及后端授权由模板快照和业务关系共同决定。
+- **平台创建资源**：插件返回结果，不向平台注册实验资源。平台根据模板生成资源及其操作绑定，不为 VM、VLAN 等类型建专用表。
+- **插件私有存储**：平台提供隔离、版本化的 Storage API，插件解释内部 JSON。SSH 主机清单不自动纳管、不强制绑定或独占分配。Job 固定实例配置、Storage 列表快照和秘密版本映射，后继步骤不静默读 latest；普通轮换可保留仍有效的旧版本，紧急吊销阻断交付。
+- **失败保留现场**：默认不自动逆序补偿；显式运行模板清理流程。未知外部结果不盲目重发，未确认清理不提前释放配额。
+- **通用交互会话**：终端流独立于普通 JSON 操作结果；WebSSH、旁观、接管和断连使用独立会话协议。
 
-首次启动会自动跳转数据库配置页面。完整配置流程如下：
+首版以通用平台、插件接入规范和 SSH 命令执行插件验证闭环，不以 PVE、OpenWrt 或 Kubernetes 插件全部完成为前提。SSH 用于执行模板操作的管理主机，不自动成为学生终端入口或实验产出。
 
-1. **数据库配置** (`/db-config`) — 首次启动时配置 PostgreSQL 连接（或使用默认 SQLite）
-2. **初始化管理员** (`/setup`) — 创建默认管理员账号
-3. **PVE 配置** (`/pve`) — 添加一个或多个 PVE 服务器
-   - 名称、Host、User、Token Name、Token Value、Verify SSL、Port
-4. **OpenWrt 配置** (`/openwrt`) — 填写路由器 SSH 信息
-   - Host、Username、Password、Port
-5. **数据库管理** (`/db`) — 管理员可切换 SQLite / PostgreSQL 模式
+## 设计规范索引
 
-PVE 和 OpenWrt 配置保存在数据库的 `config` 表或 `pve_servers` 表。
+| 文档 | 内容 |
+| --- | --- |
+| [架构与产品边界](docs/architecture.md) | 领域对象、职责、角色、单体部署、已确认范围及非目标 |
+| [插件接口规范](docs/plugin-contract.md) | Manifest、prepare/execute/poll/cancel、Storage、凭据、交互会话 |
+| [模板与资源动作规范](docs/template-resource-contract.md) | 参数、选择器、有界展开、资源生成、动作绑定、清理及状态显示 |
+| [执行与持久化规范](docs/execution-persistence-contract.md) | PostgreSQL 队列、原子性、Operation、部分引用、阻断互斥、恢复和配额 |
+| [身份、授权与安全规范](docs/identity-security-contract.md) | 学生唯一管理、课程分组、环境分配、密码展示、WebSSH 撤权和审计 |
 
-## 启动
+规范使用“必须/禁止”表示目标实现的验收约束，“建议”表示可调整实现选择。示例仅定义契约形状，不是当前可调用的接口或已实现配置文件。详细字段以各专题文档为准；不把尚未选择的 UI 框架、调度器或供应商行为当作既定要求。
 
-```bash
-# 开发模式 (Flask dev server)
-python app.py
+## 当前代码位置
 
-# 生产模式 (flask-socketio threading + Werkzeug)
-# 自动生成 .secret_key 文件，或设置环境变量
-set FLASK_SECRET_KEY=your-secret-key   # Windows
-export FLASK_SECRET_KEY=your-secret-key  # Linux/Mac
-python run.py
+| 路径 | 当前实现，不是目标模块划分 |
+| --- | --- |
+| `app.py` / `run.py` | Flask 路由、SocketIO 事件及启动入口 |
+| `modules/db.py` | 旧 SQLAlchemy 模型、PostgreSQL 连接、手写结构补列及 CRUD |
+| `modules/k8s_manager.py` | 固定 PVE/OpenWrt/K8s 编排、内存任务状态和手动重试 |
+| `modules/task_queue.py` | `queue.Queue`；create/delete 各一个线程，deploy 两个线程 |
+| `modules/pve_client.py` / `modules/openwrt_client.py` | 现有供应商协议封装，不是新插件接口 |
+| `modules/ssh_terminal.py` / `modules/status_cache.py` | 旧 WebSSH 会话与状态缓存 |
+| `modules/authz.py` / `modules/security_service.py` | 旧系统的授权策略及服务边界检查 |
+| `modules/audit.py` / `modules/credential_store.py` | 旧审计脱敏和 Fernet 凭据处理 |
+| `templates/` / `static/` | 当前 Jinja 页面和静态资源，不是实验环境模板 |
+| `tests/` | 旧系统 unittest 测试，不能直接证明新规范已实现 |
 
-# 生产模式 (waitress，无 WebSocket 传输)
-pip install waitress
-set FLASK_SECRET_KEY=your-secret-key
-waitress-serve --host 0.0.0.0 --port 5000 app:app
+当前数据库连接代码仅创建 PostgreSQL 引擎；测试中使用临时 SQLite 不表示支持 SQLite 部署。旧文档所述“默认 SQLite、在线切换数据库”不适用于当前代码。
+
+当前启动也存在顺序限制：`app.py` 在数据库初始化前创建 `SSHManager`，其构造过程会读配置表。没有数据库配置或面对空 schema 时不能把现有启动路径视为可用的新系统初始化向导。新系统必须遵守显式初始化、导入无副作用的规范。
+
+## 当前测试与验证
+
+旧系统的规范发现入口为：
+
+```sh
+python -B -m unittest discover -s tests -t .
 ```
 
-访问 http://localhost:5000
+测试使用 unittest、模拟供应商和临时数据库。测试文件存在，但当前树没有 CI workflow、Alembic migration 或新插件运行时。历史测试通过次数不作为本次文档更新的新回归结果，也不证明真实 PostgreSQL/PVE/OpenWrt/SSH 或浏览器端到端验收已经完成。
 
-## 使用流程
+新旧部署按[架构中的退役前置条件](docs/architecture.md#91-旧部署退役与硬切换前置条件)硬切换：先确认旧外部对象、未决任务、责任人和管理通道，验证旧库、凭据密文及独立密钥的备份恢复路径；新旧系统不得无协调同时修改同一对象。不要求自动迁移或兼容，不等于授权销毁真实资源、旧库、唯一管理凭据或故障证据。
 
-### 1. 用户管理 (`/users`)
-
-- 管理员可创建/编辑/删除管理员、教师、学生账号
-- 教师可创建/管理学生账号
-- 支持 CSV 模板下载和批量导入用户
-
-### 2. 课程与组管理 (`/classes`)
-
-- 教师创建课程和组，将学生分配到组
-- 支持 CSV 模板下载和批量导入课程、组、成员
-
-### 3. 创建集群 (`/k8s`)
-
-#### 单组创建
-- 选择 PVE 服务器、PVE 节点、模板 VMID
-- 设置主节点/子节点数量、CPU、内存
-- 选择目标组
-- 点击"创建集群"，观察进度条
-- 创建完成后可选择 **部署 K8s**
-
-#### 批量创建
-- 选择多个组，为每个组创建一个独立集群
-- 参数统一设置（节点数、规格、模板等）
-
-### 4. 集群管理
-
-- **查看详情** — 查看集群各 VM 状态、SSH 密钥
-- **启动/停止** — 一键启停集群所有虚拟机
-- **部署 K8s** — 自动通过 kubeasz 安装 Kubernetes
-- **删除集群** — 释放所有虚拟机并清理 OpenWrt 配置
-
-### 5. 角色说明
-
-| 角色 | 权限 |
-|---|---|---|
-| admin | 所有功能，包括 PVE/OpenWrt/数据库配置、用户管理、WebSSH 管理面板 |
-| teacher | 创建课程、组、学生账号，管理自己创建的集群，接管/查看学生会话 |
-| student | 查看自己被分配的集群，启动/停止虚拟机，WebSSH 连接 client VM |
-
-## 集群命名与网络规划
-
-| 项 | 规则 |
-|---|---|
-| 集群名 | `k8s_1`, `k8s_2` ... 数据库自增 |
-| VLAN ID | 100 + N |
-| VLAN 设备 | `eth1.<VLAN_ID>` |
-| 接口名 | `k8s_N` |
-| 子网 | `10.100.N.0/24` |
-| 网关 | `10.100.N.1` |
-| dnsmasq | `k8s<N>` |
-| 虚拟机 | `client-k8s<N>`, `master{i}-k8s<N>`, `node{i}-k8s<N>` |
-| VMID | PVE API 自动分配 |
-| MAC | `52:54:00` 前缀 + 随机后缀 |
-| SSH 端口转发 | WAN:`50000+N` → client:22 |
-
-## 文件结构
-
-```
-├── app.py                      # Flask 主程序与路由 (~2774 行)
-├── run.py                      # 生产模式入口（自动生成 .secret_key）
-├── .db_config.json             # 数据库切换配置（SQLite / PostgreSQL，含密码，gitignore）
-├── .secret_key                 # 生产模式自动生成的密钥（gitignore）
-├── modules/
-│   ├── __init__.py
-│   ├── db.py                   # SQLAlchemy 模型与数据库操作
-│   ├── pve_client.py           # PVE API 封装 (proxmoxer)
-│   ├── openwrt_client.py       # OpenWrt SSH/UCI 封装 (paramiko)
-│   ├── k8s_manager.py          # 集群编排 + K8s 部署
-│   ├── task_queue.py           # 异步任务队列（create/delete/deploy）
-│   ├── ssh_terminal.py         # WebSSH 会话池管理 (paramiko)
-│   ├── status_cache.py         # VM 状态后台缓存
-│   └── pg_client.py            # PostgreSQL 连接测试 (pg8000)
-├── templates/
-│   ├── base.html               # 布局模板
-│   ├── index.html              # 首页（admin/teacher）
-│   ├── student.html            # 学生首页
-│   ├── k8s.html                # K8s 集群管理
-│   ├── k8s_logs.html           # 异步任务日志
-│   ├── pve.html                # PVE 多服务器配置
-│   ├── openwrt.html            # OpenWrt 配置
-│   ├── db_config.html          # 数据库切换管理
-│   ├── db_setup.html           # 首次启动数据库配置向导
-│   ├── setup.html              # 初始管理员设置
-│   ├── users.html              # 用户管理
-│   ├── classes.html            # 课程与组管理
-│   ├── login.html              # 登录
-│   ├── 403.html                # 权限不足
-│   ├── admin_webssh.html       # WebSSH 管理面板
-│   └── _standalone_base.html   # 独立页面布局（登录/设置）
-├── k8s_lab.db                  # SQLite 数据文件（运行后生成，.gitignore）
-└── requirements.txt            # Python 依赖
-```
-
-## 数据存储
-
-| 数据 | 存储位置 |
-|---|---|
-| 集群数据 | `clusters` + `vms` 表 |
-| 用户数据 | `users` 表 |
-| 课程/组数据 | `classes` + `groups` + `group_members` 表 |
-| PVE 配置 | `pve_servers` 表（多服务器）或 `config` 表（旧版单服务器） |
-| OpenWrt 配置 | `config` 表 |
-| 数据库模式 | `.db_config.json` 指定 `sqlite` 或 `postgresql` |
-
-集群编号由数据库自增 ID 自动分配。旧版 `.k8s_clusters.json`、`.pve_config.json`、`.openwrt_config.json` 文件会在启动时自动迁移到数据库。
-
-## 依赖
-
-- Python 3.8+
-- Flask, Flask-SocketIO, Flask-Login, Flask-WTF
-- proxmoxer, paramiko, sqlalchemy, cryptography, pg8000
-
-详见 `requirements.txt`
-
-## 注意事项
-
-- PVE 模板必须已有 `qemu-guest-agent` 并启用
-- `k8s` 用户需要在模板中配置 passwordless sudo
-- client VM 第一次启动后需重启才能刷新 DHCP 主机名
-- K8s 部署从 `http://10.11.43.82/download/` 下载离线安装包，需内部网络可达
-- 生产环境必须设置环境变量 `FLASK_SECRET_KEY`；使用 `python run.py` 会自动生成 `.secret_key` 文件
-- Flask-SocketIO 使用 threading 模式（非 eventlet/gevent），如需 WebSocket 传输需额外安装 `simple-websocket`
-- OpenWrt VLAN 设备名含小数点，需通过 UCI 索引方式操作
-- WebSSH 连接数可在管理面板 `/admin/webssh` 配置（全局/学生/教师上限、空闲超时）
+本轮文档更新不执行旧凭据迁移、真实资源清理或生产部署。真实连接配置、会话密钥、凭据密文与加密密钥均不可提交到仓库。
