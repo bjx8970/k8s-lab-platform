@@ -1,0 +1,3 @@
+control_plane/** text eol=lf
+tests_control_plane/** text eol=lf
+scripts/run_p0_tests.sh text eol=lf
