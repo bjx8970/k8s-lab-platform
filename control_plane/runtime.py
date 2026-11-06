@@ -15,6 +15,14 @@ class LeadershipLost(RuntimeError):
     """The coordinator lock session is no longer alive."""
 
 
+class StartupInterrupted(RuntimeError):
+    """A stop signal arrived while the coordinator was starting."""
+
+
+class StartupDeadlineExceeded(RuntimeError):
+    """The whole startup connection attempt exceeded its budget."""
+
+
 class ControlPlaneRuntime:
     def __init__(self, settings):
         self.settings = settings
@@ -29,6 +37,9 @@ class ControlPlaneRuntime:
         lease = CoordinatorLease(engine, COORDINATOR_LOCK_KEY)
         try:
             acquired = lease.acquire()
+        except (StartupInterrupted, StartupDeadlineExceeded):
+            engine.dispose()
+            raise
         except Exception as exc:
             engine.dispose()
             raise DatabaseUnavailable("database connection failed") from exc

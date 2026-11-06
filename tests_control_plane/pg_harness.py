@@ -4,6 +4,7 @@ import json
 import os
 import select
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -112,6 +113,24 @@ def terminate_backend(url: str, backend_pid: int) -> None:
             conn.execute(
                 text("SELECT pg_terminate_backend(:pid)"), {"pid": backend_pid}
             )
+    finally:
+        engine.dispose()
+
+
+def enable_short_transaction_timeout(url: str) -> None:
+    engine = engine_for(url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER ROLE postgres SET transaction_timeout = '2s'"))
+    finally:
+        engine.dispose()
+
+
+def reset_transaction_timeout(url: str) -> None:
+    engine = engine_for(url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER ROLE postgres RESET transaction_timeout"))
     finally:
         engine.dispose()
 
@@ -294,6 +313,75 @@ class SilentTcpServer:
                 continue
             self.connected.set()
             self._connections.append(connection)
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        for connection in self._connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        self._thread.join(timeout=2)
+
+
+def _notice_response() -> bytes:
+    fields = (
+        b"S"
+        + b"NOTICE\0"
+        + b"V"
+        + b"NOTICE\0"
+        + b"M"
+        + b"keepalive\0"
+        + b"\0"
+    )
+    return b"N" + struct.pack("!I", len(fields) + 4) + fields
+
+
+class ChattyPostgresServer:
+    """Accepts a connection and keeps sending valid NoticeResponse frames."""
+
+    def __init__(self):
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(4)
+        self.port = int(self._listener.getsockname()[1])
+        self._stop = threading.Event()
+        self.connected = threading.Event()
+        self._connections: list[socket.socket] = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> "ChattyPostgresServer":
+        self._thread.start()
+        return self
+
+    def wait_for_connection(self, timeout: float = 5.0) -> bool:
+        return self.connected.wait(timeout)
+
+    def _run(self) -> None:
+        self._listener.settimeout(0.2)
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except (socket.timeout, OSError):
+                continue
+            self.connected.set()
+            self._connections.append(connection)
+            connection.settimeout(0.2)
+            while not self._stop.is_set():
+                try:
+                    connection.sendall(_notice_response())
+                except OSError:
+                    break
+                time.sleep(0.1)
+            try:
+                connection.close()
+            except OSError:
+                pass
 
     def close(self) -> None:
         self._stop.set()

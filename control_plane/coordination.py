@@ -13,7 +13,9 @@ class CoordinatorLease:
     def acquire(self) -> bool:
         if self._connection is not None:
             raise RuntimeError("coordinator lease is already held")
-        connection = self._engine.connect()
+        connection = self._engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        )
         try:
             acquired = bool(
                 connection.execute(

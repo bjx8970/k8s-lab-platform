@@ -10,6 +10,8 @@ from .runtime import (
     CoordinatorConflict,
     DatabaseUnavailable,
     LeadershipLost,
+    StartupDeadlineExceeded,
+    StartupInterrupted,
 )
 
 EXIT_OK = 0
@@ -18,9 +20,68 @@ EXIT_COORDINATOR_CONFLICT = 3
 EXIT_RUNTIME_FAILURE = 4
 
 
-def _install_signal_handlers(stop_event: threading.Event) -> None:
+class _StartupDeadline:
+    """Bounds the whole startup handshake.
+
+    pg8000's timeout applies to individual socket operations, so a server that
+    keeps sending protocol messages can keep a handshake alive indefinitely.
+    """
+
+    def __init__(self, seconds: float):
+        self._seconds = seconds
+        self.active = False
+        self._previous_handler = None
+        self._timer_supported = (
+            hasattr(signal, "SIGALRM")
+            and hasattr(signal, "setitimer")
+            and threading.current_thread() is threading.main_thread()
+        )
+
+    def __enter__(self):
+        if self._timer_supported:
+            try:
+                self._previous_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, self._alarm)
+                self.active = True
+                signal.setitimer(signal.ITIMER_REAL, self._seconds)
+            except BaseException:
+                self.active = False
+                try:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                except Exception:
+                    pass
+                if self._previous_handler is not None:
+                    try:
+                        signal.signal(signal.SIGALRM, self._previous_handler)
+                    except (ValueError, OSError):
+                        pass
+                raise
+        else:
+            self.active = True
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.active = False
+        if self._timer_supported:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            finally:
+                if self._previous_handler is not None:
+                    signal.signal(signal.SIGALRM, self._previous_handler)
+        return False
+
+    def _alarm(self, signum, frame):
+        if self.active:
+            raise StartupDeadlineExceeded("startup deadline exceeded")
+
+
+def _install_signal_handlers(stop_event, deadline_ref) -> None:
     def request_stop(signum, frame):
+        already_stopping = stop_event.is_set()
         stop_event.set()
+        deadline = deadline_ref[0]
+        if not already_stopping and deadline is not None and deadline.active:
+            raise StartupInterrupted("startup interrupted by signal")
 
     for signal_name in ("SIGINT", "SIGTERM"):
         signal_number = getattr(signal, signal_name, None)
@@ -41,9 +102,17 @@ def _write_event(event: str, *, error: bool = False, **fields) -> None:
     )
 
 
+def _stop_quietly(runtime) -> None:
+    try:
+        runtime.stop()
+    except Exception:
+        pass
+
+
 def _run_start() -> int:
     stop_event = threading.Event()
-    _install_signal_handlers(stop_event)
+    deadline_ref = [None]
+    _install_signal_handlers(stop_event, deadline_ref)
 
     try:
         settings = RuntimeSettings.from_env()
@@ -51,11 +120,23 @@ def _run_start() -> int:
         print("configuration error", file=sys.stderr, flush=True)
         return EXIT_CONFIGURATION
 
+    deadline = _StartupDeadline(settings.connect_timeout_seconds)
+    deadline_ref[0] = deadline
     runtime = ControlPlaneRuntime(settings)
     if stop_event.is_set():
         return EXIT_OK
     try:
-        runtime.start()
+        with deadline:
+            if stop_event.is_set():
+                return EXIT_OK
+            runtime.start()
+    except StartupInterrupted:
+        _stop_quietly(runtime)
+        return EXIT_OK
+    except StartupDeadlineExceeded:
+        _stop_quietly(runtime)
+        print("startup deadline exceeded", file=sys.stderr, flush=True)
+        return EXIT_RUNTIME_FAILURE
     except CoordinatorConflict:
         if stop_event.is_set():
             return EXIT_OK

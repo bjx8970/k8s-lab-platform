@@ -14,10 +14,13 @@ from control_plane.config import (
 from control_plane.runtime import ControlPlaneRuntime
 from tests_control_plane.pg_harness import (
     ROOT,
+    ChattyPostgresServer,
     CliProcess,
     SilentTcpServer,
     TestDatabaseIsolationError,
+    enable_short_transaction_timeout,
     public_table_count,
+    reset_transaction_timeout,
     require_disposable_database_url,
     run_cli_once,
     terminate_backend,
@@ -237,6 +240,50 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(code, 0, stdout + stderr)
         self.assertFalse(ready_events(stdout))
         self.assertNotIn("leadership_lost", stderr)
+
+    def test_stop_signal_interrupts_chatty_handshake(self):
+        server = ChattyPostgresServer().start()
+        self.addCleanup(server.close)
+        url = (
+            f"postgresql+pg8000://postgres@127.0.0.1:{server.port}/"
+            "control_plane_test_chatty_stop"
+        )
+        process = CliProcess(url, connect_timeout_seconds=5.0)
+        self.addCleanup(process.kill)
+        self.assertTrue(
+            server.wait_for_connection(timeout=5), "CLI did not attempt a connection"
+        )
+        started = time.monotonic()
+        process.send_stop()
+        code, stdout, stderr = process.wait_for_exit(timeout=6)
+        elapsed = time.monotonic() - started
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertFalse(ready_events(stdout))
+        self.assertLess(elapsed, 3.0)
+
+    def test_chatty_handshake_respects_startup_deadline(self):
+        server = ChattyPostgresServer().start()
+        self.addCleanup(server.close)
+        url = (
+            f"postgresql+pg8000://postgres@127.0.0.1:{server.port}/"
+            "control_plane_test_chatty_deadline"
+        )
+        started = time.monotonic()
+        code, stdout, stderr = run_cli_once(
+            url, connect_timeout_seconds=0.5, timeout=5
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(code, 4, stdout + stderr)
+        self.assertFalse(ready_events(stdout))
+        self.assertLess(elapsed, 3.0)
+
+    def test_heartbeat_survives_transaction_timeout(self):
+        enable_short_transaction_timeout(self.url)
+        self.addCleanup(reset_transaction_timeout, self.url)
+        leader, _ = self.start_leader(lock_poll_seconds=0.1)
+        time.sleep(2.6)
+        self.assertIsNone(leader.proc.poll())
+        self.stop_leader(leader)
 
     def test_unreachable_database_fails_closed_without_secret_leak(self):
         sentinel = "p0-unreachable-sentinel"

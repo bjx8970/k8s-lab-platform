@@ -20,8 +20,10 @@
 | 变量 | 必需 | 默认值 | 约束 |
 | --- | --- | --- | --- |
 | `CONTROL_PLANE_DATABASE_URL` | 是 | 无 | 仅 PostgreSQL；接受 `postgresql://`（内部归一化为 pg8000）或 `postgresql+pg8000://`；拒绝其他驱动 |
-| `CONTROL_PLANE_CONNECT_TIMEOUT_SECONDS` | 否 | 5 | 0.5～30，包含小数；传给 pg8000 建立连接的超时 |
+| `CONTROL_PLANE_CONNECT_TIMEOUT_SECONDS` | 否 | 5 | 0.5～30，包含小数；整个启动连接过程的总预算，同时作为 pg8000 socket 超时 |
 | `CONTROL_PLANE_LOCK_POLL_SECONDS` | 否 | 1.0 | 0.05～60；仅用于已取得锁之后的存活探测周期，不用于等待获取锁 |
+
+`CONTROL_PLANE_CONNECT_TIMEOUT_SECONDS` 在支持 SIGALRM 的 POSIX 平台同时作为整个启动握手总预算；无 SIGALRM 平台只能保证单次 socket 超时。P0 部署与测试基线为 Linux/WSL。
 
 ### 启动与协调语义
 
@@ -79,6 +81,7 @@ P0 不创建任何表，不执行 DDL，不调用 `create_all`。
 | P0-08 | 启动不执行 DDL | 集成 | 阻塞 |
 | P0-09 | 测试守卫拒绝非一次性数据库 | 单元 | 阻塞 |
 | P0-10 | 启停可重复且 stop 幂等 | 进程/单元 | 阻塞 |
+| P0-11 | 事务时限下协调连接持续存活 | 集成 | 阻塞 |
 
 ### P0-01 顶层包导入无副作用
 
@@ -121,9 +124,9 @@ P0 不创建任何表，不执行 DDL，不调用 `create_all`。
 - 需求来源：架构第 7 节；AGENTS“后台线程显式启动和停止”。
 - 步骤：对 ready 实例发送 SIGTERM；等待退出；再尝试获取同一锁；随后重新启动。
 - 预期：退出码 0，stdout 出现 `{"event":"stopped"}`；锁可被测试连接获取；新实例可再次 ready。
-- 边界：启动未完成时收到 SIGTERM/SIGINT 应退出 0；该黑盒用例使用未完成握手的 TCP 端点，未取得协调锁，因此锁释放由 P0-05 正常停止和 P0-06 失锁用例覆盖；停止阶段重复信号不改变退出路径。
+- 边界：启动未完成时收到 SIGTERM/SIGINT 应退出 0；该黑盒用例使用未完成握手的 TCP 端点，未取得协调锁，因此锁释放由 P0-05 正常停止和 P0-06 失锁用例覆盖；停止阶段重复信号不改变退出路径；对持续发送合法 Notice 的握手端点，SIGTERM 也必须中断启动并有界退出。
 - 副作用检查：无残留线程/进程；连接池已释放。
-- 自动化：`StartupTests.test_sigterm_releases_coordination_and_allows_restart`、`StartupTests.test_stop_signal_before_ready_is_bounded`。
+- 自动化：`StartupTests.test_sigterm_releases_coordination_and_allows_restart`、`StartupTests.test_stop_signal_before_ready_is_bounded`、`StartupTests.test_stop_signal_interrupts_chatty_handshake`。
 
 ### P0-06 协调连接丢失立即失去资格
 
@@ -137,8 +140,9 @@ P0 不创建任何表，不执行 DDL，不调用 `create_all`。
 - 需求来源：执行规范第 6.1 节有限调用预算；安全规范第 8 节错误脱敏。
 - 场景 A：回环地址上的未监听端口和包含唯一哨兵密码的 URL。
 - 场景 B：本地 TCP 监听端接受连接但不完成 PostgreSQL 握手，验证 `CONTROL_PLANE_CONNECT_TIMEOUT_SECONDS` 生效。
-- 预期：两次均在 `connect_timeout + 5s` 内以 4 退出，不输出 ready；stderr 不含哨兵密码、完整 URL 或驱动堆栈中的凭据。
-- 自动化：`StartupTests.test_unreachable_database_fails_closed_without_secret_leak`、`StartupTests.test_silent_tcp_endpoint_respects_connect_timeout`。
+- 场景 C：本地端点持续发送合法 PostgreSQL NoticeResponse 但不完成握手，验证总启动预算而非单次 socket 读超时。
+- 预期：均在 `connect_timeout + 5s` 内以 4 退出，不输出 ready；stderr 不含哨兵密码、完整 URL 或驱动堆栈中的凭据。
+- 自动化：`StartupTests.test_unreachable_database_fails_closed_without_secret_leak`、`StartupTests.test_silent_tcp_endpoint_respects_connect_timeout`、`StartupTests.test_chatty_handshake_respects_startup_deadline`。
 
 ### P0-08 启动不执行 DDL
 
@@ -162,6 +166,14 @@ P0 不创建任何表，不执行 DDL，不调用 `create_all`。
 - 预期：不抛异常、不重复持有锁、不残留连接；配置对象不可变。
 - 自动化：`LifecycleUnitTests.test_runtime_restart_and_idempotent_stop`、`StartupTests.test_sigterm_releases_coordination_and_allows_restart`。
 
+### P0-11 事务时限下协调连接持续存活
+
+- 需求来源：执行规范第 6.2 节长期运行与失锁边界。
+- 前置条件：一次性 PostgreSQL 17，使用 `ALTER ROLE postgres SET transaction_timeout = '2s'`。
+- 步骤：启动 leader，锁存活探测周期 0.1 秒，等待 2.6 秒，再正常停止。
+- 预期：进程保持运行，不出现 `leadership_lost`，退出 0。协调专用连接必须处于自动提交状态，心跳不得长期停留在 `idle in transaction`。
+- 自动化：`StartupTests.test_heartbeat_survives_transaction_timeout`。
+
 ## 明确不纳入 P0
 
 - 业务表、Alembic 业务 revision、持久协调租约行（P1）。
@@ -181,6 +193,7 @@ bash scripts/run_p0_tests.sh
 默认 WSL，使用 Podman 一次性 PostgreSQL 17；脚本生成唯一数据库名，并在结束时删除容器。
 
 - 2026-11-06 实现前基线：26 项中 2 项通过（顶层导入、测试守卫），24 项因 P0 骨架未实现或退出码为 99 失败；失败来自业务断言，不是导入、依赖或数据库环境失败。
-- 实现后：29 项通过，0 失败、0 错误、0 跳过、0 未运行；使用默认 WSL、Python 3.12.15、Podman PostgreSQL 17。
+- 实现后：32 项通过，0 失败、0 错误、0 跳过、0 未运行；使用默认 WSL、Python 3.12.15、Podman PostgreSQL 17。
 - 独立复核后又收紧了失锁/连接超时上界、未就绪信号同步点、query 参数隔离和必需测试库守卫；未放宽任何业务预期。
+- PR 复审后修复两项 P2：协调连接改为 AUTOCOMMIT，避免事务时限终止长期心跳；启动握手增加总预算和可中断信号，覆盖持续 Notice 但不完成握手的端点。新增 P0-11 与持续握手用例。
 - 冻结哈希见 `p0_baseline.sha256`。
